@@ -1,0 +1,50 @@
+"""Project filesystem paths and vendor sys.path bootstrap."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODELS_DIR = Path(os.environ.get("PERSONA_FLOWHMR_MODELS", str(PROJECT_ROOT / "models"))).resolve()
+VENDOR_DIR = PROJECT_ROOT / "vendor"
+DEFAULT_DEMO_VIDEO = Path(r"D:\Git\persona\references\dancing girl [2E2okJyQyZI].mp4")
+
+YOLOX_CKPT_PATH = MODELS_DIR / "yolox" / "yolox_l.pth"
+FLOWHMR_CKPT_PATH = MODELS_DIR / "flowhmr_latest" / "flowhmr_latest.ckpt"
+FLOWHMR_CFG_PATH = MODELS_DIR / "flowhmr_latest" / "config.yml"
+MOTION_STATS_PATH = MODELS_DIR / "motion_stats.json"
+J_REGRESSOR_PATH = MODELS_DIR / "smpl_neutral_J_regressor.pt"
+SAM3D_DIR = MODELS_DIR / "sam-3d-body-dinov3"
+SAM3D_CKPT_PATH = SAM3D_DIR / "model.ckpt"
+SAM3D_CFG_PATH = SAM3D_DIR / "model_config.yaml"
+SAM3D_MHR_PATH = SAM3D_DIR / "assets" / "mhr_model.pt"
+
+_BOOTSTRAPPED = False
+
+
+def bootstrap_runtime() -> None:
+    """Configure Windows OS truststore SSL certs and add bundled vendor packages to sys.path."""
+    global _BOOTSTRAPPED
+    if _BOOTSTRAPPED:
+        return
+
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except Exception:
+        pass
+
+    for extra in (
+        VENDOR_DIR,
+        VENDOR_DIR / "YOLOX",
+        VENDOR_DIR / "sam-3d-body",
+        VENDOR_DIR / "dinov3",
+    ):
+        extra_str = str(extra)
+        if extra.exists() and extra_str not in sys.path:
+            sys.path.insert(0, extra_str)
+
+    _BOOTSTRAPPED = True
