@@ -25,7 +25,7 @@ def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--preset",
         choices=tuple(LATENCY_PRESETS.keys()),
-        default="balanced",
+        default="low",
         help="Latency / smoothness sliding-window preset",
     )
     p.add_argument("--fps", type=int, choices=(30, 60), default=60, help="VMC output playout FPS (30 or 60)")
@@ -40,9 +40,29 @@ def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--sam-stride",
         type=int,
-        choices=(1, 2, 3, 5, 6),
-        default=5,
-        help="SAM 3D Body keyframe stride at 30 Hz (5=6Hz keyframes + 30Hz lerp, 3=10Hz, 1=every frame)",
+        choices=(0, 1, 2, 3, 4, 5, 6),
+        default=0,
+        help="SAM 3D Body keyframe stride at 30 Hz (0=preset optimal, 3=10Hz, 5=6Hz, 1=every frame)",
+    )
+    p.add_argument(
+        "--hand-mode",
+        choices=("auto", "off", "fast", "full"),
+        default="auto",
+        help="SAM 3D hand decoder mode (`auto` uses preset: `off` for ultra_low/low, `fast` for balanced, `full` for high/max)",
+    )
+    p.add_argument(
+        "--yolo-size",
+        type=int,
+        choices=(0, 416, 640),
+        default=0,
+        help="YOLOX-L detector input size (0=preset optimal, 416=fast 3x, 640=full)",
+    )
+    p.add_argument(
+        "--yolo-stride",
+        type=int,
+        choices=(1, 2, 3),
+        default=2,
+        help="YOLOX-L detector frame stride with linear bbox interpolation (default: 2)",
     )
     p.add_argument("--replay-tokens", default="", help="Optional `.pt` or `.npz` (T, 3072) SAM token file")
     p.add_argument("--no-compile", action="store_true", help="Disable torch.compile Triton acceleration")
@@ -71,6 +91,9 @@ def _config_from_args(args: argparse.Namespace) -> EngineConfig:
         follow_movement=not args.no_follow,
         torch_compile=not args.no_compile,
         sam_stride=args.sam_stride,
+        hand_mode=args.hand_mode,
+        yolo_size=args.yolo_size,
+        yolo_stride=args.yolo_stride,
         perception_backend=args.backend,
         replay_tokens_path=args.replay_tokens,
         vmc_enabled=not args.no_vmc,

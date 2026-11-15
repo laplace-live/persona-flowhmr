@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 import numpy as np
 import supervision as sv
 import torch
@@ -65,7 +65,8 @@ class BatchedYoloxTracker:
         self,
         ckpt_path: str | Path = YOLOX_CKPT_PATH,
         device: str | torch.device = "cuda",
-        test_size: tuple[int, int] = (640, 640),
+        test_size: tuple[int, int] = (416, 416),
+        yolo_stride: int = 2,
         bbox_thr: float = 0.45,
         nms_thr: float = 0.30,
         ema_alpha: float = 0.65,
@@ -79,7 +80,8 @@ class BatchedYoloxTracker:
         from yolox.utils import postprocess
 
         self.device = torch.device(device)
-        self.test_size = test_size
+        self.test_size = (int(test_size[0]), int(test_size[1]))
+        self.yolo_stride = max(1, int(yolo_stride))
         self.bbox_thr = float(bbox_thr)
         self.nms_thr = float(nms_thr)
         self.ema_alpha = float(ema_alpha)
@@ -100,10 +102,11 @@ class BatchedYoloxTracker:
         self._tracker = sv.ByteTrack(frame_rate=30)
         self._locked_track_id: int | None = None
         self._smoothed_bbox: np.ndarray | None = None
+        self._prev_emitted_bbox: np.ndarray | None = None
         self._missed_frames = 0
 
     @torch.no_grad()
-    def warmup(self, batch_size: int = 8, hw: tuple[int, int] = (720, 1280)) -> None:
+    def warmup(self, batch_size: int = 4, hw: tuple[int, int] = (720, 1280)) -> None:
         """Pre-initialize cuDNN workspace and kernels before real-time capture starts."""
         dtype = torch.bfloat16 if self._use_bf16 else torch.float32
         dummy = torch.full(
@@ -117,9 +120,15 @@ class BatchedYoloxTracker:
             torch.cuda.synchronize(self.device)
 
     @torch.no_grad()
-    def detect_and_track_batch(self, rgb_frames: Sequence[np.ndarray]) -> np.ndarray:
-        """Run GPU-preprocessed batched YOLOX-L + sequential ByteTrack over `N` RGB frames -> `(N, 4)`."""
-        if not rgb_frames:
+    def detect_and_track_batch(
+        self,
+        rgb_frames: Sequence[np.ndarray],
+        *,
+        reset_flags: Sequence[bool] | None = None,
+    ) -> np.ndarray:
+        """Run GPU-preprocessed batched YOLOX-L + ByteTrack over `N` RGB frames -> `(N, 4)`."""
+        n = len(rgb_frames)
+        if n == 0:
             return np.zeros((0, 4), dtype=np.float32)
 
         h, w = rgb_frames[0].shape[:2]
@@ -128,8 +137,21 @@ class BatchedYoloxTracker:
         new_w = max(1, int(w * ratio))
         dtype = torch.bfloat16 if self._use_bf16 else torch.float32
 
-        # Upload compact uint8 NHWC directly to GPU and resize + pad in BF16 on device.
-        raw_np = np.stack(rgb_frames, axis=0)
+        stride = self.yolo_stride
+        if stride > 1 and n >= 2:
+            det_indices_set = set(range(0, n, stride))
+            det_indices_set.add(n - 1)
+            if reset_flags is not None:
+                for idx, is_rst in enumerate(reset_flags):
+                    if is_rst:
+                        det_indices_set.add(idx)
+                        if idx > 0:
+                            det_indices_set.add(idx - 1)
+            det_indices = sorted(det_indices_set)
+        else:
+            det_indices = list(range(n))
+
+        raw_np = np.stack([rgb_frames[i] for i in det_indices], axis=0)
         raw_gpu = torch.from_numpy(raw_np).to(device=self.device, non_blocking=True)
         bgr_nchw = raw_gpu[..., [2, 1, 0]].permute(0, 3, 1, 2).to(dtype=dtype)
         resized = torch.nn.functional.interpolate(
@@ -139,7 +161,7 @@ class BatchedYoloxTracker:
             align_corners=False,
         )
         batch_t = torch.full(
-            (len(rgb_frames), 3, self.test_size[0], self.test_size[1]),
+            (len(det_indices), 3, self.test_size[0], self.test_size[1]),
             114.0,
             device=self.device,
             dtype=dtype,
@@ -156,11 +178,25 @@ class BatchedYoloxTracker:
         )
 
         full_box = np.array([0.0, 0.0, float(w), float(h)], dtype=np.float32)
-        out_boxes = np.empty((len(rgb_frames), 4), dtype=np.float32)
+        det_map = {det_indices[pos]: dets[pos] for pos in range(len(det_indices))}
+        key_boxes: dict[int, np.ndarray] = {}
 
-        for i, det in enumerate(dets):
-            chosen = self._step_single_frame(det, ratio, w, h, full_box)
-            out_boxes[i] = chosen
+        for idx in det_indices:
+            if reset_flags is not None and reset_flags[idx]:
+                self.reset_tracker()
+            key_boxes[idx] = self._step_single_frame(det_map[idx], ratio, w, h, full_box)
+
+        out_boxes = np.empty((n, 4), dtype=np.float32)
+        seg = 0
+        for i in range(n):
+            if i in key_boxes:
+                out_boxes[i] = key_boxes[i]
+                continue
+            while seg + 1 < len(det_indices) - 1 and i > det_indices[seg + 1]:
+                seg += 1
+            i0, i1 = det_indices[seg], det_indices[seg + 1]
+            alpha = float(i - i0) / float(max(1, i1 - i0))
+            out_boxes[i] = (1.0 - alpha) * key_boxes[i0] + alpha * key_boxes[i1]
 
         return out_boxes
 
@@ -197,7 +233,6 @@ class BatchedYoloxTracker:
                         idx = int(np.where(t_ids == self._locked_track_id)[0][0])
                         selected = tracked.xyxy[idx].astype(np.float32)
                     else:
-                        # Lock onto largest-area person track weighted by confidence.
                         areas = (tracked.xyxy[:, 2] - tracked.xyxy[:, 0]) * (
                             tracked.xyxy[:, 3] - tracked.xyxy[:, 1]
                         )
@@ -206,7 +241,6 @@ class BatchedYoloxTracker:
                         self._locked_track_id = int(t_ids[best])
                         selected = tracked.xyxy[best].astype(np.float32)
                 else:
-                    # First frame before ByteTrack confirms track ID: pick largest confident person.
                     areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
                     best = int(np.argmax(areas * scores))
                     selected = xyxy[best].astype(np.float32)
@@ -237,8 +271,11 @@ class Sam3DStreamExtractor:
         mhr_path: str | Path = SAM3D_MHR_PATH,
         device: str | torch.device = "cuda",
         use_compile: bool = True,
-        chunk_size: int = 6,
+        chunk_size: int = 3,
         hand_stride: int = 2,
+        hand_mode: Literal["off", "fast", "full"] = "off",
+        body_decoder_layers: int = 3,
+        hand_decoder_layers: int = 2,
     ) -> None:
         bootstrap_runtime()
         _install_local_dinov3_hub_hook()
@@ -259,8 +296,12 @@ class Sam3DStreamExtractor:
         self.device = torch.device(device)
         self.chunk_size = max(1, int(chunk_size))
         self.hand_stride = max(1, int(hand_stride))
+        self.hand_mode: Literal["off", "fast", "full"] = hand_mode
+        self.body_decoder_layers = max(1, int(body_decoder_layers))
+        self.hand_decoder_layers = max(1, int(hand_decoder_layers))
         self._use_compile = bool(use_compile and self.device.type == "cuda")
-        self._warmed_chunk_sizes: set[int] = set()
+        self._warmed_signatures: set[tuple[int, str, int, int]] = set()
+        self._neutral_hand_tokens: torch.Tensor | None = None
         self._extract_tokens = extract_tokens
 
         sam_model, sam_cfg = load_sam_3d_body(
@@ -273,12 +314,52 @@ class Sam3DStreamExtractor:
             enable_sam_compile(sam_model, self.device)
         self.estimator = SAM3DBodyEstimator(sam_3d_body_model=sam_model, model_cfg=sam_cfg)
 
+    def configure(
+        self,
+        *,
+        chunk_size: int,
+        hand_mode: Literal["off", "fast", "full"],
+        body_decoder_layers: int,
+        hand_decoder_layers: int,
+    ) -> None:
+        self.chunk_size = max(1, int(chunk_size))
+        self.hand_mode = hand_mode
+        self.body_decoder_layers = max(1, int(body_decoder_layers))
+        self.hand_decoder_layers = max(1, int(hand_decoder_layers))
+
+    @torch.no_grad()
+    def _ensure_neutral_hand_tokens(self, hw: tuple[int, int] = (720, 1280)) -> torch.Tensor:
+        if self._neutral_hand_tokens is not None:
+            return self._neutral_hand_tokens
+        h, w = hw
+        blank_rgb = [np.full((h, w, 3), 128, dtype=np.uint8)]
+        blank_box = np.array([[w * 0.25, h * 0.1, w * 0.75, h * 0.9]], dtype=np.float32)
+        blank_k = default_camera_intrinsics(h, w)[None]
+        # Run one unpadded single-frame full pass to capture exact in-distribution LayerNorm hand tokens.
+        tok = self._extract_tokens(
+            self.estimator,
+            blank_rgb,
+            blank_box,
+            blank_k,
+            gpu_preprocess=True,
+            merge_hands=True,
+            hand_stride=1,
+            hand_mode="full",
+            body_decoder_layers=2,
+            hand_decoder_layers=2,
+        )
+        self._neutral_hand_tokens = tok[0, 1024:].clone().cpu()
+        return self._neutral_hand_tokens
+
     @torch.no_grad()
     def warmup(self, chunk_size: int | None = None, hw: tuple[int, int] = (720, 1280)) -> None:
-        """Pre-compile static `B = chunk_size` (body) and `B = 2 * chunk_size` (merged hands) shapes."""
+        """Pre-compile static `B = chunk_size` body (and optional hand) shapes."""
         target = max(1, int(chunk_size or self.chunk_size))
         self.chunk_size = target
-        if target in self._warmed_chunk_sizes:
+        if self.hand_mode == "off":
+            self._ensure_neutral_hand_tokens(hw)
+        sig = (target, self.hand_mode, self.body_decoder_layers, self.hand_decoder_layers)
+        if sig in self._warmed_signatures:
             return
         h, w = hw
         dummy_rgb = [np.zeros((h, w, 3), dtype=np.uint8) for _ in range(target)]
@@ -290,7 +371,7 @@ class Sam3DStreamExtractor:
         self.extract_chunk(dummy_rgb, dummy_box, dummy_k)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
-        self._warmed_chunk_sizes.add(target)
+        self._warmed_signatures.add(sig)
 
     @torch.no_grad()
     def extract_chunk(
@@ -302,6 +383,13 @@ class Sam3DStreamExtractor:
         """Extract `(N, 3072)` float32 conditioning tokens for `N` frames with static compiled batch shapes."""
         if not rgb_frames:
             return torch.empty((0, 3072), dtype=torch.float32)
+        neutral_hands = (
+            self._ensure_neutral_hand_tokens(rgb_frames[0].shape[:2])
+            if self.hand_mode == "off"
+            else None
+        )
+        effective_hand_stride = max(self.hand_stride, self.chunk_size) if self.hand_mode == "fast" else self.hand_stride
+
         pieces: list[torch.Tensor] = []
         n = len(rgb_frames)
         cs = self.chunk_size
@@ -323,7 +411,11 @@ class Sam3DStreamExtractor:
                 sub_k,
                 gpu_preprocess=True,
                 merge_hands=True,
-                hand_stride=self.hand_stride,
+                hand_stride=effective_hand_stride,
+                hand_mode=self.hand_mode,
+                neutral_hand_tokens=neutral_hands,
+                body_decoder_layers=self.body_decoder_layers,
+                hand_decoder_layers=self.hand_decoder_layers,
             )
             pieces.append(toks[:actual])
         return torch.cat(pieces, dim=0)
@@ -368,14 +460,12 @@ class ReplayTokenExtractor:
             self._cursor += n
             return self._tokens[idxs].clone()
 
-        # Deterministic normalized bbox-geometry feature projection (for pipeline integration tests
-        # when neither SAM3D weights nor a `.pt` token recording is provided).
         h, w = rgb_frames[0].shape[:2]
         cx = ((bboxes_xyxy[:, 0] + bboxes_xyxy[:, 2]) * 0.5 / max(1.0, float(w))) - 0.5
         cy = ((bboxes_xyxy[:, 1] + bboxes_xyxy[:, 3]) * 0.5 / max(1.0, float(h))) - 0.5
         bw = (bboxes_xyxy[:, 2] - bboxes_xyxy[:, 0]) / max(1.0, float(w))
         bh = (bboxes_xyxy[:, 3] - bboxes_xyxy[:, 1]) / max(1.0, float(h))
-        geom = np.stack([cx, cy, bw, bh], axis=-1).astype(np.float32)  # (N, 4)
+        geom = np.stack([cx, cy, bw, bh], axis=-1).astype(np.float32)
         tiled = np.tile(geom, (1, 3072 // 4)) * 0.05
         return torch.from_numpy(tiled)
 
