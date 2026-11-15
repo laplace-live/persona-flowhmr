@@ -25,39 +25,43 @@ Standalone external single-camera mocap app for **LAPLACE Persona**, running buf
 | `high` | `60 + 32 + 8 + 24 = 124` | `20` | **~2.45 s** |
 | `max` | `60 + 36 + 10 + 50 = 156` | `20` | **~3.50 s** |
 
-## Setup
+## Setup (Git Bash)
 
-1. Activate `.venv` and check installed checkpoints:
-   ```powershell
-   .\.venv\Scripts\persona-flowhmr.exe status
+1. Check GPU and installed checkpoints:
+   ```bash
+   cd /d/Git/persona-flowhmr
+   source .venv/Scripts/activate
+   persona-flowhmr status
    ```
 2. Download Meta's gated **`facebook/sam-3d-body-dinov3`** checkpoint (one-time):
    - Accept the license at `https://huggingface.co/facebook/sam-3d-body-dinov3`
    - Authenticate and run setup:
-   ```powershell
-   .\.venv\Scripts\hf.exe auth login
-   .\.venv\Scripts\persona-flowhmr.exe setup
+   ```bash
+   hf auth login --token "<YOUR_HF_TOKEN>"
+   persona-flowhmr setup
    ```
 
-## Usage
+## Usage (Git Bash)
 
 ### 1. External App Control & Preview Web UI
-```powershell
-.\.venv\Scripts\persona-flowhmr.exe serve --port 7865
+```bash
+cd /d/Git/persona-flowhmr
+source .venv/Scripts/activate
+persona-flowhmr serve --port 7865
 ```
 Open `http://127.0.0.1:7865` to switch between **Live Camera** and **Debug Video**, adjust latency presets (`1.15s`–`3.50s`), toggle `30 / 60 FPS` and `Mirror`, configure VMC / Persona Plugin API, and view synchronized live + playout HUD previews.
 
 ### 2. Headless CLI (Debug Video or Live Camera -> Persona)
-```powershell
+```bash
 # Debug with reference dance video -> VMC UDP 39539 + Persona Plugin API auto-setup
-.\.venv\Scripts\persona-flowhmr.exe run `
-  --source video `
-  --video "D:\Git\persona\references\dancing girl [2E2okJyQyZI].mp4" `
-  --preset balanced `
-  --fps 60 `
-  --plugin-api `
+persona-flowhmr run \
+  --source video \
+  --video "D:/Git/persona/references/dancing girl [2E2okJyQyZI].mp4" \
+  --preset balanced \
+  --fps 60 \
+  --plugin-api \
   --plugin-token "<YOUR_PERSONA_TOKEN>"
 
 # Live webcam (device 0) with selfie mirror enabled
-.\.venv\Scripts\persona-flowhmr.exe run --source camera --camera 0 --preset low --fps 60 --mirror
+persona-flowhmr run --source camera --camera 0 --preset low --fps 60 --mirror
 ```
