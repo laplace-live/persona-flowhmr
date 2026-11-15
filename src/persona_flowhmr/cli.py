@@ -37,6 +37,13 @@ def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
         default="auto",
         help="Perception backend (`auto`/`sam3d` uses SAM 3D Body; `replay` uses --replay-tokens or bbox probe)",
     )
+    p.add_argument(
+        "--sam-stride",
+        type=int,
+        choices=(1, 2, 3, 5, 6),
+        default=5,
+        help="SAM 3D Body keyframe stride at 30 Hz (5=6Hz keyframes + 30Hz lerp, 3=10Hz, 1=every frame)",
+    )
     p.add_argument("--replay-tokens", default="", help="Optional `.pt` or `.npz` (T, 3072) SAM token file")
     p.add_argument("--no-compile", action="store_true", help="Disable torch.compile Triton acceleration")
     p.add_argument("--vmc-host", default="127.0.0.1", help="Target VMC receiver UDP host")
@@ -63,6 +70,7 @@ def _config_from_args(args: argparse.Namespace) -> EngineConfig:
         mirror=args.mirror,
         follow_movement=not args.no_follow,
         torch_compile=not args.no_compile,
+        sam_stride=args.sam_stride,
         perception_backend=args.backend,
         replay_tokens_path=args.replay_tokens,
         vmc_enabled=not args.no_vmc,

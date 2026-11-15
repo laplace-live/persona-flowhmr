@@ -66,8 +66,8 @@ def test_streaming_demo_video_vmc_and_webui() -> None:
             r_start = client.post("/api/start")
             assert r_start.status_code == 200
 
-            # Wait up to 90s for Triton warmup + initial 1.15s buffer + ~2.5s of steady 60 Hz streaming.
-            deadline = time.perf_counter() + 90.0
+            # Wait up to 180s for cold Triton compilation (SAM 3D Body + MMDiT) + steady 60 Hz streaming.
+            deadline = time.perf_counter() + 180.0
             while time.perf_counter() < deadline:
                 st = client.get("/api/status").json()
                 tel = st["telemetry"]
@@ -82,9 +82,10 @@ def test_streaming_demo_video_vmc_and_webui() -> None:
             assert tel["vmc_packets_sent"] >= 150
             assert tel["windows_solved"] >= 2
             assert tel["underruns"] == 0
-            # Verify playout FPS is smooth ~60 Hz and latency matches low preset (~1150 ms).
+            # Verify playout FPS is smooth ~60 Hz and latency matches low preset target.
+            target_ms = cfg.get_preset().playout_delay_s * 1000.0
             assert 54.0 <= tel["playout_fps"] <= 64.0
-            assert 950.0 <= tel["measured_latency_ms"] <= 1450.0
+            assert (target_ms - 250.0) <= tel["measured_latency_ms"] <= (target_ms + 300.0)
 
             # Verify live & latency-synced preview frames render valid JPEGs with HUD overlay.
             live_jpg = engine.render_live_jpeg()

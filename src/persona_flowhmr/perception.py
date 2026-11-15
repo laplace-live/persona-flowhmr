@@ -75,7 +75,6 @@ class BatchedYoloxTracker:
         if not ckpt.is_file():
             raise FileNotFoundError(f"YOLOX-L checkpoint missing: {ckpt}")
 
-        from yolox.data.data_augment import ValTransform
         from yolox.exp import get_exp
         from yolox.utils import postprocess
 
@@ -85,7 +84,6 @@ class BatchedYoloxTracker:
         self.nms_thr = float(nms_thr)
         self.ema_alpha = float(ema_alpha)
         self._postprocess = postprocess
-        self._preproc = ValTransform(legacy=False)
 
         exp = get_exp(exp_name="yolox-l")
         model = exp.get_model()
@@ -105,24 +103,48 @@ class BatchedYoloxTracker:
         self._missed_frames = 0
 
     @torch.no_grad()
+    def warmup(self, batch_size: int = 8, hw: tuple[int, int] = (720, 1280)) -> None:
+        """Pre-initialize cuDNN workspace and kernels before real-time capture starts."""
+        dtype = torch.bfloat16 if self._use_bf16 else torch.float32
+        dummy = torch.full(
+            (max(1, int(batch_size)), 3, self.test_size[0], self.test_size[1]),
+            114.0,
+            device=self.device,
+            dtype=dtype,
+        )
+        _ = self.model(dummy)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    @torch.no_grad()
     def detect_and_track_batch(self, rgb_frames: Sequence[np.ndarray]) -> np.ndarray:
-        """Run batched YOLOX-L + sequential ByteTrack over `N` RGB frames -> `(N, 4)` float32 `xyxy`."""
+        """Run GPU-preprocessed batched YOLOX-L + sequential ByteTrack over `N` RGB frames -> `(N, 4)`."""
         if not rgb_frames:
             return np.zeros((0, 4), dtype=np.float32)
 
         h, w = rgb_frames[0].shape[:2]
         ratio = min(self.test_size[0] / float(h), self.test_size[1] / float(w))
-
-        pre_list = []
-        for rgb in rgb_frames:
-            # YOLOX ValTransform expects BGR uint8 HWC.
-            bgr = rgb[:, :, ::-1]
-            img_pre, _ = self._preproc(bgr, None, self.test_size)
-            pre_list.append(img_pre)
-
-        batch_np = np.stack(pre_list, axis=0)
+        new_h = max(1, int(h * ratio))
+        new_w = max(1, int(w * ratio))
         dtype = torch.bfloat16 if self._use_bf16 else torch.float32
-        batch_t = torch.from_numpy(batch_np).to(device=self.device, dtype=dtype, non_blocking=True)
+
+        # Upload compact uint8 NHWC directly to GPU and resize + pad in BF16 on device.
+        raw_np = np.stack(rgb_frames, axis=0)
+        raw_gpu = torch.from_numpy(raw_np).to(device=self.device, non_blocking=True)
+        bgr_nchw = raw_gpu[..., [2, 1, 0]].permute(0, 3, 1, 2).to(dtype=dtype)
+        resized = torch.nn.functional.interpolate(
+            bgr_nchw,
+            size=(new_h, new_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        batch_t = torch.full(
+            (len(rgb_frames), 3, self.test_size[0], self.test_size[1]),
+            114.0,
+            device=self.device,
+            dtype=dtype,
+        )
+        batch_t[:, :, :new_h, :new_w] = resized
 
         raw_out = self.model(batch_t)
         dets = self._postprocess(
@@ -215,7 +237,8 @@ class Sam3DStreamExtractor:
         mhr_path: str | Path = SAM3D_MHR_PATH,
         device: str | torch.device = "cuda",
         use_compile: bool = True,
-        chunk_size: int = 8,
+        chunk_size: int = 6,
+        hand_stride: int = 2,
     ) -> None:
         bootstrap_runtime()
         _install_local_dinov3_hub_hook()
@@ -225,8 +248,7 @@ class Sam3DStreamExtractor:
         if not (ckpt.is_file() and mhr.is_file()):
             raise Sam3DCheckpointMissingError(
                 f"SAM 3D Body checkpoints not found at {ckpt.parent}. "
-                "Authenticate Hugging Face (`hf auth login` after accepting "
-                "https://huggingface.co/facebook/sam-3d-body-dinov3) and run `persona-flowhmr setup`."
+                "Run `persona-flowhmr setup` to download from ModelScope (`facebook/sam-3d-body-dinov3`)."
             )
 
         from flowhmr.utils.lite_sam_infer import extract_tokens
@@ -236,6 +258,9 @@ class Sam3DStreamExtractor:
 
         self.device = torch.device(device)
         self.chunk_size = max(1, int(chunk_size))
+        self.hand_stride = max(1, int(hand_stride))
+        self._use_compile = bool(use_compile and self.device.type == "cuda")
+        self._warmed_chunk_sizes: set[int] = set()
         self._extract_tokens = extract_tokens
 
         sam_model, sam_cfg = load_sam_3d_body(
@@ -244,9 +269,28 @@ class Sam3DStreamExtractor:
             device=str(self.device),
         )
         _maybe_convert_backbone_to_fp16(sam_model, self.device)
-        if use_compile and self.device.type == "cuda":
+        if self._use_compile:
             enable_sam_compile(sam_model, self.device)
         self.estimator = SAM3DBodyEstimator(sam_3d_body_model=sam_model, model_cfg=sam_cfg)
+
+    @torch.no_grad()
+    def warmup(self, chunk_size: int | None = None, hw: tuple[int, int] = (720, 1280)) -> None:
+        """Pre-compile static `B = chunk_size` (body) and `B = 2 * chunk_size` (merged hands) shapes."""
+        target = max(1, int(chunk_size or self.chunk_size))
+        self.chunk_size = target
+        if target in self._warmed_chunk_sizes:
+            return
+        h, w = hw
+        dummy_rgb = [np.zeros((h, w, 3), dtype=np.uint8) for _ in range(target)]
+        dummy_box = np.tile(
+            np.array([[w * 0.25, h * 0.1, w * 0.75, h * 0.9]], dtype=np.float32),
+            (target, 1),
+        )
+        dummy_k = np.repeat(default_camera_intrinsics(h, w)[None], target, axis=0)
+        self.extract_chunk(dummy_rgb, dummy_box, dummy_k)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self._warmed_chunk_sizes.add(target)
 
     @torch.no_grad()
     def extract_chunk(
@@ -255,22 +299,33 @@ class Sam3DStreamExtractor:
         bboxes_xyxy: np.ndarray,
         cameras_k: np.ndarray,
     ) -> torch.Tensor:
-        """Extract `(N, 3072)` float32 conditioning tokens for `N` frames."""
+        """Extract `(N, 3072)` float32 conditioning tokens for `N` frames with static compiled batch shapes."""
         if not rgb_frames:
             return torch.empty((0, 3072), dtype=torch.float32)
         pieces: list[torch.Tensor] = []
         n = len(rgb_frames)
-        for s in range(0, n, self.chunk_size):
-            e = min(n, s + self.chunk_size)
+        cs = self.chunk_size
+        for s in range(0, n, cs):
+            e = min(n, s + cs)
+            sub_rgb = list(rgb_frames[s:e])
+            sub_box = bboxes_xyxy[s:e]
+            sub_k = cameras_k[s:e]
+            actual = len(sub_rgb)
+            if self._use_compile and actual < cs:
+                pad = cs - actual
+                sub_rgb = sub_rgb + [sub_rgb[-1]] * pad
+                sub_box = np.concatenate([sub_box, np.repeat(sub_box[-1:], pad, axis=0)], axis=0)
+                sub_k = np.concatenate([sub_k, np.repeat(sub_k[-1:], pad, axis=0)], axis=0)
             toks = self._extract_tokens(
                 self.estimator,
-                list(rgb_frames[s:e]),
-                bboxes_xyxy[s:e],
-                cameras_k[s:e],
+                sub_rgb,
+                sub_box,
+                sub_k,
                 gpu_preprocess=True,
                 merge_hands=True,
+                hand_stride=self.hand_stride,
             )
-            pieces.append(toks)
+            pieces.append(toks[:actual])
         return torch.cat(pieces, dim=0)
 
 

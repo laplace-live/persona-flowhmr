@@ -98,6 +98,7 @@ class StreamingMocapEngine:
             "loop_video",
             "preset",
             "perception_backend",
+            "sam_stride",
             "replay_tokens_path",
             "torch_compile",
         }
@@ -202,9 +203,8 @@ class StreamingMocapEngine:
         else:
             # `auto` without SAM3D checkpoint raises clear actionable instructions.
             raise FileNotFoundError(
-                "Gated checkpoint `facebook/sam-3d-body-dinov3` is not installed yet. "
-                "Accept the license at https://huggingface.co/facebook/sam-3d-body-dinov3, "
-                "authenticate with `.venv\\Scripts\\hf.exe auth login`, and run `persona-flowhmr setup` "
+                "Checkpoint `facebook/sam-3d-body-dinov3` is not installed yet. "
+                "Run `persona-flowhmr setup` to download it automatically from ModelScope "
                 "(or select `replay` backend for pipeline testing)."
             )
 
@@ -340,6 +340,12 @@ class StreamingMocapEngine:
         finally:
             if source is not None:
                 source.close()
+            while not self._stop_event.is_set():
+                try:
+                    frame_queue.put(None, timeout=0.1)
+                    break
+                except queue.Full:
+                    pass
             try:
                 frame_queue.put_nowait(None)
             except queue.Full:
@@ -360,8 +366,15 @@ class StreamingMocapEngine:
             assert self._decoder is not None
 
             preset = self.config.get_preset()
-            # Pre-compile MMDiT static window shape before buffering starts so the first live window
-            # solves in ~53-102ms rather than paying Dynamo compilation during live capture.
+            kf_chunk = preset.sam_chunk_size
+            sam_stride = int(self.config.sam_stride) if isinstance(extractor, Sam3DStreamExtractor) else 1
+            sam_stride = max(1, sam_stride)
+
+            # Pre-compile SAM 3D Body + MMDiT static shapes before buffering starts so live windows
+            # never pay Dynamo/Triton compilation latency mid-stream.
+            self._yolox.warmup(kf_chunk * sam_stride)
+            if isinstance(extractor, Sam3DStreamExtractor):
+                extractor.warmup(kf_chunk)
             self._solver.warmup(preset.window_frames, steps=2)
             if self._stop_event.is_set():
                 warmup_done_event.set()
@@ -372,25 +385,57 @@ class StreamingMocapEngine:
             stitcher = StreamingStitcher(self._decoder, fps=30.0)
             history: deque[FrameFeatureItem] = deque(maxlen=preset.window_frames + 128)
             next_emit_frame = 0
-            chunk_target = min(4, preset.sam_chunk_size) if realtime_source else preset.sam_chunk_size
             eos_reached = False
+            prev_kf_idx: int | None = None
+            prev_kf_tok: torch.Tensor | None = None
+            pending_interm: list[tuple[SampledFrame, np.ndarray]] = []
+            stashed_reset_item: SampledFrame | None = None
 
             while not self._stop_event.is_set() and not eos_reached:
+                if isinstance(extractor, Sam3DStreamExtractor) and sam_stride > 1:
+                    batch_goal = (1 + (kf_chunk - 1) * sam_stride) if prev_kf_idx is None else (kf_chunk * sam_stride)
+                else:
+                    needed_frames = (
+                        next_emit_frame + preset.stride_frames + preset.overlap_frames + preset.lookahead_frames
+                    ) - ((history[-1].frame_index + 1) if history else 0)
+                    batch_goal = min(kf_chunk, max(1, needed_frames))
+
                 batch_samples: list[SampledFrame] = []
-                while len(batch_samples) < chunk_target and not self._stop_event.is_set():
-                    timeout = 0.02 if batch_samples else 0.1
+                if stashed_reset_item is not None:
+                    batch_samples.append(stashed_reset_item)
+                    stashed_reset_item = None
+
+                while len(batch_samples) < batch_goal and not self._stop_event.is_set():
                     try:
-                        item = frame_queue.get(timeout=timeout)
+                        item = frame_queue.get(timeout=0.1)
                     except queue.Empty:
-                        break
+                        continue
                     if item is None:
                         eos_reached = True
                         break
-                    if item.is_stream_reset and item.frame_index > 0:
-                        self._yolox.reset_tracker()
-                        if isinstance(extractor, ReplayTokenExtractor):
-                            extractor.reset()
+                    if item.is_stream_reset and item.frame_index > 0 and batch_samples:
+                        stashed_reset_item = item
+                        break
                     batch_samples.append(item)
+
+                if batch_samples and batch_samples[0].is_stream_reset and batch_samples[0].frame_index > 0:
+                    if pending_interm and prev_kf_tok is not None:
+                        for p_sample, p_bbox in pending_interm:
+                            history.append(
+                                FrameFeatureItem(
+                                    frame_index=p_sample.frame_index,
+                                    media_time_s=p_sample.media_time_s,
+                                    capture_mono_s=p_sample.capture_mono_s,
+                                    bbox_xyxy=p_bbox,
+                                    sam_token=prev_kf_tok.clone(),
+                                )
+                            )
+                        pending_interm.clear()
+                    prev_kf_idx = None
+                    prev_kf_tok = None
+                    self._yolox.reset_tracker()
+                    if isinstance(extractor, ReplayTokenExtractor):
+                        extractor.reset()
 
                 if batch_samples:
                     rgb_list = [s.rgb for s in batch_samples]
@@ -402,27 +447,100 @@ class StreamingMocapEngine:
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     t1 = time.perf_counter()
-                    tokens = extractor.extract_chunk(rgb_list, bboxes, cam_k)
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    t2 = time.perf_counter()
+
+                    if isinstance(extractor, Sam3DStreamExtractor) and sam_stride > 1:
+                        last_planned_kf = prev_kf_idx
+                        kf_indices: list[int] = []
+                        for i, s in enumerate(batch_samples):
+                            if last_planned_kf is None or (s.frame_index - last_planned_kf) >= sam_stride:
+                                kf_indices.append(i)
+                                last_planned_kf = s.frame_index
+                        if eos_reached and (len(batch_samples) - 1) not in kf_indices:
+                            kf_indices.append(len(batch_samples) - 1)
+
+                        kf_tokens = (
+                            extractor.extract_chunk(
+                                [rgb_list[i] for i in kf_indices],
+                                bboxes[kf_indices],
+                                cam_k[kf_indices],
+                            )
+                            if kf_indices
+                            else torch.empty((0, 3072), dtype=torch.float32)
+                        )
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        t2 = time.perf_counter()
+
+                        kf_map = {kf_indices[pos]: kf_tokens[pos] for pos in range(len(kf_indices))}
+                        for i, s in enumerate(batch_samples):
+                            self._preview.record_bbox(s.frame_index, bboxes[i])
+                            if i in kf_map:
+                                cur_tok = kf_map[i]
+                                if prev_kf_tok is not None and prev_kf_idx is not None and pending_interm:
+                                    span = max(1, s.frame_index - prev_kf_idx)
+                                    for p_sample, p_bbox in pending_interm:
+                                        alpha = float(p_sample.frame_index - prev_kf_idx) / float(span)
+                                        interp_tok = torch.lerp(prev_kf_tok, cur_tok, alpha)
+                                        history.append(
+                                            FrameFeatureItem(
+                                                frame_index=p_sample.frame_index,
+                                                media_time_s=p_sample.media_time_s,
+                                                capture_mono_s=p_sample.capture_mono_s,
+                                                bbox_xyxy=p_bbox,
+                                                sam_token=interp_tok,
+                                            )
+                                        )
+                                    pending_interm.clear()
+                                history.append(
+                                    FrameFeatureItem(
+                                        frame_index=s.frame_index,
+                                        media_time_s=s.media_time_s,
+                                        capture_mono_s=s.capture_mono_s,
+                                        bbox_xyxy=bboxes[i],
+                                        sam_token=cur_tok,
+                                    )
+                                )
+                                prev_kf_idx = s.frame_index
+                                prev_kf_tok = cur_tok
+                            else:
+                                pending_interm.append((s, bboxes[i]))
+                    else:
+                        tokens = extractor.extract_chunk(rgb_list, bboxes, cam_k)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        t2 = time.perf_counter()
+                        for i, s in enumerate(batch_samples):
+                            self._preview.record_bbox(s.frame_index, bboxes[i])
+                            history.append(
+                                FrameFeatureItem(
+                                    frame_index=s.frame_index,
+                                    media_time_s=s.media_time_s,
+                                    capture_mono_s=s.capture_mono_s,
+                                    bbox_xyxy=bboxes[i],
+                                    sam_token=tokens[i],
+                                )
+                            )
 
                     n_b = len(batch_samples)
                     self.telemetry.yolox_ms_per_frame = round(((t1 - t0) * 1000.0) / n_b, 2)
                     self.telemetry.sam_ms_per_frame = round(((t2 - t1) * 1000.0) / n_b, 2)
+                    if history:
+                        self.telemetry.frames_perceived = history[-1].frame_index + 1
 
-                    for i, s in enumerate(batch_samples):
-                        self._preview.record_bbox(s.frame_index, bboxes[i])
+                if eos_reached and pending_interm and prev_kf_tok is not None:
+                    for p_sample, p_bbox in pending_interm:
                         history.append(
                             FrameFeatureItem(
-                                frame_index=s.frame_index,
-                                media_time_s=s.media_time_s,
-                                capture_mono_s=s.capture_mono_s,
-                                bbox_xyxy=bboxes[i],
-                                sam_token=tokens[i],
+                                frame_index=p_sample.frame_index,
+                                media_time_s=p_sample.media_time_s,
+                                capture_mono_s=p_sample.capture_mono_s,
+                                bbox_xyxy=p_bbox,
+                                sam_token=prev_kf_tok.clone(),
                             )
                         )
-                    self.telemetry.frames_perceived = history[-1].frame_index + 1
+                    pending_interm.clear()
+                    if history:
+                        self.telemetry.frames_perceived = history[-1].frame_index + 1
 
                 # Solve every ready stride window `[next_emit_frame - H .. next_emit_frame + S + O + L - 1]`.
                 while history and not self._stop_event.is_set():
@@ -535,10 +653,7 @@ class StreamingMocapEngine:
                 break
 
             now_mono = time.perf_counter()
-            if realtime_source and frame0_mono > 0.0:
-                target_media_s = (now_mono - frame0_mono) - delay_s
-            else:
-                target_media_s = now_mono - playout_origin_mono
+            target_media_s = now_mono - playout_origin_mono
 
             if target_media_s < 0.0:
                 tick += 1
