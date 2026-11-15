@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 import sys
@@ -36,6 +37,10 @@ def bootstrap_runtime() -> None:
         truststore.inject_into_ssl()
     except Exception:
         pass
+
+    # Prevent root DEBUG log handlers (e.g. pytest LogCaptureHandler) from activating PyTorch's
+    # structured FX trace serializer during `torch.compile`.
+    logging.getLogger("torch.__trace").setLevel(logging.WARNING)
 
     for extra in (
         VENDOR_DIR,

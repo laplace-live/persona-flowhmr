@@ -26,7 +26,7 @@ def _combine_batches(batches, device):
 
 @torch.no_grad()
 def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
-                   merge_hands=False):
+                   merge_hands=False, hand_stride=1):
     """Return CPU float32 ``(frames, 3072)`` tokens in body/left/right order.
 
     ``images`` contains RGB uint8 frames, one selected person per frame.
@@ -84,9 +84,14 @@ def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
     context = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
     state_names = ("_batch_size", "_max_num_person", "_person_valid", "body_batch_idx", "hand_batch_idx")
     state = {name: getattr(model, name) for name in state_names if hasattr(model, name)}
+    prev_skip_body = getattr(model.decoder, "_skip_final_pose_output", None)
+    prev_skip_hand = getattr(model.decoder_hand, "_skip_final_pose_output", None)
     handles = []
     try:
         with context:
+            if not original_single:
+                model.decoder._skip_final_pose_output = True
+                model.decoder_hand._skip_final_pose_output = True
             handles.append(model.decoder.register_forward_hook(capture_body))
             handles.append(model.decoder_hand.register_forward_hook(capture_hand))
             if original_single:
@@ -133,17 +138,61 @@ def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
                 else:
                     raise RuntimeError("SAM hand decoder did not produce conditioning tokens")
 
-            if merge_hands:
-                run_hands(range(len(images)), ("left", "right"))
-                hand_tokens = list(hand_tokens.pop().split(len(images), dim=0))
+            n_imgs = len(images)
+            h_stride = max(1, int(hand_stride))
+            if h_stride > 1 and n_imgs >= 2:
+                m_hands = max(1, (n_imgs + h_stride - 1) // h_stride)
+                hand_indices = (
+                    [0]
+                    if m_hands == 1
+                    else np.linspace(0, n_imgs - 1, num=m_hands, dtype=int).tolist()
+                )
             else:
-                run_hands(range(len(images)), ("left",))
-                run_hands(range(len(images)), ("right",))
+                hand_indices = list(range(n_imgs))
+
+            if merge_hands:
+                run_hands(hand_indices, ("left", "right"))
+                hand_tokens = list(hand_tokens.pop().split(len(hand_indices), dim=0))
+            else:
+                run_hands(hand_indices, ("left",))
+                run_hands(hand_indices, ("right",))
+
+            if len(hand_indices) < n_imgs:
+                interp_sides = []
+                for side_tok in hand_tokens:
+                    if len(hand_indices) == 1:
+                        interp_sides.append(side_tok.expand(n_imgs, -1).clone())
+                        continue
+                    full_side = torch.empty((n_imgs, side_tok.shape[-1]), device=side_tok.device, dtype=side_tok.dtype)
+                    seg = 0
+                    for idx in range(n_imgs):
+                        while seg + 1 < len(hand_indices) - 1 and idx > hand_indices[seg + 1]:
+                            seg += 1
+                        i0, i1 = hand_indices[seg], hand_indices[seg + 1]
+                        if idx <= i0 or i1 == i0:
+                            full_side[idx] = side_tok[seg]
+                        elif idx >= i1:
+                            full_side[idx] = side_tok[seg + 1]
+                        else:
+                            alpha = float(idx - i0) / float(i1 - i0)
+                            full_side[idx] = torch.lerp(side_tok[seg], side_tok[seg + 1], alpha)
+                    interp_sides.append(full_side)
+                hand_tokens = interp_sides
 
             return collected_tokens()
     finally:
         for handle in handles:
             handle.remove()
+        if prev_skip_body is None:
+            if hasattr(model.decoder, "_skip_final_pose_output"):
+                delattr(model.decoder, "_skip_final_pose_output")
+        else:
+            model.decoder._skip_final_pose_output = prev_skip_body
+        if prev_skip_hand is None:
+            if hasattr(model.decoder_hand, "_skip_final_pose_output"):
+                delattr(model.decoder_hand, "_skip_final_pose_output")
+        else:
+            model.decoder_hand._skip_final_pose_output = prev_skip_hand
         for name in state_names:
             if name in state:
                 setattr(model, name, state[name])

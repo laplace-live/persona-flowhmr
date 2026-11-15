@@ -137,6 +137,16 @@ _DASHBOARD_HTML = """<!doctype html>
             <option value="replay">Replay / BBox Probe (Debug)</option>
           </select>
         </div>
+        <div class="field">
+          <label>SAM 3D Keyframe Stride (30 Hz Lerp)</label>
+          <select id="sam_stride">
+            <option value="5">Stride 5 · 6 Hz Keyframes (Real-Time w/ Persona)</option>
+            <option value="6">Stride 6 · 5 Hz Keyframes (Lightest GPU Load)</option>
+            <option value="3">Stride 3 · 10 Hz Keyframes (Headless Max)</option>
+            <option value="2">Stride 2 · 15 Hz Keyframes</option>
+            <option value="1">Stride 1 · 30 Hz Every Frame (Offline)</option>
+          </select>
+        </div>
       </section>
 
       <section class="card">
@@ -144,10 +154,10 @@ _DASHBOARD_HTML = """<!doctype html>
         <div class="field">
           <label>Sliding-Window Latency Preset</label>
           <select id="preset">
-            <option value="low">Low Latency (~1.15s · W=86 · 10 steps)</option>
-            <option value="balanced">Balanced (~1.65s · W=102 · 10 steps)</option>
-            <option value="high">High Smoothness (~2.45s · W=124 · 20 steps)</option>
-            <option value="max">Max Narrowband (~3.50s · W=156 · 20 steps)</option>
+            <option value="low">Low Latency (~2.20s · W=85 · 8 steps)</option>
+            <option value="balanced">Balanced (~2.75s · W=108 · 10 steps)</option>
+            <option value="high">High Smoothness (~2.95s · W=116 · 20 steps)</option>
+            <option value="max">Max Narrowband (~3.95s · W=146 · 20 steps)</option>
           </select>
         </div>
         <div class="row">
@@ -245,6 +255,7 @@ _DASHBOARD_HTML = """<!doctype html>
         loop_video: document.getElementById('loop_video').checked,
         camera_index: parseInt(document.getElementById('camera_index').value || '0', 10),
         perception_backend: document.getElementById('perception_backend').value,
+        sam_stride: parseInt(document.getElementById('sam_stride').value || '5', 10),
         preset: document.getElementById('preset').value,
         playout_fps: parseInt(document.getElementById('playout_fps').value, 10),
         mirror: document.getElementById('mirror').checked,
@@ -294,6 +305,7 @@ _DASHBOARD_HTML = """<!doctype html>
           document.getElementById('video_path').value = c.video_path;
           document.getElementById('loop_video').checked = c.loop_video;
           document.getElementById('perception_backend').value = c.perception_backend;
+          document.getElementById('sam_stride').value = String(c.sam_stride || 5);
           document.getElementById('preset').value = c.preset;
           document.getElementById('playout_fps').value = String(c.playout_fps);
           document.getElementById('mirror').checked = c.mirror;

@@ -40,47 +40,47 @@ class LatencyPreset:
 LATENCY_PRESETS: dict[PresetName, LatencyPreset] = {
     "low": LatencyPreset(
         name="low",
-        label="Low Latency (~1.15s)",
+        label="Low Latency (~2.20s)",
         history_frames=60,
-        stride_frames=16,
+        stride_frames=15,
         overlap_frames=4,
         lookahead_frames=6,
-        ode_steps=10,
-        sam_chunk_size=8,
-        playout_delay_s=1.15,
+        ode_steps=8,
+        sam_chunk_size=6,
+        playout_delay_s=2.20,
     ),
     "balanced": LatencyPreset(
         name="balanced",
-        label="Balanced (~1.65s)",
+        label="Balanced (~2.75s)",
         history_frames=60,
-        stride_frames=24,
+        stride_frames=30,
         overlap_frames=6,
         lookahead_frames=12,
         ode_steps=10,
-        sam_chunk_size=8,
-        playout_delay_s=1.65,
+        sam_chunk_size=6,
+        playout_delay_s=2.75,
     ),
     "high": LatencyPreset(
         name="high",
-        label="High Smoothness (~2.45s)",
+        label="High Smoothness (~2.95s)",
         history_frames=60,
-        stride_frames=32,
+        stride_frames=30,
         overlap_frames=8,
-        lookahead_frames=24,
+        lookahead_frames=18,
         ode_steps=20,
-        sam_chunk_size=8,
-        playout_delay_s=2.45,
+        sam_chunk_size=6,
+        playout_delay_s=2.95,
     ),
     "max": LatencyPreset(
         name="max",
-        label="Max Narrowband Context (~3.50s)",
+        label="Max Narrowband Context (~3.95s)",
         history_frames=60,
-        stride_frames=36,
+        stride_frames=30,
         overlap_frames=10,
-        lookahead_frames=50,
+        lookahead_frames=46,
         ode_steps=20,
-        sam_chunk_size=8,
-        playout_delay_s=3.50,
+        sam_chunk_size=6,
+        playout_delay_s=3.95,
     ),
 }
 
@@ -101,6 +101,7 @@ class EngineConfig:
     mirror: bool = False
     follow_movement: bool = True
     torch_compile: bool = True
+    sam_stride: Literal[1, 2, 3, 5, 6] = 5
     perception_backend: PerceptionBackend = "auto"
     replay_tokens_path: str = ""
 
