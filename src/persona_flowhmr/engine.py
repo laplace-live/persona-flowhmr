@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections import deque
+import ctypes
 from dataclasses import dataclass
 import queue
+import sys
 import threading
 import time
 from typing import Any
@@ -60,10 +62,26 @@ _BODY22_LIMBS: tuple[tuple[int, int], ...] = tuple(
 )
 
 
+_WINMM_TIMER_ENABLED = False
+
+
+def _enable_windows_high_res_timer() -> None:
+    """Request 1 ms OS timer resolution on Windows so 30/60 Hz `time.sleep` avoids 15.6 ms jitter."""
+    global _WINMM_TIMER_ENABLED
+    if _WINMM_TIMER_ENABLED or sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+        _WINMM_TIMER_ENABLED = True
+    except Exception:
+        pass
+
+
 class StreamingMocapEngine:
     """Real-time buffered single-camera mocap engine sending VMC (UDP) and Persona Plugin API."""
 
     def __init__(self, config: EngineConfig | None = None) -> None:
+        _enable_windows_high_res_timer()
         self.config = config or EngineConfig()
         self._lock = threading.Lock()
         self.telemetry = EngineTelemetry()
@@ -71,6 +89,8 @@ class StreamingMocapEngine:
         self._preview = PreviewRingBuffer(max_items=300, max_width=640)
         self._playout_buffer = PosePlayoutBuffer(max_frames=900)
         self._latest_emitted_pose: CanonicalPoseFrame | None = None
+        self._live_jpeg_cache: tuple[Any, bytes] | None = None
+        self._synced_jpeg_cache: tuple[Any, bytes] | None = None
 
         self._vmc_sender: VmcUdpSender | None = None
         self._plugin_client: PersonaPluginClient | None = None
@@ -99,6 +119,9 @@ class StreamingMocapEngine:
             "preset",
             "perception_backend",
             "sam_stride",
+            "hand_mode",
+            "yolo_size",
+            "yolo_stride",
             "replay_tokens_path",
             "torch_compile",
         }
@@ -162,10 +185,19 @@ class StreamingMocapEngine:
         """Load YOLOX-L, FlowHMR MMDiT, MotionLatentDecoder, and selected SAM/Replay extractor."""
         device = "cuda" if torch.cuda.is_available() else "cpu"
         preset = self.config.get_preset()
+        yolo_hw = self.config.effective_yolo_size()
+        yolo_stride = max(1, int(self.config.yolo_stride))
 
         if self._yolox is None:
-            self._yolox = BatchedYoloxTracker(ckpt_path=YOLOX_CKPT_PATH, device=device)
+            self._yolox = BatchedYoloxTracker(
+                ckpt_path=YOLOX_CKPT_PATH,
+                device=device,
+                test_size=yolo_hw,
+                yolo_stride=yolo_stride,
+            )
         else:
+            self._yolox.test_size = yolo_hw
+            self._yolox.yolo_stride = yolo_stride
             self._yolox.reset_tracker()
 
         if self._solver is None:
@@ -190,14 +222,23 @@ class StreamingMocapEngine:
             extractor = ReplayTokenExtractor(self.config.replay_tokens_path or None)
             active_backend = "replay" if self.config.replay_tokens_path else "bbox-probe"
         elif backend == "sam3d" or (backend == "auto" and is_sam3d_available()):
+            eff_hand_mode = self.config.effective_hand_mode()
             if self._sam3d is None:
                 self._sam3d = Sam3DStreamExtractor(
                     device=device,
                     use_compile=self.config.torch_compile,
                     chunk_size=preset.sam_chunk_size,
+                    hand_mode=eff_hand_mode,
+                    body_decoder_layers=preset.body_decoder_layers,
+                    hand_decoder_layers=preset.hand_decoder_layers,
                 )
             else:
-                self._sam3d.chunk_size = preset.sam_chunk_size
+                self._sam3d.configure(
+                    chunk_size=preset.sam_chunk_size,
+                    hand_mode=eff_hand_mode,
+                    body_decoder_layers=preset.body_decoder_layers,
+                    hand_decoder_layers=preset.hand_decoder_layers,
+                )
             extractor = self._sam3d
             active_backend = "sam3d"
         else:
@@ -219,6 +260,8 @@ class StreamingMocapEngine:
         self._preview.clear()
         self._playout_buffer.clear()
         self._latest_emitted_pose = None
+        self._live_jpeg_cache = None
+        self._synced_jpeg_cache = None
         self.telemetry = EngineTelemetry(
             state="warming_up",
             target_latency_ms=self.config.get_preset().playout_delay_s * 1000.0,
@@ -367,12 +410,13 @@ class StreamingMocapEngine:
 
             preset = self.config.get_preset()
             kf_chunk = preset.sam_chunk_size
-            sam_stride = int(self.config.sam_stride) if isinstance(extractor, Sam3DStreamExtractor) else 1
+            sam_stride = self.config.effective_sam_stride() if isinstance(extractor, Sam3DStreamExtractor) else 1
             sam_stride = max(1, sam_stride)
 
             # Pre-compile SAM 3D Body + MMDiT static shapes before buffering starts so live windows
             # never pay Dynamo/Triton compilation latency mid-stream.
-            self._yolox.warmup(kf_chunk * sam_stride)
+            yolo_warm_n = max(1, (kf_chunk * sam_stride + self._yolox.yolo_stride) // self._yolox.yolo_stride)
+            self._yolox.warmup(yolo_warm_n)
             if isinstance(extractor, Sam3DStreamExtractor):
                 extractor.warmup(kf_chunk)
             self._solver.warmup(preset.window_frames, steps=2)
@@ -389,7 +433,6 @@ class StreamingMocapEngine:
             prev_kf_idx: int | None = None
             prev_kf_tok: torch.Tensor | None = None
             pending_interm: list[tuple[SampledFrame, np.ndarray]] = []
-            stashed_reset_item: SampledFrame | None = None
 
             while not self._stop_event.is_set() and not eos_reached:
                 if isinstance(extractor, Sam3DStreamExtractor) and sam_stride > 1:
@@ -401,49 +444,24 @@ class StreamingMocapEngine:
                     batch_goal = min(kf_chunk, max(1, needed_frames))
 
                 batch_samples: list[SampledFrame] = []
-                if stashed_reset_item is not None:
-                    batch_samples.append(stashed_reset_item)
-                    stashed_reset_item = None
-
                 while len(batch_samples) < batch_goal and not self._stop_event.is_set():
                     try:
-                        item = frame_queue.get(timeout=0.1)
+                        item = frame_queue.get(timeout=0.05)
                     except queue.Empty:
                         continue
                     if item is None:
                         eos_reached = True
                         break
-                    if item.is_stream_reset and item.frame_index > 0 and batch_samples:
-                        stashed_reset_item = item
-                        break
                     batch_samples.append(item)
-
-                if batch_samples and batch_samples[0].is_stream_reset and batch_samples[0].frame_index > 0:
-                    if pending_interm and prev_kf_tok is not None:
-                        for p_sample, p_bbox in pending_interm:
-                            history.append(
-                                FrameFeatureItem(
-                                    frame_index=p_sample.frame_index,
-                                    media_time_s=p_sample.media_time_s,
-                                    capture_mono_s=p_sample.capture_mono_s,
-                                    bbox_xyxy=p_bbox,
-                                    sam_token=prev_kf_tok.clone(),
-                                )
-                            )
-                        pending_interm.clear()
-                    prev_kf_idx = None
-                    prev_kf_tok = None
-                    self._yolox.reset_tracker()
-                    if isinstance(extractor, ReplayTokenExtractor):
-                        extractor.reset()
 
                 if batch_samples:
                     rgb_list = [s.rgb for s in batch_samples]
+                    reset_flags = [bool(s.is_stream_reset and s.frame_index > 0) for s in batch_samples]
                     h, w = rgb_list[0].shape[:2]
                     cam_k = np.repeat(default_camera_intrinsics(h, w)[None], len(rgb_list), axis=0)
 
                     t0 = time.perf_counter()
-                    bboxes = self._yolox.detect_and_track_batch(rgb_list)
+                    bboxes = self._yolox.detect_and_track_batch(rgb_list, reset_flags=reset_flags)
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     t1 = time.perf_counter()
@@ -452,11 +470,21 @@ class StreamingMocapEngine:
                         last_planned_kf = prev_kf_idx
                         kf_indices: list[int] = []
                         for i, s in enumerate(batch_samples):
-                            if last_planned_kf is None or (s.frame_index - last_planned_kf) >= sam_stride:
+                            if (
+                                reset_flags[i]
+                                or last_planned_kf is None
+                                or (s.frame_index - last_planned_kf) >= sam_stride
+                            ):
                                 kf_indices.append(i)
                                 last_planned_kf = s.frame_index
-                        if eos_reached and (len(batch_samples) - 1) not in kf_indices:
-                            kf_indices.append(len(batch_samples) - 1)
+
+                        last_batch_pos = len(batch_samples) - 1
+                        if last_batch_pos >= 0 and last_batch_pos not in kf_indices:
+                            # Keep batch boundary phase-locked across video loop resets without adding padding.
+                            if kf_indices and not reset_flags[kf_indices[-1]]:
+                                kf_indices[-1] = last_batch_pos
+                            else:
+                                kf_indices.append(last_batch_pos)
 
                         kf_tokens = (
                             extractor.extract_chunk(
@@ -474,6 +502,23 @@ class StreamingMocapEngine:
                         kf_map = {kf_indices[pos]: kf_tokens[pos] for pos in range(len(kf_indices))}
                         for i, s in enumerate(batch_samples):
                             self._preview.record_bbox(s.frame_index, bboxes[i])
+                            if reset_flags[i]:
+                                # Flush pre-cut intermediate frames without blending across a loop rewind.
+                                if pending_interm and prev_kf_tok is not None:
+                                    for p_sample, p_bbox in pending_interm:
+                                        history.append(
+                                            FrameFeatureItem(
+                                                frame_index=p_sample.frame_index,
+                                                media_time_s=p_sample.media_time_s,
+                                                capture_mono_s=p_sample.capture_mono_s,
+                                                bbox_xyxy=p_bbox,
+                                                sam_token=prev_kf_tok.clone(),
+                                            )
+                                        )
+                                    pending_interm.clear()
+                                prev_kf_idx = None
+                                prev_kf_tok = None
+
                             if i in kf_map:
                                 cur_tok = kf_map[i]
                                 if prev_kf_tok is not None and prev_kf_idx is not None and pending_interm:
@@ -505,7 +550,32 @@ class StreamingMocapEngine:
                             else:
                                 pending_interm.append((s, bboxes[i]))
                     else:
-                        tokens = extractor.extract_chunk(rgb_list, bboxes, cam_k)
+                        if isinstance(extractor, ReplayTokenExtractor) and any(reset_flags):
+                            pieces: list[torch.Tensor] = []
+                            seg_start = 0
+                            for i, is_rst in enumerate(reset_flags):
+                                if is_rst and i > seg_start:
+                                    pieces.append(
+                                        extractor.extract_chunk(
+                                            rgb_list[seg_start:i],
+                                            bboxes[seg_start:i],
+                                            cam_k[seg_start:i],
+                                        )
+                                    )
+                                    extractor.reset()
+                                    seg_start = i
+                                elif is_rst:
+                                    extractor.reset()
+                            pieces.append(
+                                extractor.extract_chunk(
+                                    rgb_list[seg_start:],
+                                    bboxes[seg_start:],
+                                    cam_k[seg_start:],
+                                )
+                            )
+                            tokens = torch.cat(pieces, dim=0)
+                        else:
+                            tokens = extractor.extract_chunk(rgb_list, bboxes, cam_k)
                         if torch.cuda.is_available():
                             torch.cuda.synchronize()
                         t2 = time.perf_counter()
@@ -645,9 +715,11 @@ class StreamingMocapEngine:
             dt_out = 1.0 / fps_out
             target_wall = playout_origin_mono + tick * dt_out
             sleep_s = target_wall - time.perf_counter()
-            if sleep_s > 0.0015:
-                time.sleep(sleep_s - 0.0008)
-            while time.perf_counter() < target_wall and not self._stop_event.is_set():
+            if sleep_s > 0.0012:
+                time.sleep(sleep_s - 0.0005)
+            # Bounded sub-millisecond spin without monopolizing Python's GIL across OS quanta.
+            spin_deadline = time.perf_counter() + 0.0008
+            while time.perf_counter() < target_wall and time.perf_counter() < spin_deadline:
                 pass
             if self._stop_event.is_set():
                 break
@@ -659,8 +731,15 @@ class StreamingMocapEngine:
                 tick += 1
                 continue
 
+            was_started = self._latest_emitted_pose is not None
             sample = self._playout_buffer.sample_at_media_time(target_media_s)
             if sample is not None:
+                if sample.underrun and was_started and realtime_source:
+                    # Smoothly slip playout origin by up to one tick if external GPU load momentarily spikes
+                    # so playout never accumulates catch-up lag or fast-forward lurches.
+                    slip_s = min(dt_out, max(0.0, target_media_s - sample.pose.media_time_s))
+                    playout_origin_mono += slip_s
+
                 pose = sample.pose
                 self._latest_emitted_pose = pose
                 self.telemetry.buffer_lead_ms = round(sample.buffer_lead_ms, 1)
@@ -705,9 +784,17 @@ class StreamingMocapEngine:
         if got is None:
             return None
         f_idx, bgr, bbox, orig_hw = got
+        cache_key = (f_idx, bbox)
+        cached = self._live_jpeg_cache
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
         self._draw_bbox_overlay(bgr, bbox, orig_hw, label=f"LIVE #{f_idx}")
-        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-        return buf.tobytes() if ok else None
+        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ok:
+            return None
+        data = buf.tobytes()
+        self._live_jpeg_cache = (cache_key, data)
+        return data
 
     def render_synced_playout_jpeg(self) -> bytes | None:
         """Encode the latency-synced frame matching the exact VMC pose currently playing out."""
@@ -717,8 +804,16 @@ class StreamingMocapEngine:
             if got is None:
                 return None
             f_idx, bgr, bbox, orig_hw = got
+            cache_key: Any = ("buf", f_idx, bbox)
+            cached = self._synced_jpeg_cache
+            if cached is not None and cached[0] == cache_key:
+                return cached[1]
             self._draw_bbox_overlay(bgr, bbox, orig_hw, label=f"BUFFERING #{f_idx}")
         else:
+            cache_key = ("play", pose.frame_index, round(pose.media_time_s, 4), self.config.mirror)
+            cached = self._synced_jpeg_cache
+            if cached is not None and cached[0] == cache_key:
+                return cached[1]
             got = self._preview.get_synced_bgr(pose.frame_index)
             if got is None:
                 return None
@@ -728,8 +823,12 @@ class StreamingMocapEngine:
             if self.config.mirror:
                 bgr = cv2.flip(bgr, 1)
 
-        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-        return buf.tobytes() if ok else None
+        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ok:
+            return None
+        data = buf.tobytes()
+        self._synced_jpeg_cache = (cache_key, data)
+        return data
 
     @staticmethod
     def _draw_bbox_overlay(

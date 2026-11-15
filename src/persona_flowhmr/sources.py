@@ -33,30 +33,41 @@ class PreviewRingBuffer:
 
     def __init__(self, max_items: int = 240, max_width: int = 640) -> None:
         self._lock = threading.Lock()
+        self._max_items = int(max_items)
         self._max_width = max_width
-        self._frames: deque[tuple[int, np.ndarray]] = deque(maxlen=max_items)
+        self._order: deque[int] = deque()
+        self._frame_map: dict[int, np.ndarray] = {}
         self._bboxes: dict[int, tuple[float, float, float, float]] = {}
         self._orig_hw: tuple[int, int] = (720, 1280)
 
     def clear(self) -> None:
         with self._lock:
-            self._frames.clear()
+            self._order.clear()
+            self._frame_map.clear()
             self._bboxes.clear()
 
     def record_frame(self, frame_index: int, rgb: np.ndarray) -> None:
         h, w = rgb.shape[:2]
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         if w > self._max_width:
             scale = self._max_width / float(w)
-            bgr = cv2.resize(bgr, (self._max_width, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+            small_rgb = cv2.resize(
+                rgb,
+                (self._max_width, max(1, int(round(h * scale)))),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            bgr = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2BGR)
+        else:
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        f_idx = int(frame_index)
         with self._lock:
             self._orig_hw = (h, w)
-            self._frames.append((frame_index, bgr))
-            if self._frames:
-                oldest = self._frames[0][0]
-                stale = [k for k in self._bboxes if k < oldest]
-                for k in stale:
-                    self._bboxes.pop(k, None)
+            if f_idx not in self._frame_map:
+                self._order.append(f_idx)
+            self._frame_map[f_idx] = bgr
+            while len(self._order) > self._max_items:
+                evicted = self._order.popleft()
+                self._frame_map.pop(evicted, None)
+                self._bboxes.pop(evicted, None)
 
     def record_bbox(self, frame_index: int, bbox_xyxy: np.ndarray | tuple[float, float, float, float]) -> None:
         with self._lock:
@@ -69,18 +80,26 @@ class PreviewRingBuffer:
 
     def get_latest_bgr(self) -> tuple[int, np.ndarray, tuple[float, float, float, float] | None, tuple[int, int]] | None:
         with self._lock:
-            if not self._frames:
+            if not self._order:
                 return None
-            f_idx, bgr = self._frames[-1]
+            f_idx = self._order[-1]
+            bgr = self._frame_map.get(f_idx)
+            if bgr is None:
+                return None
             return f_idx, bgr.copy(), self._bboxes.get(f_idx), self._orig_hw
 
     def get_synced_bgr(
         self, target_frame_index: int
     ) -> tuple[int, np.ndarray, tuple[float, float, float, float] | None, tuple[int, int]] | None:
+        target = int(target_frame_index)
         with self._lock:
-            if not self._frames:
+            if not self._order:
                 return None
-            best_idx, best_bgr = min(self._frames, key=lambda item: abs(item[0] - target_frame_index))
+            exact = self._frame_map.get(target)
+            if exact is not None:
+                return target, exact.copy(), self._bboxes.get(target), self._orig_hw
+            best_idx = min(self._order, key=lambda idx: abs(idx - target))
+            best_bgr = self._frame_map[best_idx]
             return best_idx, best_bgr.copy(), self._bboxes.get(best_idx), self._orig_hw
 
 

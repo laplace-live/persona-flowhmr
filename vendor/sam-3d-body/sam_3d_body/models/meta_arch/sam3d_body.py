@@ -1025,34 +1025,27 @@ class SAM3DBody(BaseModel):
         return pose_output
 
     def get_ray_condition(self, batch):
-        B, N, _, H, W = batch["img"].shape
-        meshgrid_xy = (
-            torch.stack(
-                torch.meshgrid(torch.arange(H), torch.arange(W), indexing="xy"), dim=2
-            )[None, None, :, :, :]
-            .repeat(B, N, 1, 1, 1)
-            .cuda()
-        )  # B x N x H x W x 2
-        meshgrid_xy = (
-            meshgrid_xy / batch["affine_trans"][:, :, None, None, [0, 1], [0, 1]]
+        img = batch["img"]
+        B, N, _, H, W = img.shape
+        dev = img.device
+        dtype = batch["affine_trans"].dtype
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(H, device=dev, dtype=dtype),
+            torch.arange(W, device=dev, dtype=dtype),
+            indexing="ij",
         )
+        meshgrid_xy = torch.stack((grid_x, grid_y), dim=-1)[None, None]  # 1 x 1 x H x W x 2
+        inv_scale = 1.0 / batch["affine_trans"][:, :, None, None, [0, 1], [0, 1]]
         meshgrid_xy = (
-            meshgrid_xy
-            - batch["affine_trans"][:, :, None, None, [0, 1], [2, 2]]
-            / batch["affine_trans"][:, :, None, None, [0, 1], [0, 1]]
-        )
+            meshgrid_xy - batch["affine_trans"][:, :, None, None, [0, 1], [2, 2]]
+        ) * inv_scale
 
         # Subtract out center & normalize to be rays
-        meshgrid_xy = (
-            meshgrid_xy - batch["cam_int"][:, None, None, None, [0, 1], [2, 2]]
-        )
-        meshgrid_xy = (
-            meshgrid_xy / batch["cam_int"][:, None, None, None, [0, 1], [0, 1]]
-        )
+        cam_c = batch["cam_int"][:, None, None, None, [0, 1], [2, 2]].to(dtype=dtype)
+        cam_f = batch["cam_int"][:, None, None, None, [0, 1], [0, 1]].to(dtype=dtype)
+        meshgrid_xy = (meshgrid_xy - cam_c) / cam_f
 
-        return meshgrid_xy.permute(0, 1, 4, 2, 3).to(
-            batch["img"].dtype
-        )  # This is B x num_person x 2 x H x W
+        return meshgrid_xy.permute(0, 1, 4, 2, 3).to(img.dtype).contiguous()
 
     def forward_pose_branch(self, batch: Dict) -> Dict:
         """Run a forward pass for the crop-image (pose) branch."""

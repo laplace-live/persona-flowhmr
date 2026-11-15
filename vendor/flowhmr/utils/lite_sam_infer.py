@@ -14,6 +14,10 @@ class _HandTokensReady(Exception):
     """Local control flow: the hand decoder has produced its conditioning token."""
 
 
+class _BodyTokensReady(Exception):
+    """Local control flow: body-only fast mode has produced its conditioning token."""
+
+
 def _combine_batches(batches, device):
     # Each frame occupies the batch axis, with its own intrinsics. The person
     # axis stays at one even when left and right crops share a forward pass.
@@ -25,18 +29,33 @@ def _combine_batches(batches, device):
 
 
 @torch.no_grad()
-def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
-                   merge_hands=False, hand_stride=1):
+def extract_tokens(
+    estimator,
+    images,
+    boxes,
+    cameras,
+    *,
+    gpu_preprocess=False,
+    merge_hands=False,
+    hand_stride=1,
+    hand_mode="full",
+    neutral_hand_tokens=None,
+    body_decoder_layers=None,
+    hand_decoder_layers=None,
+):
     """Return CPU float32 ``(frames, 3072)`` tokens in body/left/right order.
 
     ``images`` contains RGB uint8 frames, one selected person per frame.
-    CPU crops and separate hand passes at batch size one preserve the original
-    operations leading to the tokens. Batching/GPU crops are optional and may
-    introduce floating-point differences. Full SAM outputs use the estimator's
-    original ``process_one_image`` entry point instead.
+    ``hand_mode`` supports:
+      - ``"full"``: full body + hand crops (subsampled by ``hand_stride``).
+      - ``"fast"``: truncated decoder layers + subsampled merged hand crops.
+      - ``"off"``: body-only inference stopping immediately after ``model.decoder``
+        and filling hand conditioning slots with ``neutral_hand_tokens`` (or zeros).
     """
     if not images or len(images) != len(boxes) or len(images) != len(cameras):
         raise ValueError("Expected equally sized, nonempty images, boxes and cameras")
+    if hand_mode not in ("full", "fast", "off"):
+        raise ValueError(f"Unsupported hand_mode: {hand_mode}")
     boxes = torch.as_tensor(boxes).detach().cpu().numpy().reshape(-1, 4)
     cameras = torch.as_tensor(cameras).detach().cpu().reshape(-1, 3, 3)
     if len(boxes) != len(images) or len(cameras) != len(images):
@@ -52,10 +71,19 @@ def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
     device = torch.device(estimator.device)
     model = estimator.model
     body_tokens, hand_tokens = [], []
-    original_single = len(images) == 1 and not gpu_preprocess and not merge_hands
+    original_single = (
+        len(images) == 1
+        and not gpu_preprocess
+        and not merge_hands
+        and hand_mode == "full"
+        and body_decoder_layers is None
+        and hand_decoder_layers is None
+    )
 
     def capture_body(_module, _args, output):
         body_tokens.append(output[0].detach() if original_single else output[0][:, 0].detach().clone())
+        if hand_mode == "off":
+            raise _BodyTokensReady
 
     def capture_hand(_module, _args, output):
         hand_tokens.append(output[0].detach() if original_single else output[0][:, 0].detach().clone())
@@ -79,25 +107,31 @@ def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
             return prepare_gpu_batch(image, box[None], camera[None], transform)
         return prepare_batch(image, transform, box[None], cam_int=camera[None])
 
-    # Upstream helpers use the current CUDA device internally. Scope it to the
-    # estimator, including when callers select a non-default GPU.
     context = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
     state_names = ("_batch_size", "_max_num_person", "_person_valid", "body_batch_idx", "hand_batch_idx")
     state = {name: getattr(model, name) for name in state_names if hasattr(model, name)}
     prev_skip_body = getattr(model.decoder, "_skip_final_pose_output", None)
     prev_skip_hand = getattr(model.decoder_hand, "_skip_final_pose_output", None)
+    prev_max_body = getattr(model.decoder, "_max_layers", None)
+    prev_max_hand = getattr(model.decoder_hand, "_max_layers", None)
+    prev_kp_body = getattr(model.head_pose, "_keypoints_only", None)
+    prev_kp_hand = getattr(model.head_pose_hand, "_keypoints_only", None)
     handles = []
     try:
         with context:
             if not original_single:
                 model.decoder._skip_final_pose_output = True
                 model.decoder_hand._skip_final_pose_output = True
+                model.head_pose._keypoints_only = True
+                model.head_pose_hand._keypoints_only = True
+                if body_decoder_layers is not None:
+                    model.decoder._max_layers = int(body_decoder_layers)
+                if hand_decoder_layers is not None:
+                    model.decoder_hand._max_layers = int(hand_decoder_layers)
             handles.append(model.decoder.register_forward_hook(capture_body))
-            handles.append(model.decoder_hand.register_forward_hook(capture_hand))
+            if hand_mode != "off":
+                handles.append(model.decoder_hand.register_forward_hook(capture_hand))
             if original_single:
-                # Keep the public estimator's exact preprocessing and scheduling
-                # for the default path. Only computation after both hand tokens
-                # have been produced is omitted.
                 try:
                     estimator.process_one_image(
                         images[0], bboxes=boxes, cam_int=cameras, inference_type="full",
@@ -105,16 +139,39 @@ def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
                 except _HandTokensReady:
                     pass
                 return collected_tokens()
-            frames = ([torch.as_tensor(np.ascontiguousarray(img), device=device) for img in images]
-                      if gpu_preprocess else images)
-            body_batch = _combine_batches([
-                prepare(image, box, camera, estimator.transform)
-                for image, box, camera in zip(frames, boxes, cameras)
-            ], device)
+
+            frames = (
+                [torch.as_tensor(np.ascontiguousarray(img), device=device) for img in images]
+                if gpu_preprocess
+                else images
+            )
+            body_batch = _combine_batches(
+                [
+                    prepare(image, box, camera, estimator.transform)
+                    for image, box, camera in zip(frames, boxes, cameras)
+                ],
+                device,
+            )
             model._initialize_batch(body_batch)
+
+            if hand_mode == "off":
+                try:
+                    model.forward_step(body_batch, decoder_type="body")
+                except _BodyTokensReady:
+                    pass
+                del body_batch
+                if len(body_tokens) != 1:
+                    raise RuntimeError("SAM body decoder did not produce conditioning tokens")
+                b_cpu = body_tokens[0].to(device="cpu", dtype=torch.float32)
+                n_imgs = len(images)
+                if neutral_hand_tokens is not None:
+                    nh = torch.as_tensor(neutral_hand_tokens, dtype=torch.float32, device="cpu").reshape(1, 2048)
+                    h_cpu = nh.expand(n_imgs, 2048)
+                else:
+                    h_cpu = torch.zeros((n_imgs, 2048), dtype=torch.float32)
+                return torch.cat([b_cpu, h_cpu], dim=-1)
+
             body = model.forward_step(body_batch, decoder_type="body")
-            # Upstream _get_hand_box indexes affine_trans[0, person]. Expose the
-            # flattened frame transforms in that layout without mixing cameras.
             geometry = {"affine_trans": body_batch["affine_trans"].flatten(0, 1).unsqueeze(0)}
             left_boxes, right_boxes = model._get_hand_box(body, geometry)
             del body, body_batch
@@ -183,16 +240,20 @@ def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
     finally:
         for handle in handles:
             handle.remove()
-        if prev_skip_body is None:
-            if hasattr(model.decoder, "_skip_final_pose_output"):
-                delattr(model.decoder, "_skip_final_pose_output")
-        else:
-            model.decoder._skip_final_pose_output = prev_skip_body
-        if prev_skip_hand is None:
-            if hasattr(model.decoder_hand, "_skip_final_pose_output"):
-                delattr(model.decoder_hand, "_skip_final_pose_output")
-        else:
-            model.decoder_hand._skip_final_pose_output = prev_skip_hand
+
+        def _restore_attr(obj, attr, prev):
+            if prev is None:
+                if hasattr(obj, attr):
+                    delattr(obj, attr)
+            else:
+                setattr(obj, attr, prev)
+
+        _restore_attr(model.decoder, "_skip_final_pose_output", prev_skip_body)
+        _restore_attr(model.decoder_hand, "_skip_final_pose_output", prev_skip_hand)
+        _restore_attr(model.decoder, "_max_layers", prev_max_body)
+        _restore_attr(model.decoder_hand, "_max_layers", prev_max_hand)
+        _restore_attr(model.head_pose, "_keypoints_only", prev_kp_body)
+        _restore_attr(model.head_pose_hand, "_keypoints_only", prev_kp_hand)
         for name in state_names:
             if name in state:
                 setattr(model, name, state[name])

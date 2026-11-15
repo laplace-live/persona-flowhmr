@@ -125,7 +125,10 @@ class PromptableDecoder(nn.Module):
             assert token_to_pose_output_fn is not None
             all_pose_outputs = []
 
-        for layer_idx, layer in enumerate(self.layers):
+        max_layers = getattr(self, "_max_layers", None)
+        active_layers = self.layers[:max_layers] if max_layers is not None else self.layers
+
+        for layer_idx, layer in enumerate(active_layers):
             if hand_embeddings is None:
                 token_embedding, image_embedding = layer(
                     token_embedding,
@@ -144,7 +147,7 @@ class PromptableDecoder(nn.Module):
                 )
                 image_embedding = image_embedding[:, : image_augment.shape[1]]
 
-            if self.do_interm_preds and layer_idx < len(self.layers) - 1:
+            if self.do_interm_preds and layer_idx < len(active_layers) - 1:
                 curr_pose_output = token_to_pose_output_fn(
                     self.norm_final(token_embedding),
                     prev_pose_output=(

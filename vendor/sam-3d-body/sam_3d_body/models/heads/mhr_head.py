@@ -183,6 +183,7 @@ class MHRHead(nn.Module):
         scale_offsets=None,
         vertex_offsets=None,
         max_keypoints: Optional[int] = None,
+        return_vertices: bool = True,
     ):
 
         if self.enable_hand_model:
@@ -239,10 +240,14 @@ class MHRHead(nn.Module):
         )
         curr_skinned_verts = curr_skinned_verts / 100
         curr_joint_coords = curr_joint_coords / 100
-        curr_joint_rots = roma.unitquat_to_rotmat(curr_joint_quats)
+        curr_joint_rots = (
+            roma.unitquat_to_rotmat(curr_joint_quats)
+            if return_joint_rotations
+            else None
+        )
 
         # Prepare returns
-        to_return = [curr_skinned_verts]
+        to_return = [curr_skinned_verts if return_vertices else None]
         if return_keypoints:
             # Get sapiens 308 keypoints
             model_vert_joints = torch.cat(
@@ -327,6 +332,31 @@ class MHRHead(nn.Module):
         count += self.num_hand_comps * 2
         pred_face = pred[:, count : count + self.num_face_comps] * 0
         count += self.num_face_comps
+
+        keypoints_only = getattr(self, "_keypoints_only", False)
+        if keypoints_only:
+            _, j3d = self.mhr_forward(
+                global_trans=global_trans,
+                global_rot=global_rot_euler,
+                body_pose_params=pred_pose_euler,
+                hand_pose_params=pred_hand,
+                scale_params=pred_scale,
+                shape_params=pred_shape,
+                expr_params=pred_face,
+                do_pcblend=do_pcblend,
+                return_keypoints=True,
+                return_joint_coords=False,
+                return_model_params=False,
+                return_joint_rotations=False,
+                max_keypoints=70,
+                return_vertices=False,
+            )
+            j3d = j3d[:, :70]
+            j3d[..., [1, 2]] *= -1
+            return {
+                "pred_keypoints_3d": j3d.reshape(batch_size, -1, 3),
+                "pred_vertices": None,
+            }
 
         # Run everything through mhr
         output = self.mhr_forward(
