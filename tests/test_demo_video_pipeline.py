@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import socket
 import struct
 import threading
 import time
-from fastapi.testclient import TestClient
+
 import numpy as np
 import pytest
+from fastapi.testclient import TestClient
 
 from persona_flowhmr.config import EngineConfig
 from persona_flowhmr.engine import StreamingMocapEngine
@@ -34,7 +34,7 @@ def test_streaming_demo_video_vmc_and_webui() -> None:
             try:
                 data, _ = recv_sock.recvfrom(65535)
                 received_packets.append((time.perf_counter(), data))
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break

@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-from collections import deque
 import ctypes
-from dataclasses import dataclass
 import queue
 import sys
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Any
+
 import cv2
 import numpy as np
 import torch
 
-from .config import EngineConfig, LATENCY_PRESETS
+from .config import LATENCY_PRESETS, EngineConfig
 from .paths import FLOWHMR_CFG_PATH, FLOWHMR_CKPT_PATH, MOTION_STATS_PATH, YOLOX_CKPT_PATH
 from .perception import (
     BatchedYoloxTracker,
@@ -26,7 +27,7 @@ from .perception import (
 )
 from .persona_api import PersonaPluginClient
 from .playout import PosePlayoutBuffer
-from .retarget import CanonicalPoseFrame, SMPLH_PARENTS, pose_to_live2d_params, pose_to_vmc_bones
+from .retarget import SMPLH_PARENTS, CanonicalPoseFrame, pose_to_live2d_params, pose_to_vmc_bones
 from .setup_models import check_models_status
 from .solver import FlowHMRWindowSolver
 from .sources import CameraSource, PreviewRingBuffer, SampledFrame, VideoFileSource

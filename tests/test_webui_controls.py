@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from fastapi.testclient import TestClient
+
 import pytest
+from fastapi.testclient import TestClient
 
 from persona_flowhmr import web_ui
 from persona_flowhmr.config import EngineConfig

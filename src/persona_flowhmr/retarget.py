@@ -7,8 +7,9 @@ Coordinate conventions verified against:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
+
 import numpy as np
 
 from .vmc_sender import BoneTransform, Pos3, Quat4
@@ -293,7 +294,9 @@ def pose_to_live2d_params(pose: CanonicalPoseFrame, *, mirror: bool = False) -> 
     body_yaw, body_pitch, body_roll = _quat_to_euler_deg_yxz(q_torso)
     head_yaw, head_pitch, head_roll = _quat_to_euler_deg_yxz(q_head_chain)
 
-    clamp = lambda v, lo, hi: max(lo, min(hi, v))
+    def clamp(v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, v))
+
     return [
         {"type": "input", "id": "FaceAngleX", "value": clamp(sign * head_yaw, -30.0, 30.0)},
         {"type": "input", "id": "FaceAngleY", "value": clamp(-head_pitch, -30.0, 30.0)},

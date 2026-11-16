@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+
 import numpy as np
 
 from persona_flowhmr.paths import MOTION_STATS_PATH, bootstrap_runtime
@@ -103,6 +104,7 @@ def test_arm_raise_pitch_yaw_and_travel_in_both_mirror_modes() -> None:
 
 def test_rot6d_parity_with_upstream_flowhmr_geometry() -> None:
     import json
+
     import torch
 
     bootstrap_runtime()
