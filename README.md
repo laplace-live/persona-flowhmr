@@ -70,3 +70,7 @@ uv run persona-flowhmr run --source camera --camera 0 --preset low --fps 60 --mi
 uv run pytest -v
 uv run ruff check
 ```
+
+## License
+
+`persona-flowhmr` is licensed under **[GNU AGPL-3.0](LICENSE)** with a Section 7 linking exception for vendored Meta `SAM 3D Body` and `DINOv3` components, which remain under their respective upstream licenses. See **[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)** for full details and modification notices.
