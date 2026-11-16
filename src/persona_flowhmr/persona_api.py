@@ -21,6 +21,8 @@ from typing import Any
 
 import websockets
 
+from . import __version__
+
 
 class PersonaPluginError(RuntimeError):
     """Error returned by the LAPLACE Persona Plugin API (`kind == 'error'`)."""
@@ -39,7 +41,7 @@ class PersonaPluginClient:
         token: str = "",
         *,
         app_name: str = "Persona FlowHMR",
-        app_version: str = "0.1.0",
+        app_version: str = __version__,
         developer: str = "LAPLACE",
     ) -> None:
         self.url = url
@@ -57,7 +59,6 @@ class PersonaPluginClient:
         self._stop = threading.Event()
 
         self.server_hello: dict[str, Any] | None = None
-        self.vmc_source_id: str | None = None
         self.has_live2d_model: bool = True
         self.last_error: str = ""
 
@@ -193,29 +194,24 @@ class PersonaPluginClient:
         settings = settings_res.get("settings", {}) if isinstance(settings_res, dict) else {}
         sources = settings.get("tracking", {}).get("sources", [])
 
-        vmc_src = None
-        for src in sources:
-            if src.get("kind") == "vmc" and int(src.get("port") or -1) == int(vmc_port):
-                vmc_src = src
-                break
-
-        if vmc_src is None:
+        vmc_src = next(
+            (src for src in sources if src.get("kind") == "vmc" and int(src.get("port") or -1) == int(vmc_port)),
+            None,
+        )
+        is_new = vmc_src is None
+        if is_new:
             added = self.call(
                 "tracking.addSource",
                 {"kind": "vmc", "name": "FlowHMR Live Mocap", "port": int(vmc_port)},
             )
-            source_obj = added.get("source", added)
-            source_id = str(source_obj["id"])
-            if not source_obj.get("enabled", True):
-                self.call("tracking.updateSource", {"id": source_id, "enabled": True})
-        else:
-            source_id = str(vmc_src["id"])
-            if not vmc_src.get("enabled", False):
-                self.call("tracking.updateSource", {"id": source_id, "enabled": True})
+            vmc_src = added.get("source", added)
+        source_id = str(vmc_src["id"])
+        # A freshly added source reporting no `enabled` flag is assumed enabled; an existing one is not.
+        if not vmc_src.get("enabled", is_new):
+            self.call("tracking.updateSource", {"id": source_id, "enabled": True})
 
         # Enable network body master switch (`pose.setEnabled`).
         self.call("pose.setEnabled", {"enabled": True})
-        self.vmc_source_id = source_id
 
         bound_instance_id: str | None = None
         if bind_primary_avatar:
@@ -239,7 +235,7 @@ class PersonaPluginClient:
                     bind_req["poseFollowMovement"] = bool(follow_movement)
                 self.call("instance.setTrackingSources", bind_req)
 
-        return {"sourceId": self.vmc_source_id, "boundInstanceId": bound_instance_id}
+        return {"sourceId": source_id, "boundInstanceId": bound_instance_id}
 
     def inject_params_fire_and_forget(self, entries: list[dict[str, Any]]) -> None:
         """Asynchronously inject `InjectEntry[]` (`param.inject`) without blocking the playout clock."""

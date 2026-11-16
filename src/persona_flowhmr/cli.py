@@ -3,110 +3,143 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import signal
 import sys
 import time
+from typing import get_args
 
-import uvicorn
-
-from .config import LATENCY_PRESETS, EngineConfig
-from .engine import StreamingMocapEngine
+from .config import (
+    CONFIG_FIELDS,
+    LATENCY_PRESETS,
+    EngineConfig,
+    HandMode,
+    PerceptionBackend,
+    PlayoutFps,
+    SamStride,
+    SourceMode,
+    YoloSize,
+    YoloStride,
+)
 from .paths import DEFAULT_DEMO_VIDEO, SETTINGS_FILE
 from .setup_models import check_models_status, download_missing_models
-from .web_ui import create_app
 
 
-def _add_common_engine_args(p: argparse.ArgumentParser, defaults: EngineConfig | None = None) -> None:
-    d = defaults or EngineConfig()
-    p.add_argument("--source", choices=("video", "camera"), default=d.source_mode, help="Input source mode")
-    p.add_argument("--video", default=d.video_path or str(DEFAULT_DEMO_VIDEO), help="Debug video file path")
-    p.add_argument("--no-loop", action="store_true", default=None, help="Play debug video once instead of looping")
-    p.add_argument("--camera", type=int, default=d.camera_index, help="Camera device index when --source=camera")
+def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
+    """Engine flags: each `dest` is an `EngineConfig` field; flags left unset keep the base config's value."""
+    p.add_argument("--source", dest="source_mode", choices=get_args(SourceMode), help="Input source mode")
+    p.add_argument("--video", dest="video_path", metavar="VIDEO", help="Debug video file path")
+    p.add_argument(
+        "--no-loop",
+        dest="loop_video",
+        action="store_const",
+        const=False,
+        help="Play debug video once instead of looping",
+    )
+    p.add_argument(
+        "--camera",
+        dest="camera_index",
+        metavar="CAMERA",
+        type=int,
+        help="Camera device index when --source=camera",
+    )
     p.add_argument(
         "--preset",
-        choices=tuple(LATENCY_PRESETS.keys()),
-        default=d.preset,
+        choices=tuple(LATENCY_PRESETS),
         help="Latency / smoothness sliding-window preset",
     )
-    p.add_argument("--fps", type=int, choices=(30, 60), default=d.playout_fps, help="VMC output playout FPS (30 or 60)")
-    p.add_argument("--mirror", action="store_true", default=None, help="Mirror left/right body & root travel")
-    p.add_argument("--no-follow", action="store_true", default=None, help="Lock horizontal XZ root travel at origin")
+    p.add_argument(
+        "--fps",
+        dest="playout_fps",
+        type=int,
+        choices=get_args(PlayoutFps),
+        help="VMC output playout FPS (30 or 60)",
+    )
+    p.add_argument("--mirror", action="store_const", const=True, help="Mirror left/right body & root travel")
+    p.add_argument(
+        "--no-follow",
+        dest="follow_movement",
+        action="store_const",
+        const=False,
+        help="Lock horizontal XZ root travel at origin",
+    )
     p.add_argument(
         "--backend",
-        choices=("auto", "sam3d", "replay"),
-        default=d.perception_backend,
+        dest="perception_backend",
+        choices=get_args(PerceptionBackend),
         help="Perception backend (`auto`/`sam3d` uses SAM 3D Body; `replay` uses --replay-tokens or bbox probe)",
     )
     p.add_argument(
         "--sam-stride",
         type=int,
-        choices=(0, 1, 2, 3, 4, 5, 6),
-        default=d.sam_stride,
+        choices=get_args(SamStride),
         help="SAM 3D Body keyframe stride at 30 Hz (0=preset optimal, 3=10Hz, 5=6Hz, 1=every frame)",
     )
     p.add_argument(
         "--hand-mode",
-        choices=("auto", "off", "fast", "full"),
-        default=d.hand_mode,
+        choices=get_args(HandMode),
         help="SAM 3D hand decoder mode (`auto` uses preset: `off` for ultra_low/low, `fast` for balanced, `full` for high/max)",
     )
     p.add_argument(
         "--yolo-size",
         type=int,
-        choices=(0, 416, 640),
-        default=d.yolo_size,
+        choices=get_args(YoloSize),
         help="YOLOX-L detector input size (0=preset optimal, 416=fast 3x, 640=full)",
     )
     p.add_argument(
         "--yolo-stride",
         type=int,
-        choices=(1, 2, 3),
-        default=d.yolo_stride,
+        choices=get_args(YoloStride),
         help="YOLOX-L detector frame stride with linear bbox interpolation (default: 2)",
     )
-    p.add_argument("--replay-tokens", default=d.replay_tokens_path, help="Optional `.pt` or `.npz` (T, 3072) SAM token file")
-    p.add_argument("--no-compile", action="store_true", default=None, help="Disable torch.compile Triton acceleration")
-    p.add_argument("--vmc-host", default=d.vmc_host, help="Target VMC receiver UDP host")
-    p.add_argument("--vmc-port", type=int, default=d.vmc_port, help="Target VMC receiver UDP port")
-    p.add_argument("--no-vmc", action="store_true", default=None, help="Disable UDP VMC output")
-    p.add_argument("--plugin-api", action="store_true", default=None, help="Connect to LAPLACE Persona Plugin API WebSocket")
-    p.add_argument("--plugin-url", default=d.plugin_api_url, help="Persona Plugin API WebSocket URL")
+    p.add_argument(
+        "--replay-tokens",
+        dest="replay_tokens_path",
+        metavar="REPLAY_TOKENS",
+        help="Optional `.pt` or `.npz` (T, 3072) SAM token file",
+    )
+    p.add_argument(
+        "--no-compile",
+        dest="torch_compile",
+        action="store_const",
+        const=False,
+        help="Disable torch.compile Triton acceleration",
+    )
+    p.add_argument("--vmc-host", help="Target VMC receiver UDP host")
+    p.add_argument("--vmc-port", type=int, help="Target VMC receiver UDP port")
+    p.add_argument("--no-vmc", dest="vmc_enabled", action="store_const", const=False, help="Disable UDP VMC output")
+    p.add_argument(
+        "--plugin-api",
+        dest="plugin_api_enabled",
+        action="store_const",
+        const=True,
+        help="Connect to LAPLACE Persona Plugin API WebSocket",
+    )
+    p.add_argument("--plugin-url", dest="plugin_api_url", metavar="PLUGIN_URL", help="Persona Plugin API WebSocket URL")
     p.add_argument(
         "--plugin-token",
-        default=os.environ.get("PERSONA_PLUGIN_TOKEN") or d.plugin_api_token,
+        dest="plugin_api_token",
+        metavar="PLUGIN_TOKEN",
+        default=os.environ.get("PERSONA_PLUGIN_TOKEN") or None,
         help="Persona Plugin API bearer token (or set $PERSONA_PLUGIN_TOKEN)",
     )
-    p.add_argument("--inject-params", action="store_true", default=None, help="Also inject Live2D angles via `param.inject`")
-
-
-def _config_from_args(args: argparse.Namespace, base: EngineConfig | None = None) -> EngineConfig:
-    b = base or EngineConfig()
-    return EngineConfig(
-        source_mode=args.source,
-        camera_index=args.camera,
-        video_path=args.video,
-        loop_video=False if args.no_loop else b.loop_video,
-        preset=args.preset,
-        playout_fps=args.fps,
-        mirror=True if args.mirror else b.mirror,
-        follow_movement=False if args.no_follow else b.follow_movement,
-        torch_compile=False if args.no_compile else b.torch_compile,
-        sam_stride=args.sam_stride,
-        hand_mode=args.hand_mode,
-        yolo_size=args.yolo_size,
-        yolo_stride=args.yolo_stride,
-        perception_backend=args.backend,
-        replay_tokens_path=args.replay_tokens,
-        vmc_enabled=False if args.no_vmc else b.vmc_enabled,
-        vmc_host=args.vmc_host,
-        vmc_port=args.vmc_port,
-        plugin_api_enabled=True if args.plugin_api else b.plugin_api_enabled,
-        plugin_api_url=args.plugin_url,
-        plugin_api_token=args.plugin_token,
-        plugin_api_inject_params=True if args.inject_params else b.plugin_api_inject_params,
+    p.add_argument(
+        "--inject-params",
+        dest="plugin_api_inject_params",
+        action="store_const",
+        const=True,
+        help="Also inject Live2D angles via `param.inject`",
     )
+
+
+def _config_from_args(args: argparse.Namespace, base: EngineConfig) -> EngineConfig:
+    """Overlay the engine flags that were given onto `base` (saved settings for `serve`, defaults for `run`)."""
+    overrides = {k: v for k, v in vars(args).items() if k in CONFIG_FIELDS and v is not None}
+    # Without `--video`, an empty saved path falls back to the demo clip.
+    overrides.setdefault("video_path", base.video_path or str(DEFAULT_DEMO_VIDEO))
+    return dataclasses.replace(base, **overrides)
 
 
 def cmd_status(_args: argparse.Namespace) -> int:
@@ -130,8 +163,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    saved = EngineConfig.load(SETTINGS_FILE)
-    cfg = _config_from_args(args, base=saved)
+    import uvicorn
+
+    from .engine import StreamingMocapEngine
+    from .web_ui import create_app
+
+    cfg = _config_from_args(args, base=EngineConfig.load(SETTINGS_FILE))
     engine = StreamingMocapEngine(cfg, settings_path=SETTINGS_FILE)
     if args.auto_start:
         engine.start(realtime_source=True)
@@ -142,7 +179,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    cfg = _config_from_args(args)
+    from .engine import StreamingMocapEngine
+
+    cfg = _config_from_args(args, base=EngineConfig())
     engine = StreamingMocapEngine(cfg)
 
     stopping = False
@@ -190,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("--host", default="127.0.0.1", help="HTTP bind host")
     p_serve.add_argument("--port", type=int, default=7865, help="HTTP bind port")
     p_serve.add_argument("--auto-start", action="store_true", help="Start streaming immediately on launch")
-    _add_common_engine_args(p_serve, defaults=EngineConfig.load(SETTINGS_FILE))
+    _add_common_engine_args(p_serve)
     p_serve.set_defaults(func=cmd_serve)
 
     p_run = sub.add_parser("run", help="Run headless streaming mocap to VMC / Plugin API")

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .config import EngineConfig
+from . import __version__
 from .engine import StreamingMocapEngine
 from .setup_models import check_models_status, download_missing_models
 from .sources import list_available_cameras
@@ -187,7 +189,7 @@ _DASHBOARD_HTML = """<!doctype html>
         <h2>Input Source (30 Hz Capture)</h2>
         <div class="field">
           <label>Source Mode</label>
-          <select id="source_mode" onchange="toggleSourceFields()">
+          <select id="source_mode" data-cfg onchange="toggleSourceFields()">
             <option value="video">Debug Video File</option>
             <option value="camera">Live Camera (Webcam)</option>
           </select>
@@ -195,21 +197,21 @@ _DASHBOARD_HTML = """<!doctype html>
         <div id="videoFields" class="field">
           <label>Debug Video Path</label>
           <div class="row">
-            <input type="text" id="video_path" placeholder="Select or enter video path..." />
+            <input type="text" id="video_path" data-cfg placeholder="Select or enter video path..." />
             <button id="browseVideoBtn" type="button" style="flex:none;" onclick="pickVideoFile()">Browse…</button>
           </div>
-          <label class="check"><input type="checkbox" id="loop_video" checked /> Loop Debug Video</label>
+          <label class="check"><input type="checkbox" id="loop_video" data-cfg checked /> Loop Debug Video</label>
         </div>
         <div id="cameraFields" class="field" style="display:none;">
           <label>Camera Device</label>
           <div class="row">
-            <select id="camera_index"><option value="0">Camera 0</option></select>
+            <select id="camera_index" data-cfg data-int><option value="0">Camera 0</option></select>
             <button style="flex:none;" onclick="refreshCameras()">Scan</button>
           </div>
         </div>
         <div class="field">
           <label>Perception Backend</label>
-          <select id="perception_backend">
+          <select id="perception_backend" data-cfg>
             <option value="auto">Auto (SAM 3D Body Dinov3)</option>
             <option value="sam3d">SAM 3D Body Dinov3 (Strict)</option>
             <option value="replay">Replay / BBox Probe (Debug)</option>
@@ -217,7 +219,7 @@ _DASHBOARD_HTML = """<!doctype html>
         </div>
         <div class="field">
           <label>SAM 3D Keyframe Stride (30 Hz Lerp)</label>
-          <select id="sam_stride">
+          <select id="sam_stride" data-cfg data-int>
             <option value="0">Auto · Preset Optimal (Recommended)</option>
             <option value="3">Stride 3 · 10 Hz Keyframes</option>
             <option value="4">Stride 4 · 7.5 Hz Keyframes</option>
@@ -229,7 +231,7 @@ _DASHBOARD_HTML = """<!doctype html>
         <div class="row">
           <div class="field">
             <label>Hand Decoder Mode</label>
-            <select id="hand_mode">
+            <select id="hand_mode" data-cfg>
               <option value="auto">Auto (Preset)</option>
               <option value="off">Body Only (Fastest)</option>
               <option value="fast">Fast Hands (2-Layer)</option>
@@ -238,7 +240,7 @@ _DASHBOARD_HTML = """<!doctype html>
           </div>
           <div class="field">
             <label>Detector Resolution</label>
-            <select id="yolo_size">
+            <select id="yolo_size" data-cfg data-int>
               <option value="0">Auto (Preset)</option>
               <option value="416">416px (3x Faster)</option>
               <option value="640">640px (Full)</option>
@@ -251,7 +253,7 @@ _DASHBOARD_HTML = """<!doctype html>
         <h2>Latency &amp; Playout</h2>
         <div class="field">
           <label>Sliding-Window Latency Preset</label>
-          <select id="preset">
+          <select id="preset" data-cfg>
             <option value="ultra_low">Ultra Low (~0.80s · W=48 · 4 steps · Fast Body)</option>
             <option value="low">Low Latency (~1.05s · W=60 · 5 steps · Fast Body)</option>
             <option value="balanced">Balanced (~1.45s · W=70 · 6 steps · Body+Hands)</option>
@@ -262,28 +264,28 @@ _DASHBOARD_HTML = """<!doctype html>
         <div class="row">
           <div class="field">
             <label>Playout Rate</label>
-            <select id="playout_fps">
+            <select id="playout_fps" data-cfg data-int>
               <option value="60">60 FPS (SLERP)</option>
               <option value="30">30 FPS (Native)</option>
             </select>
           </div>
         </div>
-        <label class="check"><input type="checkbox" id="mirror" /> Mirror Avatar (Webcam Selfie Mode)</label>
-        <label class="check"><input type="checkbox" id="follow_movement" checked /> Follow Root Movement (XZ Travel)</label>
+        <label class="check"><input type="checkbox" id="mirror" data-cfg /> Mirror Avatar (Webcam Selfie Mode)</label>
+        <label class="check"><input type="checkbox" id="follow_movement" data-cfg checked /> Follow Root Movement (XZ Travel)</label>
       </section>
 
       <section class="card">
         <h2>Persona Output (VMC + Plugin API)</h2>
-        <label class="check"><input type="checkbox" id="vmc_enabled" checked /> Send VMC OSC Bundle over UDP</label>
+        <label class="check"><input type="checkbox" id="vmc_enabled" data-cfg checked /> Send VMC OSC Bundle over UDP</label>
         <div class="row">
-          <div class="field"><label>VMC Host</label><input type="text" id="vmc_host" value="127.0.0.1" /></div>
-          <div class="field"><label>VMC Port</label><input type="number" id="vmc_port" value="39539" /></div>
+          <div class="field"><label>VMC Host</label><input type="text" id="vmc_host" data-cfg value="127.0.0.1" /></div>
+          <div class="field"><label>VMC Port</label><input type="number" id="vmc_port" data-cfg value="39539" /></div>
         </div>
         <hr style="border:0;border-top:1px solid var(--border);margin:10px 0;" />
-        <label class="check"><input type="checkbox" id="plugin_api_enabled" /> Connect Persona Plugin API (WS)</label>
-        <div class="field"><label>Plugin API WebSocket URL</label><input type="text" id="plugin_api_url" value="ws://127.0.0.1:25034" /></div>
-        <div class="field"><label>Bearer Token (Settings → Developer)</label><input type="password" id="plugin_api_token" placeholder="Paste token if enabled" /></div>
-        <label class="check"><input type="checkbox" id="plugin_api_inject_params" /> Also Inject Live2D Angles (`param.inject`)</label>
+        <label class="check"><input type="checkbox" id="plugin_api_enabled" data-cfg /> Connect Persona Plugin API (WS)</label>
+        <div class="field"><label>Plugin API WebSocket URL</label><input type="text" id="plugin_api_url" data-cfg value="ws://127.0.0.1:25034" /></div>
+        <div class="field"><label>Bearer Token (Settings → Developer)</label><input type="password" id="plugin_api_token" data-cfg placeholder="Paste token if enabled" /></div>
+        <label class="check"><input type="checkbox" id="plugin_api_inject_params" data-cfg /> Also Inject Live2D Angles (`param.inject`)</label>
         <button class="primary" style="width:100%;margin-top:6px;" onclick="applyConfig()">Apply Settings</button>
       </section>
     </div>
@@ -332,6 +334,18 @@ _DASHBOARD_HTML = """<!doctype html>
   <script>
     let initialized = false;
     let saveTimer = null;
+    // Config controls carry `data-cfg` (id == EngineConfig field); `data-int` marks integer-valued selects.
+    const cfgFields = () => document.querySelectorAll('[data-cfg]');
+    function readField(el) {
+      if (el.type === 'checkbox') return el.checked;
+      if (el.type === 'number' || 'int' in el.dataset) return parseInt(el.value || el.defaultValue || '0', 10);
+      return el.value;
+    }
+    function writeField(el, value) {
+      if (value === undefined || value === null) return;
+      if (el.type === 'checkbox') el.checked = value;
+      else el.value = String(value);
+    }
     function scheduleSaveConfig() {
       if (!initialized) return;
       if (saveTimer) clearTimeout(saveTimer);
@@ -377,43 +391,38 @@ _DASHBOARD_HTML = """<!doctype html>
       }
     }
     function gatherConfig() {
-      return {
-        source_mode: document.getElementById('source_mode').value,
-        video_path: document.getElementById('video_path').value,
-        loop_video: document.getElementById('loop_video').checked,
-        camera_index: parseInt(document.getElementById('camera_index').value || '0', 10),
-        perception_backend: document.getElementById('perception_backend').value,
-        sam_stride: parseInt(document.getElementById('sam_stride').value, 10),
-        hand_mode: document.getElementById('hand_mode').value,
-        yolo_size: parseInt(document.getElementById('yolo_size').value, 10),
-        preset: document.getElementById('preset').value,
-        playout_fps: parseInt(document.getElementById('playout_fps').value, 10),
-        mirror: document.getElementById('mirror').checked,
-        follow_movement: document.getElementById('follow_movement').checked,
-        vmc_enabled: document.getElementById('vmc_enabled').checked,
-        vmc_host: document.getElementById('vmc_host').value,
-        vmc_port: parseInt(document.getElementById('vmc_port').value || '39539', 10),
-        plugin_api_enabled: document.getElementById('plugin_api_enabled').checked,
-        plugin_api_url: document.getElementById('plugin_api_url').value,
-        plugin_api_token: document.getElementById('plugin_api_token').value,
-        plugin_api_inject_params: document.getElementById('plugin_api_inject_params').checked,
+      return Object.fromEntries([...cfgFields()].map(el => [el.id, readField(el)]));
+    }
+    function fillForm(c) {
+      const camSel = document.getElementById('camera_index');
+      const camVal = String(c.camera_index ?? 0);
+      if (![...camSel.options].some(o => o.value === camVal)) {
+        const o = document.createElement('option');
+        o.value = camVal;
+        o.textContent = 'Camera ' + camVal;
+        camSel.appendChild(o);
+      }
+      // The saved token is never sent back; only its presence is (see the placeholder).
+      cfgFields().forEach(el => { if (el.id !== 'plugin_api_token') writeField(el, c[el.id]); });
+      toggleSourceFields();
+    }
+    async function postStatus(url, payload) {
+      // Config/start/stop all reply with the full status, so render it instead of polling again.
+      const init = payload === undefined ? {method: 'POST'} : {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
       };
+      const r = await fetch(url, init);
+      if (r.ok) renderStatus(await r.json());
     }
     async function applyConfig() {
-      await fetch('/api/config', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(gatherConfig()),
-      });
-      await pollStatus();
+      await postStatus('/api/config', gatherConfig());
     }
     async function startEngine() {
       await applyConfig();
-      await fetch('/api/start', {method: 'POST'});
-      await pollStatus();
+      await postStatus('/api/start');
     }
     async function stopEngine() {
-      await fetch('/api/stop', {method: 'POST'});
-      await pollStatus();
+      await postStatus('/api/stop');
     }
     async function setupSam() {
       const tok = document.getElementById('hf_token').value.trim();
@@ -425,72 +434,42 @@ _DASHBOARD_HTML = """<!doctype html>
       if (d.sam3d_download_error) alert(d.sam3d_download_error);
       await pollStatus();
     }
+    function renderStatus(s) {
+      if (!initialized) {
+        fillForm(s.config);
+        initialized = true;
+      }
+      document.getElementById('plugin_api_token').placeholder = s.config.has_plugin_api_token
+        ? 'Token saved (paste to replace)'
+        : 'Paste token if enabled';
+      const t = s.telemetry;
+      const badge = document.getElementById('stateBadge');
+      badge.textContent = t.state.toUpperCase();
+      badge.className = 'badge ' + t.state;
+
+      document.getElementById('samAlert').style.display = s.models.sam3d_ready ? 'none' : 'block';
+      const errEl = document.getElementById('errAlert');
+      errEl.style.display = t.error ? 'block' : 'none';
+      errEl.textContent = t.error || '';
+
+      document.getElementById('m_play_fps').textContent = t.playout_fps.toFixed(1);
+      document.getElementById('m_cap_fps').textContent = t.capture_fps.toFixed(1);
+      document.getElementById('m_lat').textContent = Math.round(t.measured_latency_ms) + ' ms';
+      document.getElementById('m_lead').textContent = Math.round(t.buffer_lead_ms) + ' ms';
+      document.getElementById('m_yolo').textContent = t.yolox_ms_per_frame.toFixed(1) + ' ms';
+      document.getElementById('m_sam').textContent = t.sam_ms_per_frame.toFixed(1) + ' ms';
+      document.getElementById('m_mmdit').textContent = t.mmdit_ms_per_window.toFixed(1) + ' ms';
+      document.getElementById('m_vmc').textContent = t.vmc_packets_sent.toLocaleString();
+      document.getElementById('m_under').textContent = t.underruns;
+      document.getElementById('m_back').textContent = t.active_backend;
+    }
     async function pollStatus() {
       try {
         const r = await fetch('/api/status');
-        const s = await r.json();
-        if (!initialized) {
-          const c = s.config;
-          document.getElementById('source_mode').value = c.source_mode;
-          document.getElementById('video_path').value = c.video_path;
-          document.getElementById('loop_video').checked = c.loop_video;
-          const camSel = document.getElementById('camera_index');
-          const camVal = String(c.camera_index ?? 0);
-          if (![...camSel.options].some(o => o.value === camVal)) {
-            const o = document.createElement('option');
-            o.value = camVal;
-            o.textContent = 'Camera ' + camVal;
-            camSel.appendChild(o);
-          }
-          camSel.value = camVal;
-          document.getElementById('perception_backend').value = c.perception_backend;
-          document.getElementById('sam_stride').value = String(c.sam_stride ?? 0);
-          document.getElementById('hand_mode').value = c.hand_mode || 'auto';
-          document.getElementById('yolo_size').value = String(c.yolo_size ?? 0);
-          document.getElementById('preset').value = c.preset;
-          document.getElementById('playout_fps').value = String(c.playout_fps);
-          document.getElementById('mirror').checked = c.mirror;
-          document.getElementById('follow_movement').checked = c.follow_movement;
-          document.getElementById('vmc_enabled').checked = c.vmc_enabled;
-          document.getElementById('vmc_host').value = c.vmc_host;
-          document.getElementById('vmc_port').value = c.vmc_port;
-          document.getElementById('plugin_api_enabled').checked = c.plugin_api_enabled;
-          document.getElementById('plugin_api_url').value = c.plugin_api_url;
-          document.getElementById('plugin_api_token').placeholder = c.has_plugin_api_token
-            ? 'Token saved (paste to replace)'
-            : 'Paste token if enabled';
-          document.getElementById('plugin_api_inject_params').checked = c.plugin_api_inject_params;
-          toggleSourceFields();
-          initialized = true;
-        } else if (s.config.has_plugin_api_token) {
-          document.getElementById('plugin_api_token').placeholder = 'Token saved (paste to replace)';
-        }
-        const t = s.telemetry;
-        const badge = document.getElementById('stateBadge');
-        badge.textContent = t.state.toUpperCase();
-        badge.className = 'badge ' + t.state;
-
-        document.getElementById('samAlert').style.display = s.models.sam3d_ready ? 'none' : 'block';
-        const errEl = document.getElementById('errAlert');
-        errEl.style.display = t.error ? 'block' : 'none';
-        errEl.textContent = t.error || '';
-
-        document.getElementById('m_play_fps').textContent = t.playout_fps.toFixed(1);
-        document.getElementById('m_cap_fps').textContent = t.capture_fps.toFixed(1);
-        document.getElementById('m_lat').textContent = Math.round(t.measured_latency_ms) + ' ms';
-        document.getElementById('m_lead').textContent = Math.round(t.buffer_lead_ms) + ' ms';
-        document.getElementById('m_yolo').textContent = t.yolox_ms_per_frame.toFixed(1) + ' ms';
-        document.getElementById('m_sam').textContent = t.sam_ms_per_frame.toFixed(1) + ' ms';
-        document.getElementById('m_mmdit').textContent = t.mmdit_ms_per_window.toFixed(1) + ' ms';
-        document.getElementById('m_vmc').textContent = t.vmc_packets_sent.toLocaleString();
-        document.getElementById('m_under').textContent = t.underruns;
-        document.getElementById('m_back').textContent = t.active_backend;
+        renderStatus(await r.json());
       } catch (_e) {}
     }
-    document.querySelectorAll('main select, main input').forEach(el => {
-      if (el.id === 'hf_token') return;
-      el.addEventListener('change', scheduleSaveConfig);
-    });
+    cfgFields().forEach(el => el.addEventListener('change', scheduleSaveConfig));
     setInterval(pollStatus, 400);
     pollStatus();
   </script>
@@ -499,6 +478,7 @@ _DASHBOARD_HTML = """<!doctype html>
 """
 
 
+@functools.cache
 def _placeholder_jpeg(text: str) -> bytes:
     import cv2
     import numpy as np
@@ -511,7 +491,7 @@ def _placeholder_jpeg(text: str) -> bytes:
 
 
 def create_app(engine: StreamingMocapEngine | None = None) -> FastAPI:
-    eng = engine or StreamingMocapEngine(EngineConfig())
+    eng = engine or StreamingMocapEngine()
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
@@ -520,8 +500,7 @@ def create_app(engine: StreamingMocapEngine | None = None) -> FastAPI:
         finally:
             eng.stop()
 
-    app = FastAPI(title="Persona FlowHMR External Mocap", version="0.1.0", lifespan=_lifespan)
-    app.state.engine = eng
+    app = FastAPI(title="Persona FlowHMR External Mocap", version=__version__, lifespan=_lifespan)
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -571,27 +550,22 @@ def create_app(engine: StreamingMocapEngine | None = None) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    async def _mjpeg_generator(kind: str):
-        idle_jpg = _placeholder_jpeg("Stream Idle - Click Start Stream")
-        render_fn = eng.render_live_jpeg if kind == "live" else eng.render_synced_playout_jpeg
-        while True:
-            jpg = await asyncio.to_thread(render_fn)
-            payload = jpg or idle_jpg
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + payload + b"\r\n"
-            await asyncio.sleep(1.0 / 20.0)
+    def _mjpeg_response(render_fn: Callable[[], bytes | None]) -> StreamingResponse:
+        async def frames():
+            idle_jpg = _placeholder_jpeg("Stream Idle - Click Start Stream")
+            while True:
+                jpg = await asyncio.to_thread(render_fn)
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + (jpg or idle_jpg) + b"\r\n"
+                await asyncio.sleep(1.0 / 20.0)
+
+        return StreamingResponse(frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
     @app.get("/stream/live.mjpg")
     async def stream_live() -> StreamingResponse:
-        return StreamingResponse(
-            _mjpeg_generator("live"),
-            media_type="multipart/x-mixed-replace; boundary=frame",
-        )
+        return _mjpeg_response(eng.render_live_jpeg)
 
     @app.get("/stream/synced.mjpg")
     async def stream_synced() -> StreamingResponse:
-        return StreamingResponse(
-            _mjpeg_generator("synced"),
-            media_type="multipart/x-mixed-replace; boundary=frame",
-        )
+        return _mjpeg_response(eng.render_synced_playout_jpeg)
 
     return app

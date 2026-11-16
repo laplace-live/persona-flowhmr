@@ -23,8 +23,15 @@ SAM3D_DIR = MODELS_DIR / "sam-3d-body-dinov3"
 SAM3D_CKPT_PATH = SAM3D_DIR / "model.ckpt"
 SAM3D_CFG_PATH = SAM3D_DIR / "model_config.yaml"
 SAM3D_MHR_PATH = SAM3D_DIR / "assets" / "mhr_model.pt"
+# Every file the vendored `load_sam_3d_body` needs (it reads `model_config.yaml` next to the checkpoint).
+SAM3D_FILES = (SAM3D_CKPT_PATH, SAM3D_CFG_PATH, SAM3D_MHR_PATH)
 
 _BOOTSTRAPPED = False
+
+
+def is_sam3d_available() -> bool:
+    """Whether the `facebook/sam-3d-body-dinov3` checkpoint, config, and MHR model are all installed."""
+    return all(p.is_file() for p in SAM3D_FILES)
 
 
 def bootstrap_runtime() -> None:
