@@ -88,7 +88,13 @@ class VmcUdpSender:
         resolved = self._resolved
         if resolved is None or resolved[0] != target or now >= resolved[2]:
             # Look a host name up every few seconds rather than inside every 60 Hz `sendto`, so DNS changes still land.
-            resolved = (target, (socket.gethostbyname(target[0]), target[1]), now + _RESOLVE_TTL_S)
+            try:
+                addr = (socket.gethostbyname(target[0]), target[1])
+            except OSError:
+                if resolved is None or resolved[0] != target:
+                    raise
+                addr = resolved[1]  # a failed refresh keeps the last working address and retries after the TTL
+            resolved = (target, addr, now + _RESOLVE_TTL_S)
             self._resolved = resolved
         sent = self._sock.sendto(encode_vmc_bundle(bones), resolved[1])
         self.packets_sent += 1
