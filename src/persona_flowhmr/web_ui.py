@@ -331,6 +331,12 @@ _DASHBOARD_HTML = """<!doctype html>
 
   <script>
     let initialized = false;
+    let saveTimer = null;
+    function scheduleSaveConfig() {
+      if (!initialized) return;
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => { applyConfig(); }, 150);
+    }
     function toggleSourceFields() {
       const mode = document.getElementById('source_mode').value;
       document.getElementById('videoFields').style.display = mode === 'video' ? 'block' : 'none';
@@ -428,6 +434,15 @@ _DASHBOARD_HTML = """<!doctype html>
           document.getElementById('source_mode').value = c.source_mode;
           document.getElementById('video_path').value = c.video_path;
           document.getElementById('loop_video').checked = c.loop_video;
+          const camSel = document.getElementById('camera_index');
+          const camVal = String(c.camera_index ?? 0);
+          if (![...camSel.options].some(o => o.value === camVal)) {
+            const o = document.createElement('option');
+            o.value = camVal;
+            o.textContent = 'Camera ' + camVal;
+            camSel.appendChild(o);
+          }
+          camSel.value = camVal;
           document.getElementById('perception_backend').value = c.perception_backend;
           document.getElementById('sam_stride').value = String(c.sam_stride ?? 0);
           document.getElementById('hand_mode').value = c.hand_mode || 'auto';
@@ -441,9 +456,14 @@ _DASHBOARD_HTML = """<!doctype html>
           document.getElementById('vmc_port').value = c.vmc_port;
           document.getElementById('plugin_api_enabled').checked = c.plugin_api_enabled;
           document.getElementById('plugin_api_url').value = c.plugin_api_url;
+          document.getElementById('plugin_api_token').placeholder = c.has_plugin_api_token
+            ? 'Token saved (paste to replace)'
+            : 'Paste token if enabled';
           document.getElementById('plugin_api_inject_params').checked = c.plugin_api_inject_params;
           toggleSourceFields();
           initialized = true;
+        } else if (s.config.has_plugin_api_token) {
+          document.getElementById('plugin_api_token').placeholder = 'Token saved (paste to replace)';
         }
         const t = s.telemetry;
         const badge = document.getElementById('stateBadge');
@@ -467,6 +487,10 @@ _DASHBOARD_HTML = """<!doctype html>
         document.getElementById('m_back').textContent = t.active_backend;
       } catch (_e) {}
     }
+    document.querySelectorAll('main select, main input').forEach(el => {
+      if (el.id === 'hf_token') return;
+      el.addEventListener('change', scheduleSaveConfig);
+    });
     setInterval(pollStatus, 400);
     pollStatus();
   </script>

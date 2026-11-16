@@ -10,6 +10,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODELS_DIR = Path(os.environ.get("PERSONA_FLOWHMR_MODELS", str(PROJECT_ROOT / "models"))).resolve()
 VENDOR_DIR = PROJECT_ROOT / "vendor"
+CACHE_DIR = PROJECT_ROOT / "cache"
+SETTINGS_FILE = CACHE_DIR / "settings.json"
 DEFAULT_DEMO_VIDEO = Path(r"D:\Git\persona\references\dancing girl [2E2okJyQyZI].mp4")
 
 YOLOX_CKPT_PATH = MODELS_DIR / "yolox" / "yolox_l.pth"

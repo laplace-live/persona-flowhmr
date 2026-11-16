@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -81,9 +82,15 @@ def _enable_windows_high_res_timer() -> None:
 class StreamingMocapEngine:
     """Real-time buffered single-camera mocap engine sending VMC (UDP) and Persona Plugin API."""
 
-    def __init__(self, config: EngineConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: EngineConfig | None = None,
+        *,
+        settings_path: str | Path | None = None,
+    ) -> None:
         _enable_windows_high_res_timer()
         self.config = config or EngineConfig()
+        self._settings_path = Path(settings_path) if settings_path is not None else None
         self._lock = threading.Lock()
         self.telemetry = EngineTelemetry()
 
@@ -145,6 +152,12 @@ class StreamingMocapEngine:
 
             if self._vmc_sender is not None:
                 self._vmc_sender.set_target(self.config.vmc_host, int(self.config.vmc_port))
+
+            if self._settings_path is not None:
+                try:
+                    self.config.save(self._settings_path)
+                except OSError:
+                    pass
 
         if "plugin_api_enabled" in patch or "plugin_api_url" in patch or "plugin_api_token" in patch:
             self._sync_plugin_client()

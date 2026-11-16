@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Literal
+import json
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+from typing import Any, Literal
 
 from .paths import DEFAULT_DEMO_VIDEO
 
@@ -175,7 +177,7 @@ class EngineConfig:
         sz = int(self.yolo_size) if self.yolo_size in (416, 640) else self.get_preset().default_yolo_size
         return (sz, sz)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["has_plugin_api_token"] = bool(self.plugin_api_token)
         data["plugin_api_token"] = ""
@@ -184,3 +186,30 @@ class EngineConfig:
         data["effective_yolo_size"] = self.effective_yolo_size()[0]
         data["preset_details"] = asdict(self.get_preset())
         return data
+
+    def save(self, path: str | Path) -> None:
+        """Atomically persist configuration to a local JSON file."""
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        tmp.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        tmp.replace(dest)
+
+    @classmethod
+    def load(cls, path: str | Path) -> EngineConfig:
+        """Load persisted configuration from JSON if present, falling back to defaults."""
+        src = Path(path)
+        cfg = cls()
+        if not src.is_file():
+            return cfg
+        try:
+            raw = json.loads(src.read_text(encoding="utf-8"))
+        except Exception:
+            return cfg
+        if not isinstance(raw, dict):
+            return cfg
+        valid_names = {f.name for f in fields(cls)}
+        for k, v in raw.items():
+            if k in valid_names and v is not None:
+                setattr(cfg, k, v)
+        return cfg
