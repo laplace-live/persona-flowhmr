@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import socket
 import struct
 import subprocess
 from pathlib import Path
@@ -96,6 +97,35 @@ def test_vmc_sender_caches_host_lookups_but_re_resolves_periodically(monkeypatch
     sender.send_pose(bones)  # within the TTL: no second lookup on the 60 Hz path
     clock[0] += 60.0
     sender.send_pose(bones)  # after it: the new address is picked up
+
+    assert sent_to == [("10.0.0.1", 39539), ("10.0.0.1", 39539), ("10.0.0.2", 39539)]
+
+
+def test_vmc_sender_keeps_last_address_when_a_dns_refresh_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    sender = vmc_sender.VmcUdpSender("persona-pc.local", 39539)
+    sender._sock.close()
+    sent_to: list[tuple[str, int]] = []
+    sender._sock = SimpleNamespace(sendto=lambda packet, addr: sent_to.append(addr) or len(packet))
+    lookups = iter(["10.0.0.1", socket.gaierror(8, "nodename nor servname provided"), "10.0.0.2"])
+
+    def gethostbyname(host: str) -> str:
+        result = next(lookups)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    clock = [100.0]
+    monkeypatch.setattr(vmc_sender, "socket", SimpleNamespace(gethostbyname=gethostbyname))
+    monkeypatch.setattr(vmc_sender, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    quats = np.zeros((52, 4), dtype=np.float32)
+    quats[:, 3] = 1.0
+    bones = pose_to_vmc_bones(CanonicalPoseFrame(0.0, 0.0, 0, quats, np.zeros(3, dtype=np.float32)))
+    sender.send_pose(bones)
+    clock[0] += 60.0
+    sender.send_pose(bones)  # the refresh fails: keep sending to the last working address instead of raising
+    clock[0] += 60.0
+    sender.send_pose(bones)  # the next refresh succeeds
 
     assert sent_to == [("10.0.0.1", 39539), ("10.0.0.1", 39539), ("10.0.0.2", 39539)]
 
