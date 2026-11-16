@@ -7,14 +7,20 @@ control UI can display both the live frame and the latency-synced playout frame 
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+# Prefer DirectShow on Windows for fast camera open; elsewhere let OpenCV pick the backend.
+_CAMERA_BACKEND = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+
+BBox = tuple[float, float, float, float]
+PreviewFrame = tuple[int, np.ndarray, BBox | None, tuple[int, int]]  # (frame_index, bgr, bbox, source_hw)
 
 
 @dataclass(frozen=True)
@@ -25,8 +31,36 @@ class SampledFrame:
     media_time_s: float
     capture_mono_s: float
     rgb: np.ndarray  # HxWx3 uint8 RGB
-    is_stream_reset: bool = False
-    source_frame_pos: int = 0
+    is_stream_reset: bool = False  # first frame after a video loop rewind
+
+
+class _FrameClock:
+    """Paces a source onto a fixed output rate and stamps the frames it emits."""
+
+    def __init__(self, fps: float) -> None:
+        self.fps = float(fps)
+        self.frame_index = 0
+        self._start_mono: float | None = None
+
+    def wait_next(self) -> None:
+        """Sleep until the wall-clock slot of the next frame."""
+        now = time.perf_counter()
+        if self._start_mono is None:
+            self._start_mono = now
+        sleep_s = self._start_mono + (self.frame_index / self.fps) - time.perf_counter()
+        if sleep_s > 0.001:
+            time.sleep(sleep_s)
+
+    def emit(self, rgb: np.ndarray, *, is_stream_reset: bool = False) -> SampledFrame:
+        sample = SampledFrame(
+            frame_index=self.frame_index,
+            media_time_s=self.frame_index / self.fps,
+            capture_mono_s=time.perf_counter(),
+            rgb=rgb,
+            is_stream_reset=is_stream_reset,
+        )
+        self.frame_index += 1
+        return sample
 
 
 class PreviewRingBuffer:
@@ -36,41 +70,34 @@ class PreviewRingBuffer:
         self._lock = threading.Lock()
         self._max_items = int(max_items)
         self._max_width = max_width
-        self._order: deque[int] = deque()
-        self._frame_map: dict[int, np.ndarray] = {}
-        self._bboxes: dict[int, tuple[float, float, float, float]] = {}
+        self._frames: dict[int, np.ndarray] = {}  # insertion-ordered: oldest first
+        self._bboxes: dict[int, BBox] = {}
         self._orig_hw: tuple[int, int] = (720, 1280)
 
     def clear(self) -> None:
         with self._lock:
-            self._order.clear()
-            self._frame_map.clear()
+            self._frames.clear()
             self._bboxes.clear()
 
     def record_frame(self, frame_index: int, rgb: np.ndarray) -> None:
         h, w = rgb.shape[:2]
         if w > self._max_width:
             scale = self._max_width / float(w)
-            small_rgb = cv2.resize(
+            rgb = cv2.resize(
                 rgb,
                 (self._max_width, max(1, int(round(h * scale)))),
                 interpolation=cv2.INTER_LINEAR,
             )
-            bgr = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2BGR)
-        else:
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        f_idx = int(frame_index)
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         with self._lock:
             self._orig_hw = (h, w)
-            if f_idx not in self._frame_map:
-                self._order.append(f_idx)
-            self._frame_map[f_idx] = bgr
-            while len(self._order) > self._max_items:
-                evicted = self._order.popleft()
-                self._frame_map.pop(evicted, None)
+            self._frames[int(frame_index)] = bgr
+            while len(self._frames) > self._max_items:
+                evicted = next(iter(self._frames))
+                del self._frames[evicted]
                 self._bboxes.pop(evicted, None)
 
-    def record_bbox(self, frame_index: int, bbox_xyxy: np.ndarray | tuple[float, float, float, float]) -> None:
+    def record_bbox(self, frame_index: int, bbox_xyxy: np.ndarray | BBox) -> None:
         with self._lock:
             self._bboxes[int(frame_index)] = (
                 float(bbox_xyxy[0]),
@@ -79,29 +106,23 @@ class PreviewRingBuffer:
                 float(bbox_xyxy[3]),
             )
 
-    def get_latest_bgr(self) -> tuple[int, np.ndarray, tuple[float, float, float, float] | None, tuple[int, int]] | None:
-        with self._lock:
-            if not self._order:
-                return None
-            f_idx = self._order[-1]
-            bgr = self._frame_map.get(f_idx)
-            if bgr is None:
-                return None
-            return f_idx, bgr.copy(), self._bboxes.get(f_idx), self._orig_hw
+    def _snapshot(self, f_idx: int) -> PreviewFrame:
+        return f_idx, self._frames[f_idx].copy(), self._bboxes.get(f_idx), self._orig_hw
 
-    def get_synced_bgr(
-        self, target_frame_index: int
-    ) -> tuple[int, np.ndarray, tuple[float, float, float, float] | None, tuple[int, int]] | None:
+    def get_latest_bgr(self) -> PreviewFrame | None:
+        with self._lock:
+            if not self._frames:
+                return None
+            return self._snapshot(next(reversed(self._frames)))
+
+    def get_synced_bgr(self, target_frame_index: int) -> PreviewFrame | None:
         target = int(target_frame_index)
         with self._lock:
-            if not self._order:
+            if not self._frames:
                 return None
-            exact = self._frame_map.get(target)
-            if exact is not None:
-                return target, exact.copy(), self._bboxes.get(target), self._orig_hw
-            best_idx = min(self._order, key=lambda idx: abs(idx - target))
-            best_bgr = self._frame_map[best_idx]
-            return best_idx, best_bgr.copy(), self._bboxes.get(best_idx), self._orig_hw
+            if target in self._frames:
+                return self._snapshot(target)
+            return self._snapshot(min(self._frames, key=lambda idx: abs(idx - target)))
 
 
 class VideoFileSource:
@@ -115,47 +136,33 @@ class VideoFileSource:
         realtime: bool = True,
         target_fps: float = 30.0,
     ) -> None:
-        self.video_path = str(Path(video_path).resolve())
-        if not Path(self.video_path).is_file():
-            raise FileNotFoundError(f"Debug video not found: {self.video_path}")
+        path = Path(video_path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Debug video not found: {path}")
+        self.video_path = str(path)
         self.loop = bool(loop)
         self.realtime = bool(realtime)
-        self.target_fps = float(target_fps)
+        self._clock = _FrameClock(target_fps)
 
         self._cap = cv2.VideoCapture(self.video_path)
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open debug video: {self.video_path}")
-
-        self.width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         raw_fps = float(self._cap.get(cv2.CAP_PROP_FPS))
         self.native_fps = raw_fps if raw_fps > 1.0 else 30.0
-        self.total_native_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        self._frame_index = 0
         self._loop_frame_index = 0
         self._decoded_pos = -1
         self._last_rgb: np.ndarray | None = None
-        self._start_mono: float | None = None
-        self._pending_reset = True
 
     def read_next(self) -> SampledFrame | None:
         """Return the next 30.0 Hz sampled RGB frame, pacing to wall-clock if `realtime=True`."""
-        now = time.perf_counter()
-        if self._start_mono is None:
-            self._start_mono = now
-
-        target_wall = self._start_mono + (self._frame_index / self.target_fps)
         if self.realtime:
-            sleep_s = target_wall - time.perf_counter()
-            if sleep_s > 0.001:
-                time.sleep(sleep_s)
+            self._clock.wait_next()
 
         # Map 30 Hz tick within current loop pass to native video frame index.
-        loop_media_s = self._loop_frame_index / self.target_fps
-        desired_native_idx = int(round(loop_media_s * self.native_fps))
-
-        rgb = self._advance_to_native_frame(desired_native_idx)
+        loop_media_s = self._loop_frame_index / self._clock.fps
+        rgb = self._advance_to_native_frame(int(round(loop_media_s * self.native_fps)))
+        is_reset = False
         if rgb is None:
             if not self.loop:
                 return None
@@ -163,27 +170,21 @@ class VideoFileSource:
             self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             self._decoded_pos = -1
             self._loop_frame_index = 0
-            self._pending_reset = True
+            is_reset = True
             rgb = self._advance_to_native_frame(0)
             if rgb is None:
                 return None
 
-        capture_mono = time.perf_counter()
-        sample = SampledFrame(
-            frame_index=self._frame_index,
-            media_time_s=self._frame_index / self.target_fps,
-            capture_mono_s=capture_mono,
-            rgb=rgb,
-            is_stream_reset=self._pending_reset,
-            source_frame_pos=max(0, self._decoded_pos),
-        )
-        self._pending_reset = False
-        self._frame_index += 1
         self._loop_frame_index += 1
-        return sample
+        return self._clock.emit(rgb, is_stream_reset=is_reset)
 
     def _advance_to_native_frame(self, desired_idx: int) -> np.ndarray | None:
-        while self._decoded_pos < desired_idx:
+        # Skip frames we won't emit without decoding them into RGB (`grab` only).
+        while self._decoded_pos < desired_idx - 1:
+            if not self._cap.grab():
+                return None
+            self._decoded_pos += 1
+        if self._decoded_pos < desired_idx:
             ok, bgr = self._cap.read()
             if not ok or bgr is None:
                 return None
@@ -194,6 +195,14 @@ class VideoFileSource:
     def close(self) -> None:
         if self._cap is not None:
             self._cap.release()
+
+
+def _open_camera(index: int) -> cv2.VideoCapture:
+    cap = cv2.VideoCapture(index, _CAMERA_BACKEND)
+    if not cap.isOpened() and _CAMERA_BACKEND != cv2.CAP_ANY:
+        cap.release()
+        cap = cv2.VideoCapture(index)
+    return cap
 
 
 class CameraSource:
@@ -208,13 +217,7 @@ class CameraSource:
         target_fps: float = 30.0,
     ) -> None:
         self.camera_index = int(camera_index)
-        self.target_fps = float(target_fps)
-
-        # Prefer DirectShow on Windows for fast open, falling back to default backend.
-        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap.release()
-            cap = cv2.VideoCapture(self.camera_index)
+        cap = _open_camera(self.camera_index)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open camera index {self.camera_index}")
 
@@ -229,16 +232,13 @@ class CameraSource:
             raise RuntimeError(f"Camera {self.camera_index} opened but returned no frames")
 
         self._cap = cap
-        self.height, self.width = first_bgr.shape[:2]
+        self._clock = _FrameClock(target_fps)
         self._lock = threading.Lock()
-        self._latest_rgb = cv2.cvtColor(first_bgr, cv2.COLOR_BGR2RGB)
+        # Raw BGR; converted to RGB only for frames actually emitted on the output clock.
+        self._latest_bgr: np.ndarray = first_bgr
         self._stop = threading.Event()
         self._reader_thread = threading.Thread(target=self._reader_loop, name="camera-reader", daemon=True)
         self._reader_thread.start()
-
-        self._frame_index = 0
-        self._start_mono: float | None = None
-        self._pending_reset = True
 
     def _reader_loop(self) -> None:
         while not self._stop.is_set():
@@ -246,36 +246,16 @@ class CameraSource:
             if not ok or bgr is None:
                 time.sleep(0.005)
                 continue
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             with self._lock:
-                self._latest_rgb = rgb
+                self._latest_bgr = bgr
 
     def read_next(self) -> SampledFrame | None:
         if self._stop.is_set():
             return None
-        now = time.perf_counter()
-        if self._start_mono is None:
-            self._start_mono = now
-
-        target_wall = self._start_mono + (self._frame_index / self.target_fps)
-        sleep_s = target_wall - time.perf_counter()
-        if sleep_s > 0.001:
-            time.sleep(sleep_s)
-
+        self._clock.wait_next()
         with self._lock:
-            rgb = self._latest_rgb.copy()
-
-        sample = SampledFrame(
-            frame_index=self._frame_index,
-            media_time_s=self._frame_index / self.target_fps,
-            capture_mono_s=time.perf_counter(),
-            rgb=rgb,
-            is_stream_reset=self._pending_reset,
-            source_frame_pos=self._frame_index,
-        )
-        self._pending_reset = False
-        self._frame_index += 1
-        return sample
+            bgr = self._latest_bgr
+        return self._clock.emit(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
     def close(self) -> None:
         self._stop.set()
@@ -288,7 +268,7 @@ def list_available_cameras(max_probe: int = 4) -> list[dict[str, int | str]]:
     """Probe local camera indices `0..max_probe-1` for the control UI dropdown."""
     found: list[dict[str, int | str]] = []
     for idx in range(max_probe):
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(idx, _CAMERA_BACKEND)
         if not cap.isOpened():
             cap.release()
             continue

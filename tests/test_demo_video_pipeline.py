@@ -13,8 +13,7 @@ from fastapi.testclient import TestClient
 
 from persona_flowhmr.config import EngineConfig
 from persona_flowhmr.engine import StreamingMocapEngine
-from persona_flowhmr.paths import DEFAULT_DEMO_VIDEO
-from persona_flowhmr.perception import is_sam3d_available
+from persona_flowhmr.paths import DEFAULT_DEMO_VIDEO, is_sam3d_available
 from persona_flowhmr.web_ui import create_app
 
 

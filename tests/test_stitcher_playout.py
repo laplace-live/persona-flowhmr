@@ -20,7 +20,7 @@ from persona_flowhmr.stitcher import MotionLatentDecoder, StreamingStitcher
 
 
 def test_stitcher_continuous_root_integration_and_overlap_blend() -> None:
-    decoder = MotionLatentDecoder(MOTION_STATS_PATH, motion_style="basic", fps=30.0)
+    decoder = MotionLatentDecoder(MOTION_STATS_PATH, motion_style="basic")
     stitcher = StreamingStitcher(decoder, fps=30.0)
 
     # Window 1 & Window 2 with constant normalized latent = 0 (except positive X velocity in win 1 & 2).

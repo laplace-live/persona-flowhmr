@@ -5,14 +5,25 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from .paths import DEFAULT_DEMO_VIDEO
+
+# FlowHMR's native motion rate: sources resample to it and windows/stitching run on its frame grid.
+MODEL_FPS = 30.0
+# Width of one SAM 3D Body conditioning token (1024 body + 2048 hand features).
+SAM_TOKEN_DIM = 3072
 
 PresetName = Literal["ultra_low", "low", "balanced", "high", "max"]
 SourceMode = Literal["video", "camera"]
 PerceptionBackend = Literal["auto", "sam3d", "replay"]
-HandMode = Literal["auto", "off", "fast", "full"]
+ResolvedHandMode = Literal["off", "fast", "full"]
+HandMode = Literal["auto", ResolvedHandMode]  # auto = use preset default_hand_mode
+DetectorSize = Literal[416, 640]
+YoloSize = Literal[0, DetectorSize]  # 0 = use preset default_yolo_size
+YoloStride = Literal[1, 2, 3]
+SamStride = Literal[0, 1, 2, 3, 4, 5, 6]  # 0 = use preset default_sam_stride
+PlayoutFps = Literal[30, 60]
 
 
 @dataclass(frozen=True)
@@ -28,21 +39,24 @@ class LatencyPreset:
     ode_steps: int
     sam_chunk_size: int
     default_sam_stride: int
-    default_hand_mode: Literal["off", "fast", "full"]
+    default_hand_mode: ResolvedHandMode
     body_decoder_layers: int
     hand_decoder_layers: int
-    default_yolo_size: Literal[416, 640]
+    default_yolo_size: DetectorSize
     playout_delay_s: float
+
+    @property
+    def future_frames(self) -> int:
+        """Frames a stride needs from its first emitted frame onward (`S + O + L`)."""
+        return self.stride_frames + self.overlap_frames + self.lookahead_frames
 
     @property
     def window_frames(self) -> int:
         """Total frames passed to FlowHMR MMDiT per sliding-window solve."""
-        return self.history_frames + self.stride_frames + self.overlap_frames + self.lookahead_frames
+        return self.history_frames + self.future_frames
 
-    @property
-    def causal_wait_s(self) -> float:
-        """Media-time span (seconds at 30 Hz) needed ahead of the first frame of a stride."""
-        return (self.stride_frames + self.overlap_frames + self.lookahead_frames - 1) / 30.0
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self) | {"window_frames": self.window_frames}
 
 
 LATENCY_PRESETS: dict[PresetName, LatencyPreset] = {
@@ -141,14 +155,14 @@ class EngineConfig:
     loop_video: bool = True
 
     preset: PresetName = "low"
-    playout_fps: Literal[30, 60] = 60
+    playout_fps: PlayoutFps = 60
     mirror: bool = False
     follow_movement: bool = True
     torch_compile: bool = True
-    sam_stride: Literal[0, 1, 2, 3, 4, 5, 6] = 0  # 0 = use preset default_sam_stride
-    hand_mode: HandMode = "auto"  # auto = use preset default_hand_mode
-    yolo_size: Literal[0, 416, 640] = 0  # 0 = use preset default_yolo_size
-    yolo_stride: Literal[1, 2, 3] = 2
+    sam_stride: SamStride = 0
+    hand_mode: HandMode = "auto"
+    yolo_size: YoloSize = 0
+    yolo_stride: YoloStride = 2
     perception_backend: PerceptionBackend = "auto"
     replay_tokens_path: str = ""
 
@@ -168,13 +182,13 @@ class EngineConfig:
     def effective_sam_stride(self) -> int:
         return int(self.sam_stride) if self.sam_stride > 0 else self.get_preset().default_sam_stride
 
-    def effective_hand_mode(self) -> Literal["off", "fast", "full"]:
-        if self.hand_mode in ("off", "fast", "full"):
+    def effective_hand_mode(self) -> ResolvedHandMode:
+        if self.hand_mode in get_args(ResolvedHandMode):
             return self.hand_mode
         return self.get_preset().default_hand_mode
 
     def effective_yolo_size(self) -> tuple[int, int]:
-        sz = int(self.yolo_size) if self.yolo_size in (416, 640) else self.get_preset().default_yolo_size
+        sz = int(self.yolo_size) if self.yolo_size in get_args(DetectorSize) else self.get_preset().default_yolo_size
         return (sz, sz)
 
     def to_dict(self) -> dict[str, Any]:
@@ -184,7 +198,7 @@ class EngineConfig:
         data["effective_sam_stride"] = self.effective_sam_stride()
         data["effective_hand_mode"] = self.effective_hand_mode()
         data["effective_yolo_size"] = self.effective_yolo_size()[0]
-        data["preset_details"] = asdict(self.get_preset())
+        data["preset_details"] = self.get_preset().to_dict()
         return data
 
     def save(self, path: str | Path) -> None:
@@ -208,8 +222,10 @@ class EngineConfig:
             return cfg
         if not isinstance(raw, dict):
             return cfg
-        valid_names = {f.name for f in fields(cls)}
         for k, v in raw.items():
-            if k in valid_names and v is not None:
+            if k in CONFIG_FIELDS and v is not None:
                 setattr(cfg, k, v)
         return cfg
+
+
+CONFIG_FIELDS: frozenset[str] = frozenset(f.name for f in fields(EngineConfig))
