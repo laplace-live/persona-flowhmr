@@ -7,8 +7,9 @@ frame-indexed deterministic initial Gaussian noise so overlapping windows remain
 
 from __future__ import annotations
 
-from pathlib import Path
 import time
+from pathlib import Path
+
 import numpy as np
 import torch
 import yaml
@@ -40,7 +41,7 @@ class FlowHMRWindowSolver:
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision("high")
 
-        with open(cfg_file, "r", encoding="utf-8") as f:
+        with open(cfg_file, encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
 
         pipe_args = self.cfg.get("train_pipeline_args", {})

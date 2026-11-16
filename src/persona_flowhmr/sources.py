@@ -7,11 +7,12 @@ control UI can display both the live frame and the latency-synced playout frame 
 
 from __future__ import annotations
 
+import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-import threading
-import time
+
 import cv2
 import numpy as np
 

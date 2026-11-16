@@ -26,17 +26,19 @@ Standalone external single-camera mocap app for **LAPLACE Persona**, running buf
 | `high` | `60 + 15 + 6 + 10 = 91` | `10` | Stride 5 · Full 6-Layer Body + Hands | **~2.15 s** |
 | `max` | `60 + 20 + 8 + 28 = 116` | `16` | Stride 5 · Full 6-Layer Body + Hands | **~3.20 s** |
 
-## Setup (Git Bash)
+## Setup (`uv` · Git Bash)
 
-1. Check GPU and installed checkpoints:
+Managed with **[uv](https://docs.astral.sh/uv/)** (`pyproject.toml` + `uv.lock`, including explicit CUDA 12.8 `pytorch-cu128` wheel routing and `triton-windows`).
+
+1. Sync the locked environment and check GPU / checkpoint status:
    ```bash
    cd /d/Git/persona-flowhmr
-   source .venv/Scripts/activate
-   persona-flowhmr status
+   uv sync
+   uv run persona-flowhmr status
    ```
 2. Download any missing checkpoints (automatically pulls `facebook/sam-3d-body-dinov3` from ModelScope with SHA256 verification):
    ```bash
-   persona-flowhmr setup
+   uv run persona-flowhmr setup
    ```
 
 ## Usage (Git Bash)
@@ -44,15 +46,14 @@ Standalone external single-camera mocap app for **LAPLACE Persona**, running buf
 ### 1. External App Control & Preview Web UI
 ```bash
 cd /d/Git/persona-flowhmr
-source .venv/Scripts/activate
-persona-flowhmr serve --port 7865
+uv run persona-flowhmr serve --port 7865
 ```
-Open `http://127.0.0.1:7865` to switch between **Live Camera** and **Debug Video**, adjust latency presets (`0.80s`–`3.20s`), configure `Hand Mode` (`auto`/`off`/`fast`/`full`) and `YOLOX` resolution (`416`/`640`), toggle `30 / 60 FPS` and `Mirror`, configure VMC / Persona Plugin API, and view synchronized live + playout HUD previews.
+Open `http://127.0.0.1:7865` to switch between **Live Camera** and **Debug Video** (including native system file browsing), adjust latency presets (`0.80s`–`3.20s`), configure `Hand Mode` (`auto`/`off`/`fast`/`full`) and `YOLOX` resolution (`416`/`640`), toggle `30 / 60 FPS` and `Mirror`, configure VMC / Persona Plugin API, and view synchronized live + playout HUD previews.
 
 ### 2. Headless CLI (Debug Video or Live Camera -> Persona)
 ```bash
 # Low-latency (~1.05s) debug dance video -> VMC UDP 39539 + Persona Plugin API auto-setup
-persona-flowhmr run \
+uv run persona-flowhmr run \
   --source video \
   --video "D:/Git/persona/references/dancing girl [2E2okJyQyZI].mp4" \
   --preset low \
@@ -61,5 +62,11 @@ persona-flowhmr run \
   --plugin-token "<YOUR_PERSONA_TOKEN>"
 
 # Live webcam (device 0) with selfie mirror enabled
-persona-flowhmr run --source camera --camera 0 --preset low --fps 60 --mirror
+uv run persona-flowhmr run --source camera --camera 0 --preset low --fps 60 --mirror
+```
+
+### 3. Tests & Linting
+```bash
+uv run pytest -v
+uv run ruff check
 ```

@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import base64
 import json
-from pathlib import Path
 import shutil
 import struct
 import subprocess
+from pathlib import Path
+
 import numpy as np
 import pytest
 
-from persona_flowhmr.retarget import CanonicalPoseFrame, SMPLH_TO_UNITY_BONES, pose_to_vmc_bones
+from persona_flowhmr.retarget import SMPLH_TO_UNITY_BONES, CanonicalPoseFrame, pose_to_vmc_bones
 from persona_flowhmr.vmc_sender import encode_vmc_bundle
 
 

@@ -8,9 +8,10 @@ import os
 import signal
 import sys
 import time
+
 import uvicorn
 
-from .config import EngineConfig, LATENCY_PRESETS
+from .config import LATENCY_PRESETS, EngineConfig
 from .engine import StreamingMocapEngine
 from .paths import DEFAULT_DEMO_VIDEO
 from .setup_models import check_models_status, download_missing_models

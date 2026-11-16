@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import socket
 import struct
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 Pos3 = tuple[float, float, float]
 Quat4 = tuple[float, float, float, float]  # (x, y, z, w)

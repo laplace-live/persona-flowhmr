@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 import sys
 import time
-from typing import Any
 import urllib.parse
 import urllib.request
+from pathlib import Path
+from typing import Any
+
 from huggingface_hub import hf_hub_download, snapshot_download
 from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
 
@@ -19,8 +20,8 @@ from .paths import (
     J_REGRESSOR_PATH,
     MODELS_DIR,
     MOTION_STATS_PATH,
-    SAM3D_CKPT_PATH,
     SAM3D_CFG_PATH,
+    SAM3D_CKPT_PATH,
     SAM3D_DIR,
     SAM3D_MHR_PATH,
     YOLOX_CKPT_PATH,

@@ -7,14 +7,15 @@ and crossfading all 52 canonical joint quaternions via antipodal SLERP over `O` 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from pathlib import Path
+
 import numpy as np
 
 from .retarget import (
-    CanonicalPoseFrame,
     SMPLH_PARENTS,
+    CanonicalPoseFrame,
     canonicalize_smplh_sequence,
     rot6d_to_matrix_np,
     slerp_quat_xyzw,
@@ -43,7 +44,7 @@ class MotionLatentDecoder:
         self.motion_style = motion_style
         self.fps = float(fps)
 
-        with open(motion_stats_path, "r", encoding="utf-8") as f:
+        with open(motion_stats_path, encoding="utf-8") as f:
             stats = json.load(f)
 
         def _pair(key: str, shape: tuple[int, ...] | None = None) -> tuple[np.ndarray, np.ndarray]:
