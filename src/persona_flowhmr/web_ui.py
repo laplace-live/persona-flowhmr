@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
 from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -17,6 +23,71 @@ from .sources import list_available_cameras
 
 class SetupModelsRequest(BaseModel):
     hf_token: str | None = None
+
+
+class PickVideoRequest(BaseModel):
+    current_path: str | None = None
+
+
+_PICKER_LOCK = threading.Lock()
+
+_TK_PICK_VIDEO_SCRIPT = """
+import ctypes, json, sys, tkinter as tk
+from tkinter import filedialog
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        pass
+root = tk.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
+path = filedialog.askopenfilename(
+    parent=root,
+    initialdir=sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None,
+    title="Select Debug Video File",
+    filetypes=[
+        ("Video Files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v *.ts"),
+        ("All Files", "*.*"),
+    ],
+)
+root.destroy()
+print(json.dumps({"path": path or ""}))
+"""
+
+
+def _open_system_video_dialog(current_path: str | None = None) -> str:
+    """Open the native OS file picker in a clean helper process and return the chosen path (or '')."""
+    if not _PICKER_LOCK.acquire(blocking=False):
+        return ""
+    try:
+        initial_dir = Path.home()
+        if current_path:
+            cand = Path(current_path).expanduser()
+            if cand.is_dir():
+                initial_dir = cand
+            elif cand.parent.is_dir():
+                initial_dir = cand.parent
+
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = subprocess.run(
+            [sys.executable, "-c", _TK_PICK_VIDEO_SCRIPT, str(initial_dir)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "Failed to open system file dialog").strip())
+        lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        raw_path = str(json.loads(lines[-1]).get("path") or "").strip()
+        return str(Path(raw_path).resolve()) if raw_path else ""
+    finally:
+        _PICKER_LOCK.release()
 
 
 _DASHBOARD_HTML = """<!doctype html>
@@ -67,12 +138,15 @@ _DASHBOARD_HTML = """<!doctype html>
       background: #0d1118; color: var(--text); font-size: 13px;
     }
     .row { display: flex; gap: 8px; align-items: center; }
-    .row > * { flex: 1; }
+    .row > * { flex: 1; min-width: 0; }
+    .actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
     .check { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 13px; cursor: pointer; }
     button {
       padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border);
       background: #1c2434; color: var(--text); font-weight: 600; cursor: pointer; font-size: 13px;
+      white-space: nowrap; flex-shrink: 0;
     }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
     button.primary { background: #1a6fb0; border-color: #2c8bd4; color: #fff; }
     button.danger { background: #7c2424; border-color: #a63434; color: #fff; }
     .previews { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
@@ -97,11 +171,11 @@ _DASHBOARD_HTML = """<!doctype html>
 </head>
 <body>
   <header>
-    <div style="display:flex;align-items:center;gap:12px;">
+    <div style="display:flex;align-items:center;gap:12px;min-width:0;">
       <h1>LAPLACE Persona · FlowHMR External Mocap</h1>
       <span id="stateBadge" class="badge">STOPPED</span>
     </div>
-    <div class="row" style="flex:none;">
+    <div class="actions">
       <button class="primary" onclick="startEngine()">Start Stream</button>
       <button class="danger" onclick="stopEngine()">Stop</button>
     </div>
@@ -119,7 +193,10 @@ _DASHBOARD_HTML = """<!doctype html>
         </div>
         <div id="videoFields" class="field">
           <label>Debug Video Path</label>
-          <input type="text" id="video_path" />
+          <div class="row">
+            <input type="text" id="video_path" placeholder="Select or enter video path..." />
+            <button id="browseVideoBtn" type="button" style="flex:none;" onclick="pickVideoFile()">Browse…</button>
+          </div>
           <label class="check"><input type="checkbox" id="loop_video" checked /> Loop Debug Video</label>
         </div>
         <div id="cameraFields" class="field" style="display:none;">
@@ -269,6 +346,29 @@ _DASHBOARD_HTML = """<!doctype html>
         sel.appendChild(o);
       });
     }
+    async function pickVideoFile() {
+      const btn = document.getElementById('browseVideoBtn');
+      const input = document.getElementById('video_path');
+      btn.disabled = true;
+      try {
+        const r = await fetch('/api/pick-video', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({current_path: input.value}),
+        });
+        const d = await r.json();
+        if (!r.ok) {
+          alert(d.detail || 'Failed to open file dialog');
+          return;
+        }
+        if (d.path) {
+          input.value = d.path;
+          await applyConfig();
+        }
+      } finally {
+        btn.disabled = false;
+      }
+    }
     function gatherConfig() {
       return {
         source_mode: document.getElementById('source_mode').value,
@@ -413,6 +513,17 @@ def create_app(engine: StreamingMocapEngine | None = None) -> FastAPI:
     @app.get("/api/cameras")
     def api_cameras() -> dict[str, Any]:
         return {"cameras": list_available_cameras()}
+
+    @app.post("/api/pick-video")
+    async def api_pick_video(req: PickVideoRequest) -> dict[str, str]:
+        try:
+            chosen = await asyncio.to_thread(
+                _open_system_video_dialog,
+                req.current_path or eng.config.video_path,
+            )
+            return {"path": chosen}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/api/config")
     def api_config(patch: dict[str, Any]) -> dict[str, Any]:
