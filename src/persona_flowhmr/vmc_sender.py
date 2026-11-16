@@ -9,6 +9,7 @@ bones across frames.
 from __future__ import annotations
 
 import functools
+import logging
 import socket
 import struct
 import time
@@ -22,6 +23,7 @@ _SIZE = struct.Struct(">I")
 _POS7 = struct.Struct(">7f")  # (px, py, pz, qx, qy, qz, qw)
 _BUNDLE_HEADER = b"#bundle\x00" + struct.pack(">Q", 1)  # immediate timetag = 1
 _RESOLVE_TTL_S = 5.0  # how long a resolved target address is reused before looking the host up again
+_log = logging.getLogger(__name__)
 
 
 def encode_osc_string(value: str) -> bytes:
@@ -90,10 +92,12 @@ class VmcUdpSender:
             # Look a host name up every few seconds rather than inside every 60 Hz `sendto`, so DNS changes still land.
             try:
                 addr = (socket.gethostbyname(target[0]), target[1])
-            except OSError:
+            except OSError as exc:
                 if resolved is None or resolved[0] != target:
                     raise
-                addr = resolved[1]  # a failed refresh keeps the last working address and retries after the TTL
+                # A failed refresh keeps the last working address and retries after the TTL.
+                _log.warning("VMC host %r lookup failed (%s); still sending to %s", target[0], exc, resolved[1][0])
+                addr = resolved[1]
             resolved = (target, addr, now + _RESOLVE_TTL_S)
             self._resolved = resolved
         sent = self._sock.sendto(encode_vmc_bundle(bones), resolved[1])
