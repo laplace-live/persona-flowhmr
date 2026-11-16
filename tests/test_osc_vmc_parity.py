@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import socket
 import struct
@@ -101,7 +102,9 @@ def test_vmc_sender_caches_host_lookups_but_re_resolves_periodically(monkeypatch
     assert sent_to == [("10.0.0.1", 39539), ("10.0.0.1", 39539), ("10.0.0.2", 39539)]
 
 
-def test_vmc_sender_keeps_last_address_when_a_dns_refresh_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_vmc_sender_keeps_last_address_when_a_dns_refresh_fails(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     sender = vmc_sender.VmcUdpSender("persona-pc.local", 39539)
     sender._sock.close()
     sent_to: list[tuple[str, int]] = []
@@ -123,11 +126,16 @@ def test_vmc_sender_keeps_last_address_when_a_dns_refresh_fails(monkeypatch: pyt
     bones = pose_to_vmc_bones(CanonicalPoseFrame(0.0, 0.0, 0, quats, np.zeros(3, dtype=np.float32)))
     sender.send_pose(bones)
     clock[0] += 60.0
-    sender.send_pose(bones)  # the refresh fails: keep sending to the last working address instead of raising
+    with caplog.at_level(logging.WARNING, logger="persona_flowhmr.vmc_sender"):
+        sender.send_pose(bones)  # the refresh fails: keep sending to the last working address instead of raising
     clock[0] += 60.0
     sender.send_pose(bones)  # the next refresh succeeds
 
     assert sent_to == [("10.0.0.1", 39539), ("10.0.0.1", 39539), ("10.0.0.2", 39539)]
+    # The stale-address fallback is reported once, naming the host and the address still in use.
+    assert [r.getMessage() for r in caplog.records] == [
+        "VMC host 'persona-pc.local' lookup failed ([Errno 8] nodename nor servname provided); still sending to 10.0.0.1"
+    ]
 
 
 @pytest.mark.skipif(not Path(r"D:\Git\persona\node_modules").exists(), reason="Persona repo not present")
