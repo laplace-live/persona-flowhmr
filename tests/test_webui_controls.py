@@ -42,3 +42,48 @@ def test_dashboard_single_line_buttons_and_pick_video_endpoint(monkeypatch: pyte
         res_cancel = client.post("/api/pick-video", json={"current_path": ""})
         assert res_cancel.status_code == 200
         assert res_cancel.json() == {"path": ""}
+
+
+def test_settings_persisted_across_refresh_and_restart(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    eng1 = StreamingMocapEngine(EngineConfig(), settings_path=settings_file)
+    app1 = web_ui.create_app(eng1)
+
+    with TestClient(app1) as client1:
+        html = client1.get("/").text
+        assert "scheduleSaveConfig" in html
+        res = client1.post(
+            "/api/config",
+            json={
+                "preset": "balanced",
+                "mirror": True,
+                "camera_index": 2,
+                "video_path": "D:/videos/custom.mp4",
+                "plugin_api_token": "sk-lp-v1-test-token",
+            },
+        )
+        assert res.status_code == 200
+
+    assert settings_file.is_file()
+    loaded = EngineConfig.load(settings_file)
+    assert loaded.preset == "balanced"
+    assert loaded.mirror is True
+    assert loaded.camera_index == 2
+    assert loaded.video_path == "D:/videos/custom.mp4"
+    assert loaded.plugin_api_token == "sk-lp-v1-test-token"
+
+    # Simulated page refresh / server restart keeps redacted token intact when UI sends empty string.
+    eng2 = StreamingMocapEngine(loaded, settings_path=settings_file)
+    app2 = web_ui.create_app(eng2)
+    with TestClient(app2) as client2:
+        st = client2.get("/api/status").json()["config"]
+        assert st["preset"] == "balanced"
+        assert st["mirror"] is True
+        assert st["camera_index"] == 2
+        assert st["has_plugin_api_token"] is True
+
+        client2.post("/api/config", json={"playout_fps": 30, "plugin_api_token": ""})
+
+    reloaded = EngineConfig.load(settings_file)
+    assert reloaded.playout_fps == 30
+    assert reloaded.plugin_api_token == "sk-lp-v1-test-token"
