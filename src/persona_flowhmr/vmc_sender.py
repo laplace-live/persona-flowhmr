@@ -8,14 +8,17 @@ bones across frames.
 
 from __future__ import annotations
 
+import functools
 import socket
 import struct
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 
 Pos3 = tuple[float, float, float]
 Quat4 = tuple[float, float, float, float]  # (x, y, z, w)
 BoneTransform = tuple[str, Pos3, Quat4]
 
+_SIZE = struct.Struct(">I")
+_POS7 = struct.Struct(">7f")  # (px, py, pz, qx, qy, qz, qw)
 _BUNDLE_HEADER = b"#bundle\x00" + struct.pack(">Q", 1)  # immediate timetag = 1
 
 
@@ -26,91 +29,63 @@ def encode_osc_string(value: str) -> bytes:
     return raw + (b"\x00" * pad)
 
 
-_ADDR_ROOT_POS = encode_osc_string("/VMC/Ext/Root/Pos")
-_ADDR_BONE_POS = encode_osc_string("/VMC/Ext/Bone/Pos")
-_ADDR_OK = encode_osc_string("/VMC/Ext/OK")
 _TAGS_POS7 = encode_osc_string(",sfffffff")
-_TAGS_OK = encode_osc_string(",iii")
-_ROOT_NAME = encode_osc_string("root")
-_BONE_NAME_CACHE: dict[str, bytes] = {}
 
 
-def _cached_bone_name(name: str) -> bytes:
-    encoded = _BONE_NAME_CACHE.get(name)
-    if encoded is None:
-        encoded = encode_osc_string(name)
-        _BONE_NAME_CACHE[name] = encoded
-    return encoded
+def _bundle_element(msg: bytes) -> bytes:
+    """Prefix an OSC message with its big-endian byte size, as stored inside a `#bundle`."""
+    return _SIZE.pack(len(msg)) + msg
 
 
-def encode_vmc_pos_message(address_bytes: bytes, name_bytes: bytes, pos: Pos3, quat: Quat4) -> bytes:
-    """Encode `/VMC/Ext/Root/Pos` or `/VMC/Ext/Bone/Pos` with `(name, px, py, pz, qx, qy, qz, qw)`."""
-    payload = struct.pack(
-        ">7f",
-        float(pos[0]),
-        float(pos[1]),
-        float(pos[2]),
-        float(quat[0]),
-        float(quat[1]),
-        float(quat[2]),
-        float(quat[3]),
-    )
-    return address_bytes + _TAGS_POS7 + name_bytes + payload
+@functools.cache
+def _bone_element_head(name: str) -> bytes:
+    """Size prefix + `/VMC/Ext/Bone/Pos ,sfffffff <name>`: everything before a bone's 7 floats."""
+    head = encode_osc_string("/VMC/Ext/Bone/Pos") + _TAGS_POS7 + encode_osc_string(name)
+    return _SIZE.pack(len(head) + _POS7.size) + head
 
 
-def encode_vmc_ok_message(loaded: int = 1, calibrated: int = 3, tracking: int = 1) -> bytes:
-    """Encode `/VMC/Ext/OK` status message (`loaded=1, calibrated=3, tracking=1`)."""
-    return _ADDR_OK + _TAGS_OK + struct.pack(">3i", int(loaded), int(calibrated), int(tracking))
+# Identity root transform and `/VMC/Ext/OK` status (`loaded=1, calibrated=3, tracking=1`) never change.
+_ROOT_ELEMENT = _bundle_element(
+    encode_osc_string("/VMC/Ext/Root/Pos")
+    + _TAGS_POS7
+    + encode_osc_string("root")
+    + _POS7.pack(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+)
+_OK_ELEMENT = _bundle_element(encode_osc_string("/VMC/Ext/OK") + encode_osc_string(",iii") + struct.pack(">3i", 1, 3, 1))
 
 
-def encode_vmc_bundle(
-    bones: Iterable[BoneTransform],
-    root_pos: Pos3 = (0.0, 0.0, 0.0),
-    root_quat: Quat4 = (0.0, 0.0, 0.0, 1.0),
-    include_ok: bool = True,
-) -> bytes:
-    """Pack root transform, all humanoid bone transforms, and `/VMC/Ext/OK` into one OSC `#bundle`."""
-    elements: list[bytes] = []
-
-    root_msg = encode_vmc_pos_message(_ADDR_ROOT_POS, _ROOT_NAME, root_pos, root_quat)
-    elements.append(struct.pack(">I", len(root_msg)) + root_msg)
-
-    for bone_name, pos, quat in bones:
-        bone_msg = encode_vmc_pos_message(_ADDR_BONE_POS, _cached_bone_name(bone_name), pos, quat)
-        elements.append(struct.pack(">I", len(bone_msg)) + bone_msg)
-
-    if include_ok:
-        ok_msg = encode_vmc_ok_message(1, 3, 1)
-        elements.append(struct.pack(">I", len(ok_msg)) + ok_msg)
-
-    return _BUNDLE_HEADER + b"".join(elements)
+def encode_vmc_bundle(bones: Iterable[BoneTransform]) -> bytes:
+    """Pack the identity root transform, all humanoid bone transforms, and `/VMC/Ext/OK` into one OSC `#bundle`."""
+    parts = [_BUNDLE_HEADER, _ROOT_ELEMENT]
+    for name, pos, quat in bones:
+        parts.append(_bone_element_head(name))
+        parts.append(_POS7.pack(*pos, *quat))
+    parts.append(_OK_ELEMENT)
+    return b"".join(parts)
 
 
 class VmcUdpSender:
-    """Thread-safe non-blocking UDP sender for VMC OSC `#bundle` packets."""
+    """Non-blocking UDP sender for VMC OSC `#bundle` packets."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 39539) -> None:
         self.host = host
         self.port = int(port)
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+        self._resolved: tuple[tuple[str, int], tuple[str, int]] | None = None  # ((host, port), (ip, port))
         self.packets_sent = 0
-        self.bytes_sent = 0
 
     def set_target(self, host: str, port: int) -> None:
         self.host = host
         self.port = int(port)
 
-    def send_pose(
-        self,
-        bones: Sequence[BoneTransform],
-        root_pos: Pos3 = (0.0, 0.0, 0.0),
-        root_quat: Quat4 = (0.0, 0.0, 0.0, 1.0),
-    ) -> int:
-        packet = encode_vmc_bundle(bones, root_pos=root_pos, root_quat=root_quat, include_ok=True)
-        sent = self._sock.sendto(packet, (self.host, self.port))
+    def send_pose(self, bones: Iterable[BoneTransform]) -> int:
+        target = (self.host, self.port)
+        if self._resolved is None or self._resolved[0] != target:
+            # Resolve a host name once per target instead of inside every 60 Hz `sendto`.
+            self._resolved = (target, (socket.gethostbyname(target[0]), target[1]))
+        sent = self._sock.sendto(encode_vmc_bundle(bones), self._resolved[1])
         self.packets_sent += 1
-        self.bytes_sent += sent
         return sent
 
     def close(self) -> None:

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 import supervision as sv
 import torch
 
+from .config import MODEL_FPS, SAM_TOKEN_DIM, ResolvedHandMode
 from .paths import (
     SAM3D_CKPT_PATH,
     SAM3D_MHR_PATH,
@@ -23,17 +22,27 @@ class Sam3DCheckpointMissingError(FileNotFoundError):
     """Raised when gated `facebook/sam-3d-body-dinov3` weights have not been downloaded yet."""
 
 
-def is_sam3d_available(ckpt_path: Path = SAM3D_CKPT_PATH, mhr_path: Path = SAM3D_MHR_PATH) -> bool:
-    return ckpt_path.is_file() and mhr_path.is_file()
-
-
 def default_camera_intrinsics(height: int, width: int) -> np.ndarray:
-    """Compute FlowHMR's diagonal-focal-length static camera matrix `K` `(3, 3)`."""
-    f = float((height * height + width * width) ** 0.5)
-    return np.array(
-        [[f, 0.0, width * 0.5], [0.0, f, height * 0.5], [0.0, 0.0, 1.0]],
-        dtype=np.float32,
-    )
+    """FlowHMR's diagonal-focal-length static camera matrix `K` `(3, 3)`."""
+    bootstrap_runtime()
+    from flowhmr.utils.runtime_video_processing import VideoProcessor
+
+    return VideoProcessor.default_K_from_hw(height, width)
+
+
+def _empty_tokens() -> torch.Tensor:
+    return torch.empty((0, SAM_TOKEN_DIM), dtype=torch.float32)
+
+
+def _center_box(height: int, width: int) -> np.ndarray:
+    """`(1, 4)` centered person-sized box used for warmup / neutral-pose passes."""
+    return np.array([[width * 0.25, height * 0.1, width * 0.75, height * 0.9]], dtype=np.float32)
+
+
+def _best_box_index(dets: sv.Detections) -> int:
+    """Index of the largest, most confident box (`area * confidence`)."""
+    conf = dets.confidence if dets.confidence is not None else 1.0
+    return int(np.argmax(dets.box_area * conf))
 
 
 def _install_local_dinov3_hub_hook() -> None:
@@ -82,8 +91,6 @@ class BatchedYoloxTracker:
         from yolox.utils import postprocess
 
         self.device = torch.device(device)
-        self.test_size = (int(test_size[0]), int(test_size[1]))
-        self.yolo_stride = max(1, int(yolo_stride))
         self.bbox_thr = float(bbox_thr)
         self.nms_thr = float(nms_thr)
         self.ema_alpha = float(ema_alpha)
@@ -94,30 +101,33 @@ class BatchedYoloxTracker:
         state = torch.load(str(ckpt), map_location="cpu", weights_only=True)
         model.load_state_dict(state["model"])
         model.eval()
-        self._use_bf16 = self.device.type == "cuda" and torch.cuda.get_device_capability(self.device)[0] >= 8
-        self.model = model.to(device=self.device, dtype=torch.bfloat16 if self._use_bf16 else torch.float32)
+        use_bf16 = self.device.type == "cuda" and torch.cuda.get_device_capability(self.device)[0] >= 8
+        self._dtype = torch.bfloat16 if use_bf16 else torch.float32
+        self.model = model.to(device=self.device, dtype=self._dtype)
         self.num_classes = int(exp.num_classes)
 
+        self.configure(test_size=test_size, yolo_stride=yolo_stride)
+
+    def configure(self, *, test_size: tuple[int, int], yolo_stride: int) -> None:
+        """Set the detector input size and frame stride, and restart tracking for a new stream."""
+        self.test_size = (int(test_size[0]), int(test_size[1]))
+        self.yolo_stride = max(1, int(yolo_stride))
         self.reset_tracker()
 
     def reset_tracker(self) -> None:
-        self._tracker = sv.ByteTrack(frame_rate=30)
+        self._tracker = sv.ByteTrack(frame_rate=int(MODEL_FPS))
         self._locked_track_id: int | None = None
         self._smoothed_bbox: np.ndarray | None = None
-        self._prev_emitted_bbox: np.ndarray | None = None
         self._missed_frames = 0
 
+    def _letterbox_canvas(self, batch_size: int) -> torch.Tensor:
+        """YOLOX's gray (114) padded input batch `(B, 3, H, W)` in the model dtype."""
+        return torch.full((batch_size, 3, *self.test_size), 114.0, device=self.device, dtype=self._dtype)
+
     @torch.no_grad()
-    def warmup(self, batch_size: int = 4, hw: tuple[int, int] = (720, 1280)) -> None:
+    def warmup(self, batch_size: int = 4) -> None:
         """Pre-initialize cuDNN workspace and kernels before real-time capture starts."""
-        dtype = torch.bfloat16 if self._use_bf16 else torch.float32
-        dummy = torch.full(
-            (max(1, int(batch_size)), 3, self.test_size[0], self.test_size[1]),
-            114.0,
-            device=self.device,
-            dtype=dtype,
-        )
-        _ = self.model(dummy)
+        self.model(self._letterbox_canvas(max(1, int(batch_size))))
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
@@ -137,7 +147,6 @@ class BatchedYoloxTracker:
         ratio = min(self.test_size[0] / float(h), self.test_size[1] / float(w))
         new_h = max(1, int(h * ratio))
         new_w = max(1, int(w * ratio))
-        dtype = torch.bfloat16 if self._use_bf16 else torch.float32
 
         stride = self.yolo_stride
         if stride > 1 and n >= 2:
@@ -155,19 +164,14 @@ class BatchedYoloxTracker:
 
         raw_np = np.stack([rgb_frames[i] for i in det_indices], axis=0)
         raw_gpu = torch.from_numpy(raw_np).to(device=self.device, non_blocking=True)
-        bgr_nchw = raw_gpu[..., [2, 1, 0]].permute(0, 3, 1, 2).to(dtype=dtype)
+        bgr_nchw = raw_gpu[..., [2, 1, 0]].permute(0, 3, 1, 2).to(dtype=self._dtype)
         resized = torch.nn.functional.interpolate(
             bgr_nchw,
             size=(new_h, new_w),
             mode="bilinear",
             align_corners=False,
         )
-        batch_t = torch.full(
-            (len(det_indices), 3, self.test_size[0], self.test_size[1]),
-            114.0,
-            device=self.device,
-            dtype=dtype,
-        )
+        batch_t = self._letterbox_canvas(len(det_indices))
         batch_t[:, :, :new_h, :new_w] = resized
 
         raw_out = self.model(batch_t)
@@ -180,13 +184,11 @@ class BatchedYoloxTracker:
         )
 
         full_box = np.array([0.0, 0.0, float(w), float(h)], dtype=np.float32)
-        det_map = {det_indices[pos]: dets[pos] for pos in range(len(det_indices))}
         key_boxes: dict[int, np.ndarray] = {}
-
-        for idx in det_indices:
+        for idx, det in zip(det_indices, dets):
             if reset_flags is not None and reset_flags[idx]:
                 self.reset_tracker()
-            key_boxes[idx] = self._step_single_frame(det_map[idx], ratio, w, h, full_box)
+            key_boxes[idx] = self._step_single_frame(det, ratio, w, h, full_box)
 
         out_boxes = np.empty((n, 4), dtype=np.float32)
         seg = 0
@@ -202,6 +204,35 @@ class BatchedYoloxTracker:
 
         return out_boxes
 
+    def _select_person(self, det: torch.Tensor | None, ratio: float, width: int, height: int) -> np.ndarray | None:
+        """Pick the locked ByteTrack person (else the largest confident one) from one frame's detections."""
+        if det is None or len(det) == 0:
+            return None
+        det_np = det.detach().cpu().numpy()
+        det_np = det_np[det_np[:, 6].astype(np.int32) == 0]
+        if len(det_np) == 0:
+            return None
+
+        xyxy = det_np[:, :4] / ratio
+        xyxy[:, [0, 2]] = np.clip(xyxy[:, [0, 2]], 0.0, float(width))
+        xyxy[:, [1, 3]] = np.clip(xyxy[:, [1, 3]], 0.0, float(height))
+        scores = (det_np[:, 4] * det_np[:, 5]).astype(np.float32)
+        detections = sv.Detections(
+            xyxy=xyxy.astype(np.float32),
+            confidence=scores,
+            class_id=np.zeros(len(scores), dtype=np.int32),
+        )
+        tracked = self._tracker.update_with_detections(detections)
+        if len(tracked) == 0 or tracked.tracker_id is None:
+            return detections.xyxy[_best_box_index(detections)]
+
+        t_ids = tracked.tracker_id.astype(int)
+        if self._locked_track_id is None or self._locked_track_id not in t_ids:
+            best = _best_box_index(tracked)
+            self._locked_track_id = int(t_ids[best])
+            return tracked.xyxy[best].astype(np.float32)
+        return tracked.xyxy[int(np.where(t_ids == self._locked_track_id)[0][0])].astype(np.float32)
+
     def _step_single_frame(
         self,
         det: torch.Tensor | None,
@@ -210,43 +241,7 @@ class BatchedYoloxTracker:
         height: int,
         full_box: np.ndarray,
     ) -> np.ndarray:
-        selected: np.ndarray | None = None
-
-        if det is not None and len(det) > 0:
-            det_np = det.detach().cpu().numpy()
-            person_mask = det_np[:, 6].astype(np.int32) == 0
-            det_np = det_np[person_mask]
-            if len(det_np) > 0:
-                xyxy = det_np[:, :4] / ratio
-                xyxy[:, [0, 2]] = np.clip(xyxy[:, [0, 2]], 0.0, float(width))
-                xyxy[:, [1, 3]] = np.clip(xyxy[:, [1, 3]], 0.0, float(height))
-                scores = (det_np[:, 4] * det_np[:, 5]).astype(np.float32)
-
-                sv_det = sv.Detections(
-                    xyxy=xyxy.astype(np.float32),
-                    confidence=scores,
-                    class_id=np.zeros(len(scores), dtype=np.int32),
-                )
-                tracked = self._tracker.update_with_detections(sv_det)
-
-                if len(tracked) > 0 and tracked.tracker_id is not None:
-                    t_ids = tracked.tracker_id.astype(int)
-                    if self._locked_track_id is not None and self._locked_track_id in t_ids:
-                        idx = int(np.where(t_ids == self._locked_track_id)[0][0])
-                        selected = tracked.xyxy[idx].astype(np.float32)
-                    else:
-                        areas = (tracked.xyxy[:, 2] - tracked.xyxy[:, 0]) * (
-                            tracked.xyxy[:, 3] - tracked.xyxy[:, 1]
-                        )
-                        confs = tracked.confidence if tracked.confidence is not None else np.ones_like(areas)
-                        best = int(np.argmax(areas * confs))
-                        self._locked_track_id = int(t_ids[best])
-                        selected = tracked.xyxy[best].astype(np.float32)
-                else:
-                    areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
-                    best = int(np.argmax(areas * scores))
-                    selected = xyxy[best].astype(np.float32)
-
+        selected = self._select_person(det, ratio, width, height)
         if selected is not None:
             self._missed_frames = 0
             if self._smoothed_bbox is None:
@@ -265,7 +260,10 @@ class BatchedYoloxTracker:
 
 
 class Sam3DStreamExtractor:
-    """Compiled BF16 SAM 3D Body Lite feature extractor producing `(N, 3072)` tokens."""
+    """Compiled BF16 SAM 3D Body Lite feature extractor producing `(N, SAM_TOKEN_DIM)` tokens."""
+
+    # Hand decoder runs on every `hand_stride`-th frame of a chunk (`fast` mode widens it to the chunk).
+    hand_stride = 2
 
     def __init__(
         self,
@@ -274,8 +272,7 @@ class Sam3DStreamExtractor:
         device: str | torch.device = "cuda",
         use_compile: bool = True,
         chunk_size: int = 3,
-        hand_stride: int = 2,
-        hand_mode: Literal["off", "fast", "full"] = "off",
+        hand_mode: ResolvedHandMode = "off",
         body_decoder_layers: int = 3,
         hand_decoder_layers: int = 2,
     ) -> None:
@@ -296,11 +293,12 @@ class Sam3DStreamExtractor:
         from sam_3d_body import SAM3DBodyEstimator, load_sam_3d_body
 
         self.device = torch.device(device)
-        self.chunk_size = max(1, int(chunk_size))
-        self.hand_stride = max(1, int(hand_stride))
-        self.hand_mode: Literal["off", "fast", "full"] = hand_mode
-        self.body_decoder_layers = max(1, int(body_decoder_layers))
-        self.hand_decoder_layers = max(1, int(hand_decoder_layers))
+        self.configure(
+            chunk_size=chunk_size,
+            hand_mode=hand_mode,
+            body_decoder_layers=body_decoder_layers,
+            hand_decoder_layers=hand_decoder_layers,
+        )
         self._use_compile = bool(use_compile and self.device.type == "cuda")
         self._warmed_signatures: set[tuple[int, str, int, int]] = set()
         self._neutral_hand_tokens: torch.Tensor | None = None
@@ -320,7 +318,7 @@ class Sam3DStreamExtractor:
         self,
         *,
         chunk_size: int,
-        hand_mode: Literal["off", "fast", "full"],
+        hand_mode: ResolvedHandMode,
         body_decoder_layers: int,
         hand_decoder_layers: int,
     ) -> None:
@@ -335,14 +333,12 @@ class Sam3DStreamExtractor:
             return self._neutral_hand_tokens
         h, w = hw
         blank_rgb = [np.full((h, w, 3), 128, dtype=np.uint8)]
-        blank_box = np.array([[w * 0.25, h * 0.1, w * 0.75, h * 0.9]], dtype=np.float32)
-        blank_k = default_camera_intrinsics(h, w)[None]
         # Run one unpadded single-frame full pass to capture exact in-distribution LayerNorm hand tokens.
         tok = self._extract_tokens(
             self.estimator,
             blank_rgb,
-            blank_box,
-            blank_k,
+            _center_box(h, w),
+            default_camera_intrinsics(h, w)[None],
             gpu_preprocess=True,
             merge_hands=True,
             hand_stride=1,
@@ -354,22 +350,18 @@ class Sam3DStreamExtractor:
         return self._neutral_hand_tokens
 
     @torch.no_grad()
-    def warmup(self, chunk_size: int | None = None, hw: tuple[int, int] = (720, 1280)) -> None:
+    def warmup(self, hw: tuple[int, int] = (720, 1280)) -> None:
         """Pre-compile static `B = chunk_size` body (and optional hand) shapes."""
-        target = max(1, int(chunk_size or self.chunk_size))
-        self.chunk_size = target
         if self.hand_mode == "off":
             self._ensure_neutral_hand_tokens(hw)
-        sig = (target, self.hand_mode, self.body_decoder_layers, self.hand_decoder_layers)
+        sig = (self.chunk_size, self.hand_mode, self.body_decoder_layers, self.hand_decoder_layers)
         if sig in self._warmed_signatures:
             return
         h, w = hw
-        dummy_rgb = [np.zeros((h, w, 3), dtype=np.uint8) for _ in range(target)]
-        dummy_box = np.tile(
-            np.array([[w * 0.25, h * 0.1, w * 0.75, h * 0.9]], dtype=np.float32),
-            (target, 1),
-        )
-        dummy_k = np.repeat(default_camera_intrinsics(h, w)[None], target, axis=0)
+        n = self.chunk_size
+        dummy_rgb = [np.zeros((h, w, 3), dtype=np.uint8) for _ in range(n)]
+        dummy_box = np.repeat(_center_box(h, w), n, axis=0)
+        dummy_k = np.repeat(default_camera_intrinsics(h, w)[None], n, axis=0)
         self.extract_chunk(dummy_rgb, dummy_box, dummy_k)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -382,9 +374,9 @@ class Sam3DStreamExtractor:
         bboxes_xyxy: np.ndarray,
         cameras_k: np.ndarray,
     ) -> torch.Tensor:
-        """Extract `(N, 3072)` float32 conditioning tokens for `N` frames with static compiled batch shapes."""
+        """Extract `(N, SAM_TOKEN_DIM)` float32 conditioning tokens for `N` frames with static compiled batch shapes."""
         if not rgb_frames:
-            return torch.empty((0, 3072), dtype=torch.float32)
+            return _empty_tokens()
         neutral_hands = (
             self._ensure_neutral_hand_tokens(rgb_frames[0].shape[:2])
             if self.hand_mode == "off"
@@ -424,7 +416,7 @@ class Sam3DStreamExtractor:
 
 
 class ReplayTokenExtractor:
-    """Replays pre-extracted `(T, 3072)` `.pt`/`.npz` SAM tokens (or deterministic bbox embeddings)."""
+    """Replays pre-extracted `(T, SAM_TOKEN_DIM)` `.pt`/`.npz` SAM tokens (or deterministic bbox embeddings)."""
 
     def __init__(self, replay_path: str | Path | None = None) -> None:
         self._tokens: torch.Tensor | None = None
@@ -440,8 +432,8 @@ class ReplayTokenExtractor:
                 if isinstance(loaded, dict):
                     loaded = loaded.get("tokens", loaded.get("feature"))
                 self._tokens = torch.as_tensor(loaded, dtype=torch.float32)
-            if self._tokens.ndim != 2 or self._tokens.shape[1] != 3072:
-                raise ValueError(f"Expected (T, 3072) replay tokens, got {tuple(self._tokens.shape)}")
+            if self._tokens.ndim != 2 or self._tokens.shape[1] != SAM_TOKEN_DIM:
+                raise ValueError(f"Expected (T, {SAM_TOKEN_DIM}) replay tokens, got {tuple(self._tokens.shape)}")
         self._cursor = 0
 
     def reset(self) -> None:
@@ -455,7 +447,7 @@ class ReplayTokenExtractor:
     ) -> torch.Tensor:
         n = len(rgb_frames)
         if n == 0:
-            return torch.empty((0, 3072), dtype=torch.float32)
+            return _empty_tokens()
         if self._tokens is not None:
             t_total = self._tokens.shape[0]
             idxs = [(self._cursor + i) % t_total for i in range(n)]
@@ -468,16 +460,5 @@ class ReplayTokenExtractor:
         bw = (bboxes_xyxy[:, 2] - bboxes_xyxy[:, 0]) / max(1.0, float(w))
         bh = (bboxes_xyxy[:, 3] - bboxes_xyxy[:, 1]) / max(1.0, float(h))
         geom = np.stack([cx, cy, bw, bh], axis=-1).astype(np.float32)
-        tiled = np.tile(geom, (1, 3072 // 4)) * 0.05
+        tiled = np.tile(geom, (1, SAM_TOKEN_DIM // 4)) * 0.05
         return torch.from_numpy(tiled)
-
-
-@dataclass
-class FrameFeatureItem:
-    """Per-frame perception output stored in the engine's sliding-window conditioning history."""
-
-    frame_index: int
-    media_time_s: float
-    capture_mono_s: float
-    bbox_xyxy: np.ndarray  # (4,)
-    sam_token: torch.Tensor  # (3072,) CPU float32

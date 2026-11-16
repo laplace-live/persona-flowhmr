@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import yaml
 
+from .config import SAM_TOKEN_DIM
 from .paths import FLOWHMR_CFG_PATH, FLOWHMR_CKPT_PATH, bootstrap_runtime
 
 
@@ -52,6 +53,7 @@ class FlowHMRWindowSolver:
         )
 
         from flowhmr.core.framework.loaders import load_object
+        from flowhmr.core.framework.net_utils import select_state_dict_by_prefix
 
         net_args = dict(self.cfg["network_module_args"])
         net_args["gradient_checkpointing"] = False
@@ -59,22 +61,16 @@ class FlowHMRWindowSolver:
 
         raw = torch.load(str(ckpt_file), map_location="cpu", weights_only=False)
         sd = raw.get("model_state_dict", raw.get("state_dict", raw.get("model", raw)))
-        mt_sd = {}
-        for prefix in ("motion_transformer.", "module.motion_transformer."):
-            for k, v in sd.items():
-                if k.startswith(prefix):
-                    mt_sd[k[len(prefix) :]] = v
-            if mt_sd:
-                break
-        if not mt_sd:
-            mt_sd = sd
+        mt_sd = (
+            select_state_dict_by_prefix(sd, "motion_transformer.")
+            or select_state_dict_by_prefix(sd, "module.motion_transformer.")
+            or sd
+        )
 
-        missing, unexpected = model.load_state_dict(mt_sd, strict=False)
+        # Unexpected keys are tolerated: an unprefixed raw checkpoint also carries non-transformer buffers.
+        missing, _unexpected = model.load_state_dict(mt_sd, strict=False)
         if missing:
             raise RuntimeError(f"FlowHMR MMDiT missing state_dict keys: {missing[:5]}")
-        if unexpected:
-            # Ignore non-transformer buffers if raw checkpoint was unprefixed.
-            pass
 
         self.device = torch.device(device)
         model.eval()
@@ -124,7 +120,7 @@ class FlowHMRWindowSolver:
     @torch.no_grad()
     def warmup(self, window_frames: int, steps: int = 2) -> float:
         """Run a dummy forward pass to trigger Triton kernel compilation up front."""
-        dummy_tokens = torch.zeros((window_frames, 3072), dtype=torch.float32)
+        dummy_tokens = torch.zeros((window_frames, SAM_TOKEN_DIM), dtype=torch.float32)
         t0 = time.perf_counter()
         self.solve_window(dummy_tokens, list(range(window_frames)), ode_steps=max(2, steps))
         if self.device.type == "cuda":
@@ -164,28 +160,21 @@ class FlowHMRWindowSolver:
         for i in range(steps):
             t_cur = ts[i]
             dt = ts[i + 1] - t_cur
-            t_batch = t_cur.expand(1)
+            inputs = dict(
+                x=x,
+                ctxt_input=ctxt_input,
+                vtxt_input=vtxt_input,
+                timesteps=t_cur.expand(1),
+                x_mask_temporal=mask,
+                ctxt_mask_temporal=mask,
+            )
             try:
-                x_pred = forward_fn(
-                    x=x,
-                    ctxt_input=ctxt_input,
-                    vtxt_input=vtxt_input,
-                    timesteps=t_batch,
-                    x_mask_temporal=mask,
-                    ctxt_mask_temporal=mask,
-                )
+                x_pred = forward_fn(**inputs)
             except Exception:
                 # Graceful eager fallback if torch.compile encounters an unexpected shape/backend error.
                 self._compiled_forward = None
                 forward_fn = self.eager_model.forward
-                x_pred = forward_fn(
-                    x=x,
-                    ctxt_input=ctxt_input,
-                    vtxt_input=vtxt_input,
-                    timesteps=t_batch,
-                    x_mask_temporal=mask,
-                    ctxt_mask_temporal=mask,
-                )
+                x_pred = forward_fn(**inputs)
 
             if self.pred_type == "velocity":
                 vel = x_pred

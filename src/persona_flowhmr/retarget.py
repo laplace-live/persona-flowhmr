@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .vmc_sender import BoneTransform, Pos3, Quat4
+from .vmc_sender import BoneTransform, Pos3
 
 # Exact 52 SMPL-H joint order (`SMPLH_JOINT2NUM` in FlowHMR) -> Unity HumanBodyBones name.
 # Persona's `unityToVrmBone` (`protocol.ts`) maps `LeftThumbProximal/Intermediate/Distal`
@@ -200,6 +200,10 @@ def slerp_quat_xyzw(q0: np.ndarray, q1: np.ndarray, alpha: float | np.ndarray) -
 # Pre-rotation R_y(180 deg) = (0, 1, 0, 0) in (x, y, z, w), matching FlowHMR's
 # `_rotate_smplh_params_y180`: brings camera-facing (-Z) SMPL-H root into +Z-forward VRM space.
 _RY_180_QUAT = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+# The same R_y(180) applied to positions: `(x, y, z) -> (-x, +y, -z)`.
+_RY_180_POS_SIGN = np.array([-1.0, 1.0, -1.0], dtype=np.float32)
+# Unity's left-handed VMC frame stores `(qx, -qy, -qz, qw)` for a right-handed `(qx, qy, qz, qw)`.
+_RH_TO_UNITY_QUAT_SIGN = np.array([1.0, -1.0, -1.0, 1.0], dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -214,22 +218,25 @@ class CanonicalPoseFrame:
     joints_cam_3d: np.ndarray | None = None  # optional (22, 3) body joints in camera frame for 2D HUD
 
 
+def canonicalize_smplh_rotations(local_rot_mats: np.ndarray) -> np.ndarray:
+    """Convert `(T, 52, 3, 3)` local SMPL-H rotations to `(T, 52, 4)` +Z-forward quats (`R_y(180)` on the root)."""
+    quats = matrix_to_quat_xyzw(local_rot_mats)
+    ry = np.broadcast_to(_RY_180_QUAT, quats[:, 0].shape)
+    quats[:, 0] = quat_mul_xyzw(ry, quats[:, 0])
+    return quats
+
+
+def cam_to_canonical_position(pos_cam: np.ndarray) -> np.ndarray:
+    """Apply `R_y(180)` (`(-x, +y, -z)`) to `(..., 3)` camera-space positions -> float32 canonical space."""
+    return np.asarray(pos_cam, dtype=np.float32) * _RY_180_POS_SIGN
+
+
 def canonicalize_smplh_sequence(
     local_rot_mats: np.ndarray,
     pelvis_world_cam: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Convert `(T, 52, 3, 3)` local SMPL-H rotations + `(T, 3)` pelvis_world to +Z-forward canonical space.
-
-    Applies `R_y(180)` to root orientation (`joint 0`) and root translation `(-x, +y, -z)`.
-    """
-    quats = matrix_to_quat_xyzw(local_rot_mats)  # (T, 52, 4)
-    ry = np.broadcast_to(_RY_180_QUAT, quats[:, 0].shape)
-    quats[:, 0] = quat_mul_xyzw(ry, quats[:, 0])
-
-    hips = pelvis_world_cam.astype(np.float32).copy()
-    hips[:, 0] = -hips[:, 0]
-    hips[:, 2] = -hips[:, 2]
-    return quats, hips
+    """Convert `(T, 52, 3, 3)` local SMPL-H rotations + `(T, 3)` pelvis_world to +Z-forward canonical space."""
+    return canonicalize_smplh_rotations(local_rot_mats), cam_to_canonical_position(pelvis_world_cam)
 
 
 def pose_to_vmc_bones(
@@ -247,29 +254,18 @@ def pose_to_vmc_bones(
       - `mirror=True`: reflects across YZ plane (`Left*` <-> `Right*`), `q_vmc = (qx, qy, qz, qw)`,
         `hips_vmc = (+px, py, pz)` so Three.js receives `(-px, py, pz)` and `(-qx, qy, qz, -qw) == (qx, -qy, -qz, qw)`.
     """
-    q = pose.quats_rh_xyzw
-    p = pose.hips_pos_rh
-
+    px, py, pz = pose.hips_pos_rh.tolist()
     if mirror:
         names = MIRRORED_UNITY_BONES
-        q_vmc = q  # (qx, qy, qz, qw) -> Three.js (qx, -qy, -qz, qw) on swapped side!
-        hips_pos: Pos3 = (
-            (float(p[0]), float(p[1]), float(p[2])) if follow_movement else (0.0, float(p[1]), 0.0)
-        )
+        quats = pose.quats_rh_xyzw.tolist()  # (qx, qy, qz, qw) -> Three.js (qx, -qy, -qz, qw) on swapped side!
     else:
         names = SMPLH_TO_UNITY_BONES
-        q_vmc = np.stack([q[:, 0], -q[:, 1], -q[:, 2], q[:, 3]], axis=-1)
-        hips_pos = (
-            (-float(p[0]), float(p[1]), float(p[2])) if follow_movement else (0.0, float(p[1]), 0.0)
-        )
+        quats = (pose.quats_rh_xyzw * _RH_TO_UNITY_QUAT_SIGN).tolist()
+        px = -px
+    hips_pos: Pos3 = (px, py, pz) if follow_movement else (0.0, py, 0.0)
 
     zero_pos: Pos3 = (0.0, 0.0, 0.0)
-    bones: list[BoneTransform] = []
-    for idx, name in enumerate(names):
-        qi = q_vmc[idx]
-        quat_tuple: Quat4 = (float(qi[0]), float(qi[1]), float(qi[2]), float(qi[3]))
-        bones.append((name, hips_pos if idx == 0 else zero_pos, quat_tuple))
-    return bones
+    return [(name, hips_pos if idx == 0 else zero_pos, tuple(q)) for idx, (name, q) in enumerate(zip(names, quats))]
 
 
 def _quat_to_euler_deg_yxz(q: np.ndarray) -> tuple[float, float, float]:
