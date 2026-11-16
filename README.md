@@ -71,6 +71,19 @@ uv run pytest -v
 uv run ruff check
 ```
 
+## Citation
+
+Built on **[FlowHMR](https://github.com/flowhmr/flowhmr)**. If you find FlowHMR useful in your research, please cite:
+
+```bibtex
+@article{wang2026flowhmr,
+  title={FlowHMR: Physically Plausible Motion Capture from Video},
+  author={Wang, Zhanke and Zhao, Chengfeng and Shuai, Qing and Lin, Jingzhong and Li, Heng and Ling, Zeyu and Wen, Yuxin and Li, Jing and Kang, Di and Guo, Chunchao and Bao, Linchao},
+  journal={arXiv preprint arXiv:2610.03691},
+  year={2026}
+}
+```
+
 ## License
 
 `persona-flowhmr` is licensed under **[GNU AGPL-3.0](LICENSE)** with a Section 7 linking exception for vendored Meta `SAM 3D Body` and `DINOv3` components, which remain under their respective upstream licenses. See **[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)** for full details and modification notices.
