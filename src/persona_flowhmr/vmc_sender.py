@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import socket
 import struct
+import time
 from collections.abc import Iterable
 
 Pos3 = tuple[float, float, float]
@@ -20,6 +21,7 @@ BoneTransform = tuple[str, Pos3, Quat4]
 _SIZE = struct.Struct(">I")
 _POS7 = struct.Struct(">7f")  # (px, py, pz, qx, qy, qz, qw)
 _BUNDLE_HEADER = b"#bundle\x00" + struct.pack(">Q", 1)  # immediate timetag = 1
+_RESOLVE_TTL_S = 5.0  # how long a resolved target address is reused before looking the host up again
 
 
 def encode_osc_string(value: str) -> bytes:
@@ -72,7 +74,8 @@ class VmcUdpSender:
         self.port = int(port)
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
-        self._resolved: tuple[tuple[str, int], tuple[str, int]] | None = None  # ((host, port), (ip, port))
+        # ((host, port), (ip, port), expires_at): the address `sendto` uses for the current target.
+        self._resolved: tuple[tuple[str, int], tuple[str, int], float] | None = None
         self.packets_sent = 0
 
     def set_target(self, host: str, port: int) -> None:
@@ -81,10 +84,13 @@ class VmcUdpSender:
 
     def send_pose(self, bones: Iterable[BoneTransform]) -> int:
         target = (self.host, self.port)
-        if self._resolved is None or self._resolved[0] != target:
-            # Resolve a host name once per target instead of inside every 60 Hz `sendto`.
-            self._resolved = (target, (socket.gethostbyname(target[0]), target[1]))
-        sent = self._sock.sendto(encode_vmc_bundle(bones), self._resolved[1])
+        now = time.monotonic()
+        resolved = self._resolved
+        if resolved is None or resolved[0] != target or now >= resolved[2]:
+            # Look a host name up every few seconds rather than inside every 60 Hz `sendto`, so DNS changes still land.
+            resolved = (target, (socket.gethostbyname(target[0]), target[1]), now + _RESOLVE_TTL_S)
+            self._resolved = resolved
+        sent = self._sock.sendto(encode_vmc_bundle(bones), resolved[1])
         self.packets_sent += 1
         return sent
 

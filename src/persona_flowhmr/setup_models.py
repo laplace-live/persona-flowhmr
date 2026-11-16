@@ -162,8 +162,11 @@ def download_missing_models(hf_token: str | None = None) -> dict[str, Any]:
     ):
         if not dst.is_file():
             dst.parent.mkdir(parents=True, exist_ok=True)
-            # Stream the cached file instead of loading multi-GB checkpoints into memory.
-            shutil.copyfile(hf_hub_download(repo_id="FlowHMR/FlowHMR", filename=rel, token=hf_token), dst)
+            # Stream the cached file (no multi-GB read into memory) into a `.part` renamed into place, so an
+            # interrupted copy never leaves a truncated checkpoint that later runs would accept.
+            part = dst.with_suffix(dst.suffix + ".part")
+            shutil.copyfile(hf_hub_download(repo_id="FlowHMR/FlowHMR", filename=rel, token=hf_token), part)
+            part.replace(dst)
 
     # 2. Meta SAM 3D Body (`facebook/sam-3d-body-dinov3`)
     sam_error: str | None = None

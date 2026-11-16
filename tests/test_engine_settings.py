@@ -78,8 +78,11 @@ class _FakeClock:
         self.t += max(0.0, seconds)
 
 
-def test_switching_playout_fps_live_keeps_a_steady_tick_cadence(monkeypatch: pytest.MonkeyPatch) -> None:
-    eng = StreamingMocapEngine(EngineConfig(playout_fps=60))
+@pytest.mark.parametrize(("start_fps", "new_fps"), [(60, 30), (30, 60)])
+def test_switching_playout_fps_live_keeps_a_steady_tick_cadence(
+    monkeypatch: pytest.MonkeyPatch, start_fps: int, new_fps: int
+) -> None:
+    eng = StreamingMocapEngine(EngineConfig(playout_fps=start_fps))
     identity = np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (52, 1))
     eng._playout_buffer.push_many(
         [
@@ -103,7 +106,7 @@ def test_switching_playout_fps_live_keeps_a_steady_tick_cadence(monkeypatch: pyt
         def send_pose(self, bones: object) -> None:
             sent_at.append(clock.t)
             if len(sent_at) == 60:
-                eng.config.playout_fps = 30
+                eng.config.playout_fps = new_fps
             if len(sent_at) == 120:
                 eng._stop_event.set()
 
@@ -114,6 +117,6 @@ def test_switching_playout_fps_live_keeps_a_steady_tick_cadence(monkeypatch: pyt
     eng._playout_worker(first_commit, True)
 
     gaps = np.diff(sent_at)
-    # 60 Hz until the switch, then 30 Hz: no output freeze when slowing down, no burst when speeding up.
-    assert np.allclose(gaps[:60], 1 / 60, atol=1e-4)
-    assert np.allclose(gaps[60:], 1 / 30, atol=1e-4)
+    # The old rate until the switch, then the new one: no output freeze when slowing down, no burst when speeding up.
+    assert np.allclose(gaps[:60], 1 / start_fps, atol=1e-4)
+    assert np.allclose(gaps[60:], 1 / new_fps, atol=1e-4)
