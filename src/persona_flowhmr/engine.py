@@ -229,24 +229,25 @@ class _JpegCache:
     """Last encoded preview JPEG, re-encoded only when its cache key changes."""
 
     def __init__(self) -> None:
-        self._key: Any = None
-        self._data: bytes | None = None
+        # One `(key, jpeg)` tuple read and replaced whole, so concurrent MJPEG renders never mix halves.
+        self._entry: tuple[Any, bytes] | None = None
 
     def clear(self) -> None:
-        self._key = None
-        self._data = None
+        self._entry = None
 
     def get(self, key: Any, draw: Callable[[], np.ndarray | None]) -> bytes | None:
-        if self._data is not None and self._key == key:
-            return self._data
+        entry = self._entry
+        if entry is not None and entry[0] == key:
+            return entry[1]
         bgr = draw()
         if bgr is None:
             return None
         ok, buf = cv2.imencode(".jpg", bgr, _JPEG_PARAMS)
         if not ok:
             return None
-        self._key, self._data = key, buf.tobytes()
-        return self._data
+        data = buf.tobytes()
+        self._entry = (key, data)
+        return data
 
 
 class StreamingMocapEngine:

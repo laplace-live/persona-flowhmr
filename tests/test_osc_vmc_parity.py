@@ -7,10 +7,12 @@ import shutil
 import struct
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from persona_flowhmr import vmc_sender
 from persona_flowhmr.retarget import SMPLH_TO_UNITY_BONES, CanonicalPoseFrame, pose_to_vmc_bones
 from persona_flowhmr.vmc_sender import encode_vmc_bundle
 
@@ -75,6 +77,27 @@ def test_osc_bundle_binary_layout() -> None:
     assert tuple(seen_names) == SMPLH_TO_UNITY_BONES
     # Hips X negated in VMC Unity space (-0.25) so Persona's `unityVec3ToThree` recovers +0.25.
     assert np.allclose(msgs[1][1][1:4], [-0.25, 0.92, -0.15], atol=1e-6)
+
+
+def test_vmc_sender_caches_host_lookups_but_re_resolves_periodically(monkeypatch: pytest.MonkeyPatch) -> None:
+    sender = vmc_sender.VmcUdpSender("persona-pc.local", 39539)
+    sender._sock.close()
+    sent_to: list[tuple[str, int]] = []
+    sender._sock = SimpleNamespace(sendto=lambda packet, addr: sent_to.append(addr) or len(packet))
+    addresses = iter(["10.0.0.1", "10.0.0.2"])  # the host's DHCP lease changes mid-session
+    clock = [100.0]
+    monkeypatch.setattr(vmc_sender, "socket", SimpleNamespace(gethostbyname=lambda host: next(addresses)))
+    monkeypatch.setattr(vmc_sender, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    quats = np.zeros((52, 4), dtype=np.float32)
+    quats[:, 3] = 1.0
+    bones = pose_to_vmc_bones(CanonicalPoseFrame(0.0, 0.0, 0, quats, np.zeros(3, dtype=np.float32)))
+    sender.send_pose(bones)
+    sender.send_pose(bones)  # within the TTL: no second lookup on the 60 Hz path
+    clock[0] += 60.0
+    sender.send_pose(bones)  # after it: the new address is picked up
+
+    assert sent_to == [("10.0.0.1", 39539), ("10.0.0.1", 39539), ("10.0.0.2", 39539)]
 
 
 @pytest.mark.skipif(not Path(r"D:\Git\persona\node_modules").exists(), reason="Persona repo not present")
