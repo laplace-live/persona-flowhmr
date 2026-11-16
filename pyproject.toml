@@ -7,6 +7,8 @@ name = "persona-flowhmr"
 version = "0.1.0"
 description = "External single-camera buffered live mocap bridge (FlowHMR -> VMC & LAPLACE Persona Plugin API)"
 readme = "README.md"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES.md"]
 requires-python = ">=3.10,<3.13"
 dependencies = [
   "braceexpand>=0.1.7",
