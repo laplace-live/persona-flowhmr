@@ -422,8 +422,8 @@ class StreamingMocapEngine:
         self._threads: list[threading.Thread] = []
         self._peeked_frame: SampledFrame | None = None
         self._evicted_lock = threading.Lock()
-        self._evicted_switch = False
-        self._evicted_reset = False
+        self._evicted_switch_min_frame: int | None = None
+        self._evicted_reset_min_frame: int | None = None
 
     @property
     def is_running(self) -> bool:
@@ -489,7 +489,7 @@ class StreamingMocapEngine:
         self._plugin_client = client
         if self.config.plugin_api_auto_configure_vmc:
             self._configure_plugin_receiver()
-        elif client.is_connected:
+        elif client.is_connected and self.config.plugin_api_sync_camera:
             client.refresh_vrm_placement()
 
     def _configure_plugin_receiver(self) -> None:
@@ -565,8 +565,8 @@ class StreamingMocapEngine:
         self._frame0_mono = 0.0
         self._peeked_frame = None
         with self._evicted_lock:
-            self._evicted_switch = False
-            self._evicted_reset = False
+            self._evicted_switch_min_frame = None
+            self._evicted_reset_min_frame = None
         self._live_jpeg.clear()
         self._synced_jpeg.clear()
         self.telemetry = EngineTelemetry(
@@ -639,9 +639,20 @@ class StreamingMocapEngine:
                     with contextlib.suppress(queue.Empty):
                         evicted = frame_queue.get_nowait()
                         if evicted is not None and (evicted.is_camera_switch or evicted.is_stream_reset):
+                            ef = int(evicted.frame_index)
                             with self._evicted_lock:
-                                self._evicted_switch = self._evicted_switch or evicted.is_camera_switch
-                                self._evicted_reset = self._evicted_reset or evicted.is_stream_reset
+                                if evicted.is_camera_switch:
+                                    self._evicted_switch_min_frame = (
+                                        ef
+                                        if self._evicted_switch_min_frame is None
+                                        else min(self._evicted_switch_min_frame, ef)
+                                    )
+                                if evicted.is_stream_reset:
+                                    self._evicted_reset_min_frame = (
+                                        ef
+                                        if self._evicted_reset_min_frame is None
+                                        else min(self._evicted_reset_min_frame, ef)
+                                    )
 
     def _capture_worker(
         self,
@@ -740,10 +751,18 @@ class StreamingMocapEngine:
             if item is None:
                 return batch, True
             with self._evicted_lock:
-                carry_sw = self._evicted_switch
-                carry_rst = self._evicted_reset
-                self._evicted_switch = False
-                self._evicted_reset = False
+                carry_sw = (
+                    self._evicted_switch_min_frame is not None
+                    and item.frame_index >= self._evicted_switch_min_frame
+                )
+                carry_rst = (
+                    self._evicted_reset_min_frame is not None
+                    and item.frame_index >= self._evicted_reset_min_frame
+                )
+                if carry_sw:
+                    self._evicted_switch_min_frame = None
+                if carry_rst:
+                    self._evicted_reset_min_frame = None
             if carry_sw or carry_rst:
                 item = replace(
                     item,
@@ -799,7 +818,10 @@ class StreamingMocapEngine:
             if prev_track_cam:
                 cut_detector = ShotCutDetector()
                 vo_tracker = BackgroundVisualOdometry()
-                camera_solver = StreamingCameraSolver(avatar_scale=sanitize_avatar_scale(self.config.camera_avatar_scale))
+                camera_solver = StreamingCameraSolver(
+                    avatar_scale=sanitize_avatar_scale(self.config.camera_avatar_scale),
+                    calibrated_fov_deg=sanitize_camera_fov_deg(self.config.camera_fov_deg),
+                )
                 vo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mocap-vo")
 
             history: deque[FrameFeatureItem] = deque(maxlen=preset.window_frames + 128)
@@ -835,7 +857,8 @@ class StreamingMocapEngine:
                             cut_detector = ShotCutDetector()
                             vo_tracker = BackgroundVisualOdometry()
                             camera_solver = StreamingCameraSolver(
-                                avatar_scale=sanitize_avatar_scale(self.config.camera_avatar_scale)
+                                avatar_scale=sanitize_avatar_scale(self.config.camera_avatar_scale),
+                                calibrated_fov_deg=fov_cfg,
                             )
                             if vo_pool is None:
                                 vo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mocap-vo")
@@ -849,7 +872,6 @@ class StreamingMocapEngine:
                         for idx_in_b, s in enumerate(batch):
                             if s.is_stream_reset:
                                 cut_detector.reset()
-                                vo_tracker.reset()
                                 is_cut = False
                                 shot_id += 1
                             else:
@@ -882,7 +904,8 @@ class StreamingMocapEngine:
 
                     if track_cam:
                         assert vo_tracker is not None and vo_pool is not None
-                        cur_zoom = float(vo_tracker.zoom_scale)
+                        allow_zoom = fov_cfg <= 0.0
+                        cur_zoom = float(vo_tracker.zoom_scale) if allow_zoom else 1.0
                         for idx_f, bnd in enumerate(cut_or_reset):
                             if bnd:
                                 cur_zoom = 1.0
@@ -897,17 +920,22 @@ class StreamingMocapEngine:
                             b_boxes: np.ndarray = bboxes,
                             base_k0: np.ndarray = cam_k0,
                             b_bounds: list[bool] = cut_or_reset,
+                            z_allow: bool = allow_zoom,
                         ) -> tuple[list[np.ndarray], list[int], list[float], np.ndarray]:
                             rots: list[np.ndarray] = []
                             inls: list[int] = []
                             flows: list[float] = []
                             ks = np.repeat(base_k0[None], len(b_frames), axis=0)
                             for idx_f, (sf, bx, bnd) in enumerate(zip(b_frames, b_boxes, b_bounds)):
-                                r_v, n_i = vt.step(sf.rgb, bx, base_k0, is_cut=bnd)
+                                step_k = base_k0.copy()
+                                if not bnd and z_allow and abs(vt.zoom_scale - 1.0) > 1e-4:
+                                    step_k[0, 0] *= vt.zoom_scale
+                                    step_k[1, 1] *= vt.zoom_scale
+                                r_v, n_i = vt.step(sf.rgb, bx, step_k, is_cut=bnd, allow_zoom=z_allow)
                                 rots.append(r_v)
                                 inls.append(n_i)
                                 flows.append(float(vt.last_trans_flow_px))
-                                if abs(vt.zoom_scale - 1.0) > 1e-4:
+                                if z_allow and abs(vt.zoom_scale - 1.0) > 1e-4:
                                     ks[idx_f, 0, 0] = base_k0[0, 0] * vt.zoom_scale
                                     ks[idx_f, 1, 1] = base_k0[1, 1] * vt.zoom_scale
                             return rots, inls, flows, ks
@@ -929,7 +957,11 @@ class StreamingMocapEngine:
                             )
                             vo_rots, vo_inliers, vo_flows, cam_k = vo_future.result()
                             if len(kf_pos) > 0:
-                                kf_cam_t[:, 2] *= cam_k[kf_pos, 0, 0] / np.maximum(cam_k_pre[kf_pos, 0, 0], 1e-6)
+                                old_tz = kf_cam_t[:, 2].copy()
+                                new_tz = old_tz * (cam_k[kf_pos, 0, 0] / np.maximum(cam_k_pre[kf_pos, 0, 0], 1e-6))
+                                delta_tz = new_tz - old_tz
+                                kf_cam_t[:, 2] = new_tz
+                                kf_j3d[:, :, 2] += delta_tz[:, None]
                         else:
                             tokens, cam_ts, j3ds = _extract_dense_with_camera(
                                 extractor,
@@ -940,7 +972,11 @@ class StreamingMocapEngine:
                             )
                             vo_rots, vo_inliers, vo_flows, cam_k = vo_future.result()
                             if len(cam_ts) > 0:
-                                cam_ts[:, 2] *= cam_k[:, 0, 0] / np.maximum(cam_k_pre[:, 0, 0], 1e-6)
+                                old_tz = cam_ts[:, 2].copy()
+                                new_tz = old_tz * (cam_k[:, 0, 0] / np.maximum(cam_k_pre[:, 0, 0], 1e-6))
+                                delta_tz = new_tz - old_tz
+                                cam_ts[:, 2] = new_tz
+                                j3ds[:, :, 2] += delta_tz[:, None]
                     else:
                         if keyframe_mode:
                             kf_pos = _plan_keyframes(
@@ -1015,6 +1051,7 @@ class StreamingMocapEngine:
 
                 if camera_solver is not None:
                     camera_solver.avatar_scale = sanitize_avatar_scale(self.config.camera_avatar_scale)
+                    camera_solver.calibrated_fov_deg = sanitize_camera_fov_deg(self.config.camera_fov_deg)
                 next_emit_frame = self._solve_ready_windows(
                     history,
                     next_emit_frame,
@@ -1123,7 +1160,7 @@ class StreamingMocapEngine:
                 latent_win,
                 emit_offset_in_window=preset.history_frames,
                 stride_frames=stride,
-                overlap_frames=0 if (eos or cut_within_stride) else preset.overlap_frames,
+                overlap_frames=preset.overlap_frames,
                 first_emit_frame_index=next_emit_frame,
                 capture_mono_times=[it.capture_mono_s for it in stride_items],
                 reset_flags=[it.is_stream_reset for it in stride_items],
@@ -1133,6 +1170,7 @@ class StreamingMocapEngine:
                 camera_solver=camera_solver if have_stride_cam else None,
                 follow_movement=self.config.follow_movement,
                 anchor_world_yaw_across_cuts=have_stride_cam,
+                save_tail=not (eos or cut_within_stride),
             )
             for cf, it in zip(committed, stride_items):
                 if it.is_stream_reset or stream_frame0_hips[0] is None:

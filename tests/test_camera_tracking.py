@@ -765,6 +765,33 @@ def test_cut_roll_and_live_framing_rebase_on_static_tripod() -> None:
     assert p_rebased.orbit_distance > p_cut.orbit_distance * 1.35
     assert abs(float(p_rebased.orbit_target_rh[0])) < 0.25
 
+    # Changing calibrated FOV live on a locked tripod must also rebase camera distance instead of keeping stale distance.
+    k_narrow = default_camera_intrinsics(h, w).copy()
+    k_narrow[0, 0] *= 1.5
+    k_narrow[1, 1] *= 1.5
+    j14_cv_narrow = j14_cv.copy()
+    j14_cv_narrow[:, 2] *= 1.5
+    obs_recal = FrameCameraObservation(
+        sam_cam_t=obs_cut.sam_cam_t * np.array([1.0, 1.0, 1.5], dtype=np.float32),
+        sam_j3d_cam=j14_cv_narrow,
+        cam_k=k_narrow,
+        image_hw=(h, w),
+        bbox_xyxy=obs_cut.bbox_xyxy,
+        r_vo_yup=np.eye(3, dtype=np.float32),
+        vo_inliers=28,
+        is_cut=False,
+        shot_id=1,
+        trans_flow_px=0.05,
+    )
+    cam_solver.calibrated_fov_deg = 25.0
+    p_fov_rebased = cam_solver.solve_frame(
+        obs_recal,
+        ljp_cam_52=ljp_neutral,
+        hips_pos_rh=hips_displaced,
+        follow_movement=False,
+    )
+    assert p_fov_rebased.orbit_distance > p_rebased.orbit_distance * 1.35
+
 
 def test_preview_per_frame_dims_and_eviction_preserves_camera_switch() -> None:
     """Verify `PreviewRingBuffer` keeps per-frame `orig_hw` across resolution changes and `_put_until_stopped`
@@ -795,6 +822,19 @@ def test_preview_per_frame_dims_and_eviction_preserves_camera_switch() -> None:
     assert len(batch) == 2
     assert batch[0].frame_index == 1
     assert batch[0].is_camera_switch is True
+
+    # Evicting frame 11 while consumer already holds frame 10 must NOT mark frame 10; frame 12 must receive it.
+    eng2 = StreamingMocapEngine()
+    fq2: queue.Queue[SampledFrame | None] = queue.Queue(maxsize=2)
+    eng2._put_until_stopped(fq2, SampledFrame(10, 0.33, 1.33, rgb), drop_oldest=True)
+    # Simulate producer evicting frame 11 (`_evicted_switch_min_frame = 11`) before consumer inspects frame 10:
+    with eng2._evicted_lock:
+        eng2._evicted_switch_min_frame = 11
+    eng2._put_until_stopped(fq2, SampledFrame(12, 0.40, 1.40, rgb), drop_oldest=True)
+    batch2, _ = eng2._take_batch(fq2, 2)
+    assert [f.frame_index for f in batch2] == [10, 12]
+    assert batch2[0].is_camera_switch is False
+    assert batch2[1].is_camera_switch is True
 
 
 def test_persona_sync_camera_pose_refreshes_placement_and_fails_closed() -> None:
@@ -896,7 +936,113 @@ def test_persona_sync_camera_pose_refreshes_placement_and_fails_closed() -> None
             threading.Event().wait(0.02)
         assert len(patched) >= 2
         assert abs(float(patched[-1]["orbit"]["targetX"]) - (-1.25)) < 1e-4
+
+        # 4. Calling legacy `send_vrm_camera_fire_and_forget` right after `sync_camera_pose_fire_and_forget`
+        # shares `_drain_camera_queue` and never strands a pending update.
+        legacy_cam = {
+            "orbit": {
+                "azimuth": 0.25,
+                "elevation": 0.0,
+                "distance": 4.2,
+                "targetX": 0.5,
+                "targetY": 1.0,
+                "targetZ": 0.0,
+            },
+            "roll": 0.0,
+            "fov": 35.0,
+        }
+        client.sync_camera_pose_fire_and_forget(cam_pose)
+        client.send_vrm_camera_fire_and_forget(legacy_cam)
+        for _ in range(40):
+            if patched and abs(float(patched[-1]["orbit"]["distance"]) - 4.2) < 1e-4:
+                break
+            threading.Event().wait(0.02)
+        assert abs(float(patched[-1]["orbit"]["distance"]) - 4.2) < 1e-4
     finally:
         client.stop()
         stop_srv.set()
         t.join(timeout=2.0)
+
+
+def test_vo_optical_zoom_vs_wall_dolly_and_pre_cut_incoming_crossfade() -> None:
+    """Verify VO accepts optical zoom when foreground+background magnify together, rejects dolly toward a wall
+    (where closer foreground expands faster) and calibrated fixed-FOV cameras, and `save_tail=False` preserves
+    incoming overlap crossfading before a cut.
+    """
+    import cv2
+
+    rng = np.random.default_rng(7)
+    h, w = 360, 640
+    cam_k = default_camera_intrinsics(h, w)
+    # Build rich synthetic background texture outside center performer box.
+    base = np.zeros((h, w, 3), dtype=np.uint8)
+    for _ in range(180):
+        cx_i = int(rng.integers(20, w - 20))
+        cy_i = int(rng.integers(20, h - 20))
+        col = tuple(int(v) for v in rng.integers(80, 255, size=3))
+        cv2.circle(base, (cx_i, cy_i), int(rng.integers(4, 9)), col, -1)
+
+    zoom_factor = 1.03
+    m_zoom = np.array(
+        [
+            [zoom_factor, 0.0, (1.0 - zoom_factor) * (w * 0.5)],
+            [0.0, zoom_factor, (1.0 - zoom_factor) * (h * 0.5)],
+        ],
+        dtype=np.float32,
+    )
+    frame_zoomed = cv2.warpAffine(base, m_zoom, (w, h), flags=cv2.INTER_LINEAR)
+    box0 = np.array([260.0, 70.0, 380.0, 310.0], dtype=np.float32)
+
+    def _scale_box(b: np.ndarray, s: float) -> np.ndarray:
+        bcx, bcy = 0.5 * (b[0] + b[2]), 0.5 * (b[1] + b[3])
+        hw_b, hh_b = 0.5 * (b[2] - b[0]) * s, 0.5 * (b[3] - b[1]) * s
+        return np.array([bcx - hw_b, bcy - hh_b, bcx + hw_b, bcy + hh_b], dtype=np.float32)
+
+    # 1. Optical zoom (`allow_zoom=True`): foreground scales by same 1.03x as background -> `zoom_scale` increases!
+    vo_zoom = BackgroundVisualOdometry()
+    vo_zoom.step(base, box0, cam_k)
+    vo_zoom.step(frame_zoomed, _scale_box(box0, zoom_factor), cam_k, allow_zoom=True)
+    assert vo_zoom.zoom_scale > 1.02
+    assert vo_zoom.last_trans_flow_px < 0.35
+
+    # 2. Calibrated fixed-FOV camera (`allow_zoom=False`): `zoom_scale` stays fixed at 1.0!
+    vo_cal = BackgroundVisualOdometry()
+    vo_cal.step(base, box0, cam_k, allow_zoom=False)
+    vo_cal.step(frame_zoomed, _scale_box(box0, zoom_factor), cam_k, allow_zoom=False)
+    assert abs(vo_cal.zoom_scale - 1.0) < 1e-6
+
+    # 3. Dolly toward textured wall (`Z_person < Z_wall`): closer foreground expands 2x faster (1.06x vs 1.03x) -> NOT zoom!
+    vo_dolly = BackgroundVisualOdometry()
+    vo_dolly.step(base, box0, cam_k, allow_zoom=True)
+    vo_dolly.step(frame_zoomed, _scale_box(box0, 1.06), cam_k, allow_zoom=True)
+    assert abs(vo_dolly.zoom_scale - 1.0) < 1e-6
+    assert vo_dolly.last_trans_flow_px > 0.8
+
+    # 4. `save_tail=False` on shortened pre-cut stride blends incoming tail smoothly while dropping outgoing tail.
+    decoder = MotionLatentDecoder(MOTION_STATS_PATH, motion_style="basic")
+    stitcher = StreamingStitcher(decoder, fps=30.0)
+    w_a = np.zeros((16, 491), dtype=np.float32)
+    w_b = np.zeros((16, 491), dtype=np.float32)
+    w_b[:, 2] = 2.0  # shifted pelvis height `srp_y` in second window
+    f_a = stitcher.commit_window(
+        w_a,
+        emit_offset_in_window=4,
+        stride_frames=4,
+        overlap_frames=2,
+        first_emit_frame_index=0,
+        capture_mono_times=[i / 30.0 for i in range(4)],
+        save_tail=True,
+    )
+    dec_b_raw = decoder.decode_window(w_b[4:6])["srp_y_cam"]
+    f_b = stitcher.commit_window(
+        w_b,
+        emit_offset_in_window=4,
+        stride_frames=2,
+        overlap_frames=2,
+        first_emit_frame_index=4,
+        capture_mono_times=[(4 + i) / 30.0 for i in range(2)],
+        save_tail=False,
+    )
+    # Frame 4 was crossfaded between `f_a` pelvis height and `dec_b_raw[0]`, and outgoing `_tail` was cleared!
+    assert float(f_a[-1].hips_pos_rh[1]) < float(f_b[0].hips_pos_rh[1]) < float(dec_b_raw[0])
+    assert stitcher._tail is None

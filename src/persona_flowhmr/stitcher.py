@@ -143,20 +143,22 @@ class StreamingStitcher:
         camera_solver: StreamingCameraSolver | None = None,
         follow_movement: bool = True,
         anchor_world_yaw_across_cuts: bool = True,
+        save_tail: bool = True,
     ) -> list[CanonicalPoseFrame]:
         """Decode `latent_window`, crossfade first `O` frames with prior tail, and commit `S` frames.
 
         Window slice layout starting at `emit_offset_in_window`:
           `[0 .. S - 1]`     -> committed and returned on this call (`len == stride_frames`)
-          `[S .. S + O - 1]` -> stored as `_tail` to crossfade against `[0 .. O - 1]` of the next window
+          `[S .. S + O - 1]` -> stored as `_tail` when `save_tail=True` to crossfade against the next window
         """
         s_idx = int(emit_offset_in_window)
         n_commit = int(stride_frames)
-        e_tail = s_idx + n_commit + int(overlap_frames)
+        outgoing_overlap = int(overlap_frames) if save_tail else 0
+        e_tail = s_idx + n_commit + outgoing_overlap
         if e_tail > latent_window.shape[0]:
             raise ValueError(
                 f"Window length {latent_window.shape[0]} too short for emit_offset={s_idx}, "
-                f"stride={stride_frames}, overlap={overlap_frames}"
+                f"stride={stride_frames}, overlap={outgoing_overlap}"
             )
         if len(capture_mono_times) != stride_frames:
             raise ValueError(f"Expected {stride_frames} capture_mono_times, got {len(capture_mono_times)}")
@@ -213,8 +215,8 @@ class StreamingStitcher:
                 alphas[:, None],
             )
 
-        # Store uncommitted tail `[S .. S + O - 1]` for the next window's crossfade.
-        if overlap_frames > 0:
+        # Store uncommitted tail `[S .. S + O - 1]` for the next window's crossfade (unless suppressed before a cut/EOS).
+        if outgoing_overlap > 0:
             self._tail = {k: v[n_commit:].copy() for k, v in decoded.items()}
             self._tail_start_frame = first_emit_frame_index + stride_frames
             self._tail_vo_yaw_rad = float(window_vo_yaw_rad)

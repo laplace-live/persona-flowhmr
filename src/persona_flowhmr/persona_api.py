@@ -324,18 +324,14 @@ class PersonaPluginClient:
             self.last_error = str(exc)
             return False
 
-    def sync_camera_pose_fire_and_forget(self, cam_pose: CameraPoseFrame, *, mirror: bool = False) -> None:
-        """Refresh VRM stage placement when needed, transform `cam_pose`, and coalesce `scene.patch -> vrmCamera`."""
-        if not self.is_connected or self._loop is None:
+    async def _drain_camera_queue(self) -> None:
+        """Single coalesced worker draining both `sync_camera_pose_fire_and_forget` and `send_vrm_camera_fire_and_forget`."""
+        if self._camera_inflight:
             return
-
-        async def _enqueue_pose() -> None:
-            self._pending_camera_pose = (cam_pose, bool(mirror))
-            if self._camera_inflight:
-                return
-            self._camera_inflight = True
-            try:
-                while self._pending_camera_pose is not None and self.is_connected and not self._stop.is_set():
+        self._camera_inflight = True
+        try:
+            while self.is_connected and not self._stop.is_set():
+                if self._pending_camera_pose is not None:
                     nxt_pose, nxt_mirror = self._pending_camera_pose
                     self._pending_camera_pose = None
                     now_m = time.monotonic()
@@ -344,22 +340,38 @@ class PersonaPluginClient:
                             break
                     if not self.has_vrm_model or not self.vrm_placement_valid:
                         break
-                    nxt_cam = camera_to_persona_vrm_camera(
+                    nxt_cam: dict[str, Any] | None = camera_to_persona_vrm_camera(
                         nxt_pose,
                         mirror=nxt_mirror,
                         vrm_placement=self.bound_vrm_placement,
                     )
-                    if nxt_cam == self._last_sent_vrm_camera:
-                        continue
-                    try:
-                        await self._send_request_async("scene.patch", {"vrmCamera": nxt_cam})
-                        self._last_sent_vrm_camera = nxt_cam
-                        self.camera_patches_sent += 1
-                    except Exception as exc:
-                        self.last_error = str(exc)
-                        break
-            finally:
-                self._camera_inflight = False
+                elif self._pending_vrm_camera is not None:
+                    nxt_cam = self._pending_vrm_camera
+                    self._pending_vrm_camera = None
+                else:
+                    break
+
+                if not nxt_cam or nxt_cam == self._last_sent_vrm_camera:
+                    continue
+                try:
+                    await self._send_request_async("scene.patch", {"vrmCamera": nxt_cam})
+                    self._last_sent_vrm_camera = nxt_cam
+                    self.camera_patches_sent += 1
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    break
+        finally:
+            self._camera_inflight = False
+
+    def sync_camera_pose_fire_and_forget(self, cam_pose: CameraPoseFrame, *, mirror: bool = False) -> None:
+        """Refresh VRM stage placement when needed, transform `cam_pose`, and coalesce `scene.patch -> vrmCamera`."""
+        if not self.is_connected or self._loop is None:
+            return
+
+        async def _enqueue_pose() -> None:
+            self._pending_camera_pose = (cam_pose, bool(mirror))
+            self._pending_vrm_camera = None
+            await self._drain_camera_queue()
 
         asyncio.run_coroutine_threadsafe(_enqueue_pose(), self._loop)
 
@@ -372,24 +384,8 @@ class PersonaPluginClient:
             if not self._camera_inflight and vrm_camera == self._last_sent_vrm_camera:
                 return
             self._pending_vrm_camera = vrm_camera
-            if self._camera_inflight:
-                return
-            self._camera_inflight = True
-            try:
-                while self._pending_vrm_camera is not None and self.is_connected and not self._stop.is_set():
-                    nxt = self._pending_vrm_camera
-                    self._pending_vrm_camera = None
-                    if nxt == self._last_sent_vrm_camera:
-                        continue
-                    try:
-                        await self._send_request_async("scene.patch", {"vrmCamera": nxt})
-                        self._last_sent_vrm_camera = nxt
-                        self.camera_patches_sent += 1
-                    except Exception as exc:
-                        self.last_error = str(exc)
-                        break
-            finally:
-                self._camera_inflight = False
+            self._pending_camera_pose = None
+            await self._drain_camera_queue()
 
         asyncio.run_coroutine_threadsafe(_enqueue(), self._loop)
 

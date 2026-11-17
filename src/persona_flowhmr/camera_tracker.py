@@ -474,12 +474,14 @@ class BackgroundVisualOdometry:
         self.zoom_scale: float = 1.0
         self._prev_gray: np.ndarray | None = None
         self._prev_hw: tuple[int, int] | None = None
+        self._prev_bbox: np.ndarray | None = None
         self._r_yup = np.eye(3, dtype=np.float32)
         self._rng = np.random.default_rng(42)
 
     def reset(self) -> None:
         self._prev_gray = None
         self._prev_hw = None
+        self._prev_bbox = None
         self._r_yup = np.eye(3, dtype=np.float32)
         self.last_trans_flow_px = 0.0
         self.zoom_scale = 1.0
@@ -491,9 +493,14 @@ class BackgroundVisualOdometry:
         cam_k: np.ndarray,
         *,
         is_cut: bool = False,
+        allow_zoom: bool = True,
     ) -> tuple[np.ndarray, int]:
         """Advance VO by one frame; returns `(r_vo_yup_3x3, inlier_count)` and updates `last_trans_flow_px`."""
         h, w = rgb.shape[:2]
+        cur_bbox = np.asarray(bbox_xyxy, dtype=np.float32).reshape(4).copy()
+        prev_bbox = self._prev_bbox
+        if not allow_zoom:
+            self.zoom_scale = 1.0
         long_side = max(1, max(h, w))
         scale = min(1.0, float(self.work_width) / float(long_side))
         sw, sh = max(32, int(round(w * scale))), max(32, int(round(h * scale)))
@@ -511,14 +518,17 @@ class BackgroundVisualOdometry:
         if is_cut or self._prev_gray is None or self._prev_hw != (sh, sw):
             self._prev_gray = gray
             self._prev_hw = (sh, sw)
+            self._prev_bbox = cur_bbox
             self._r_yup = np.eye(3, dtype=np.float32)
             self.last_trans_flow_px = 0.0
             self.zoom_scale = 1.0
             return self._r_yup.copy(), 0
 
+        self._prev_bbox = cur_bbox
+
         # Mask out expanded person bounding box so moving limbs never corrupt background camera motion.
         mask = np.full((sh, sw), 255, dtype=np.uint8)
-        bx1, by1, bx2, by2 = (np.asarray(bbox_xyxy, dtype=np.float32) * scale).tolist()
+        bx1, by1, bx2, by2 = (cur_bbox * scale).tolist()
         pad_x = 0.14 * max(1.0, bx2 - bx1)
         pad_y = 0.10 * max(1.0, by2 - by1)
         ix1 = max(0, int(math.floor(bx1 - pad_x)))
@@ -575,31 +585,81 @@ class BackgroundVisualOdometry:
             self.last_trans_flow_px = raw_flow_480
             return self._r_yup.copy(), int(len(p0))
 
-        delta_r_cv, n_inliers = self._ransac_ray_rotation(p0, p1, cam_k)
-        # Measure non-rotational residual flow (parallax / radial dolly) and isotropic optical zoom.
         fx = max(1.0, float(cam_k[0, 0]))
         fy = max(1.0, float(cam_k[1, 1]))
         cx = float(cam_k[0, 2])
         cy = float(cam_k[1, 2])
+
+        # Estimate candidate optical zoom BEFORE pure-rotation RANSAC so radial edge expansion doesn't get
+        # misfit as a one-sided pan. Subtracting median displacement cancels first-order pan/tilt shift.
+        eff_zoom = 1.0
+        eff_k1: np.ndarray | None = None
+        du0 = p0[:, 0] - cx
+        dv0 = p0[:, 1] - cy
+        r0 = np.hypot(du0, dv0)
+        far_mask = r0 >= 0.12 * float(long_side)
+        if allow_zoom and prev_bbox is not None and int(np.sum(far_mask)) >= self.min_inliers:
+            du_far = du0[far_mask]
+            both_sides = bool(np.any(du_far < -0.05 * w) and np.any(du_far > 0.05 * w))
+            a_far = np.stack([du_far, dv0[far_mask]], axis=-1).astype(np.float64)
+            b_far = np.stack([p1[far_mask, 0] - cx, p1[far_mask, 1] - cy], axis=-1).astype(np.float64)
+            ac = a_far - np.mean(a_far, axis=0)
+            bc = b_far - np.mean(b_far, axis=0)
+            denom_z = float(np.sum(ac * ac))
+            med_zoom = float(np.sum(ac * bc) / denom_z) if denom_z > 1e-6 else 1.0
+            zoom_res_480 = float(np.median(np.linalg.norm(bc - med_zoom * ac, axis=-1))) * norm_480
+
+            # Separate optical lens zoom from physical camera dolly: under optical zoom, an unclipped
+            # foreground performer at closer depth `Z_person < Z_bg` magnifies by the SAME factor `med_zoom`,
+            # whereas dolly toward a textured wall expands the closer performer faster due to perspective.
+            fg_agrees = False
+            margin = 8.0
+            bw0 = float(prev_bbox[2] - prev_bbox[0])
+            bh0 = float(prev_bbox[3] - prev_bbox[1])
+            unclipped = (
+                prev_bbox[0] > margin
+                and prev_bbox[1] > margin
+                and prev_bbox[2] < (w - margin)
+                and prev_bbox[3] < (h - margin)
+                and cur_bbox[0] > margin
+                and cur_bbox[1] > margin
+                and cur_bbox[2] < (w - margin)
+                and cur_bbox[3] < (h - margin)
+                and bw0 >= 24.0
+                and bh0 >= 48.0
+            )
+            if unclipped:
+                fg_scale = 0.5 * (
+                    float(cur_bbox[2] - cur_bbox[0]) / bw0
+                    + float(cur_bbox[3] - cur_bbox[1]) / bh0
+                )
+                fg_agrees = (
+                    (fg_scale - 1.0) * (med_zoom - 1.0) > 0.0
+                    and abs(fg_scale - med_zoom) <= max(0.0045, 0.28 * abs(med_zoom - 1.0))
+                )
+
+            if (
+                both_sides
+                and fg_agrees
+                and zoom_res_480 < 0.85
+                and 0.92 <= med_zoom <= 1.08
+                and abs(med_zoom - 1.0) >= 0.0025
+            ):
+                eff_zoom = med_zoom
+                eff_k1 = cam_k.copy()
+                eff_k1[0, 0] = fx * eff_zoom
+                eff_k1[1, 1] = fy * eff_zoom
+
+        delta_r_cv, n_inliers = self._ransac_ray_rotation(p0, p1, cam_k, cam_k1=eff_k1)
         rays0 = np.stack([(p0[:, 0] - cx) / fx, (p0[:, 1] - cy) / fy, np.ones(len(p0), dtype=np.float64)], axis=-1)
         rays0_rot = rays0 @ delta_r_cv.astype(np.float64).T
         z_rot = np.maximum(rays0_rot[:, 2], 1e-4)
-        u_pred = fx * (rays0_rot[:, 0] / z_rot) + cx
-        v_pred = fy * (rays0_rot[:, 1] / z_rot) + cy
-
-        du_rot = u_pred - cx
-        dv_rot = v_pred - cy
-        r_rot = np.hypot(du_rot, dv_rot)
-        far_mask = r_rot >= 0.12 * float(long_side)
-        if int(np.sum(far_mask)) >= self.min_inliers:
-            r_obs = np.hypot(p1[far_mask, 0] - cx, p1[far_mask, 1] - cy)
-            ratios = r_obs / np.maximum(r_rot[far_mask], 1.0)
-            med_zoom = float(np.median(ratios))
-            mad_zoom = float(np.median(np.abs(ratios - med_zoom)))
-            if mad_zoom < 0.008 and 0.92 <= med_zoom <= 1.08 and abs(med_zoom - 1.0) >= 0.0025:
-                self.zoom_scale = float(np.clip(self.zoom_scale * med_zoom, 0.4, 3.5))
-                u_pred = cx + med_zoom * du_rot
-                v_pred = cy + med_zoom * dv_rot
+        fx_out = fx * eff_zoom
+        fy_out = fy * eff_zoom
+        u_pred = fx_out * (rays0_rot[:, 0] / z_rot) + cx
+        v_pred = fy_out * (rays0_rot[:, 1] / z_rot) + cy
+        if eff_k1 is not None and n_inliers >= self.min_inliers:
+            self.zoom_scale = float(np.clip(self.zoom_scale * eff_zoom, 0.4, 3.5))
 
         self.last_trans_flow_px = float(np.median(np.hypot(p1[:, 0] - u_pred, p1[:, 1] - v_pred))) * norm_480
 
@@ -623,22 +683,29 @@ class BackgroundVisualOdometry:
         p0_px: np.ndarray,
         p1_px: np.ndarray,
         cam_k: np.ndarray,
+        *,
+        cam_k1: np.ndarray | None = None,
     ) -> tuple[np.ndarray, int]:
         """Estimate `R_cv` (`v1 ≈ R_cv @ v0`) via calibrated unit-ray Kabsch RANSAC (degeneracy-free at `t=0`)."""
-        fx = max(1.0, float(cam_k[0, 0]))
-        fy = max(1.0, float(cam_k[1, 1]))
-        cx = float(cam_k[0, 2])
-        cy = float(cam_k[1, 2])
+        fx0 = max(1.0, float(cam_k[0, 0]))
+        fy0 = max(1.0, float(cam_k[1, 1]))
+        cx0 = float(cam_k[0, 2])
+        cy0 = float(cam_k[1, 2])
+        k1 = cam_k1 if cam_k1 is not None else cam_k
+        fx1 = max(1.0, float(k1[0, 0]))
+        fy1 = max(1.0, float(k1[1, 1]))
+        cx1 = float(k1[0, 2])
+        cy1 = float(k1[1, 2])
 
-        def _to_rays(pts: np.ndarray) -> np.ndarray:
+        def _to_rays(pts: np.ndarray, fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
             r = np.stack([(pts[:, 0] - cx) / fx, (pts[:, 1] - cy) / fy, np.ones(len(pts), dtype=np.float64)], axis=-1)
             return r / np.clip(np.linalg.norm(r, axis=-1, keepdims=True), 1e-8, None)
 
-        v0 = _to_rays(p0_px.astype(np.float64))
-        v1 = _to_rays(p1_px.astype(np.float64))
+        v0 = _to_rays(p0_px.astype(np.float64), fx0, fy0, cx0, cy0)
+        v1 = _to_rays(p1_px.astype(np.float64), fx1, fy1, cx1, cy1)
         n = len(v0)
-        # Angular threshold ~3.0 pixels at focal length `fx`.
-        cos_thr = math.cos(max(0.0025, 3.0 / fx))
+        # Angular threshold ~3.0 pixels at focal length `fx1`.
+        cos_thr = math.cos(max(0.0025, 3.0 / fx1))
 
         n_iters = 28
         # Sample 3 distinct rays per RANSAC hypothesis without replacement.
@@ -673,8 +740,9 @@ class BackgroundVisualOdometry:
 class StreamingCameraSolver:
     """Fuses per-frame SAM 3D Body + background VO with FlowHMR stage poses into drift-free 6-DoF camera frames."""
 
-    def __init__(self, *, avatar_scale: float = 1.0) -> None:
+    def __init__(self, *, avatar_scale: float = 1.0, calibrated_fov_deg: float = 0.0) -> None:
         self.avatar_scale = max(0.1, float(avatar_scale)) if math.isfinite(float(avatar_scale)) else 1.0
+        self.calibrated_fov_deg = float(calibrated_fov_deg) if math.isfinite(float(calibrated_fov_deg)) else 0.0
         self._shot_base_rot: np.ndarray | None = None
         self._shot_cut_vo_yup: np.ndarray | None = None
         self._r_world_from_cam: np.ndarray | None = None
@@ -685,6 +753,7 @@ class StreamingCameraSolver:
         self._frame0_hips_rh: np.ndarray | None = None
         self._last_avatar_scale: float | None = None
         self._last_follow_movement: bool | None = None
+        self._last_calibrated_fov_deg: float | None = None
 
     def anchor_stream_origin(self, hips_pos_rh: np.ndarray) -> None:
         """Record stream frame-0 pelvis origin so live-enabling camera tracking preserves prior XZ travel."""
@@ -699,6 +768,7 @@ class StreamingCameraSolver:
         self._prev_azimuth = None
         self._last_avatar_scale = None
         self._last_follow_movement = None
+        self._last_calibrated_fov_deg = None
         if not keep_origin:
             self._frame0_hips_rh = None
 
@@ -717,12 +787,15 @@ class StreamingCameraSolver:
             self._frame0_hips_rh = np.asarray(hips_pos_rh, dtype=np.float32).copy()
 
         follow_flag = bool(follow_movement)
+        cal_fov = float(self.calibrated_fov_deg) if math.isfinite(float(self.calibrated_fov_deg)) else 0.0
         framing_changed = (
             (self._last_avatar_scale is not None and abs(self.avatar_scale - self._last_avatar_scale) > 1e-6)
             or (self._last_follow_movement is not None and follow_flag != self._last_follow_movement)
+            or (self._last_calibrated_fov_deg is not None and abs(cal_fov - self._last_calibrated_fov_deg) > 1e-4)
         )
         self._last_avatar_scale = float(self.avatar_scale)
         self._last_follow_movement = follow_flag
+        self._last_calibrated_fov_deg = cal_fov
 
         # Match Persona's `VrmPoseDriver.applyTranslation` (`hipsRest + (hips_t - hips_0)`):
         # At stream start, the avatar stands at `(0, hips_0_y * scale, 0)`, and travels by `(hips_t - hips_0)`.
