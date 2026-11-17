@@ -1143,6 +1143,19 @@ def test_vo_optical_zoom_vs_wall_dolly_and_pre_cut_incoming_crossfade() -> None:
         p_k = slow_solver.solve_frame(obs_k, ljp_cam_52=ljp_n, hips_pos_rh=hips_n)
     assert p_k.orbit_distance < 2.55
 
+    # 11. After camera stops on stationary frame, `_accum_parallax` decays quickly back below tripod threshold!
+    box_dolly_end = _scale_box(box0, 1.06)
+    for _ in range(6):
+        vo_dolly.step(frame_zoomed, box_dolly_end, cam_k, allow_zoom=True)
+    assert vo_dolly.last_trans_flow_px < 0.20
+
+    # 12. Clipped performer bbox (`y2 >= h - 8`) never commits background expansion as optical zoom!
+    vo_clipped = BackgroundVisualOdometry()
+    clipped_box = np.array([260.0, 70.0, 380.0, float(h - 2)], dtype=np.float32)
+    vo_clipped.step(base, clipped_box, cam_k, allow_zoom=True)
+    vo_clipped.step(frame_zoomed, clipped_box, cam_k, allow_zoom=True)
+    assert abs(vo_clipped.zoom_scale - 1.0) < 1e-6
+
 
 def test_stalled_camera_reader_hot_swap_and_close_release_devices(monkeypatch) -> None:
     """Verify hot-swapping away from a stalled camera starts live reads on the new device immediately,

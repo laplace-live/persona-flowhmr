@@ -475,6 +475,7 @@ class BackgroundVisualOdometry:
         self._pending_bg_zoom: float = 1.0
         self._pending_fg_zoom: float = 1.0
         self._pending_fg_valid: bool = True
+        self._prev_allow_zoom: bool = True
         self._accum_parallax = np.zeros(3, dtype=np.float64)
         self._prev_gray: np.ndarray | None = None
         self._prev_hw: tuple[int, int] | None = None
@@ -489,6 +490,7 @@ class BackgroundVisualOdometry:
         self._pending_bg_zoom = 1.0
         self._pending_fg_zoom = 1.0
         self._pending_fg_valid = True
+        self._prev_allow_zoom = True
         self._accum_parallax[:] = 0.0
         self._r_yup = np.eye(3, dtype=np.float32)
         self.last_trans_flow_px = 0.0
@@ -512,6 +514,9 @@ class BackgroundVisualOdometry:
             self._pending_bg_zoom = 1.0
             self._pending_fg_zoom = 1.0
             self._pending_fg_valid = True
+            if self._prev_allow_zoom:
+                self._accum_parallax[:] = 0.0
+        self._prev_allow_zoom = bool(allow_zoom)
         long_side = max(1, max(h, w))
         scale = min(1.0, float(self.work_width) / float(long_side))
         sw, sh = max(32, int(round(w * scale))), max(32, int(round(h * scale)))
@@ -617,6 +622,7 @@ class BackgroundVisualOdometry:
         if raw_flow_480 < 0.28:
             du_sub = float(np.median(p1[:, 0] - p0[:, 0])) * norm_480
             dv_sub = float(np.median(p1[:, 1] - p0[:, 1])) * norm_480
+            self._accum_parallax *= 0.55
             sub_parallax = float(np.linalg.norm(self._accum_parallax + np.array([du_sub, dv_sub, 0.0], dtype=np.float64)))
             self.last_trans_flow_px = max(raw_flow_480, sub_parallax)
             return self._r_yup.copy(), int(len(p0))
@@ -674,7 +680,6 @@ class BackgroundVisualOdometry:
                     and bw0 >= 24.0
                     and bh0 >= 48.0
                 )
-                cand_bg = self._pending_bg_zoom * med_zoom
                 if unclipped:
                     fg_step = 0.5 * (
                         float(cur_bbox[2] - cur_bbox[0]) / bw0
@@ -682,13 +687,12 @@ class BackgroundVisualOdometry:
                     )
                     if abs(med_zoom - 1.0) < 0.0005:
                         fg_step = float(np.clip(fg_step, 0.998, 1.002))
+                    cand_bg = self._pending_bg_zoom * med_zoom
                     cand_fg = self._pending_fg_zoom * fg_step
-                    cand_valid = self._pending_fg_valid
-                elif abs(med_zoom - 1.0) < 0.0005:
-                    cand_fg = self._pending_fg_zoom * med_zoom
-                    cand_valid = self._pending_fg_valid
+                    cand_valid = True
                 else:
-                    cand_fg = self._pending_fg_zoom
+                    cand_bg = 1.0
+                    cand_fg = 1.0
                     cand_valid = False
 
                 if abs(cand_bg - 1.0) >= 0.008:
