@@ -1100,6 +1100,49 @@ def test_vo_optical_zoom_vs_wall_dolly_and_pre_cut_incoming_crossfade() -> None:
     vo_pan_then_zoom.step(panned_zoomed, _scale_box(box_bigger, zoom_factor), cam_k, allow_zoom=True)
     assert vo_pan_then_zoom.zoom_scale > 1.02
 
+    # 9. Ultra-slow (<0.05%/frame) lens zoom during an active pan still accumulates into `zoom_scale`!
+    vo_micro_zoom = BackgroundVisualOdometry()
+    vo_micro_zoom.step(base, box0, cam_k, allow_zoom=True)
+    for k in range(1, 32):
+        zk = 1.00038**k
+        dx_k = -1.6 * k
+        mz_pan = np.array(
+            [
+                [zk, 0.0, (1.0 - zk) * (w * 0.5) + dx_k],
+                [0.0, zk, (1.0 - zk) * (h * 0.5)],
+            ],
+            dtype=np.float32,
+        )
+        zp_img = cv2.warpAffine(base, mz_pan, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        vo_micro_zoom.step(zp_img, _scale_box(box0, zk), cam_k, allow_zoom=True)
+    assert vo_micro_zoom.zoom_scale > 1.007
+
+    # 10. Sustained slow physical camera dolly (`trans_flow_px = 0.34 < 0.48`) unlocks tripod and tracks distance!
+    slow_solver = StreamingCameraSolver(avatar_scale=1.0)
+    dec_n = decoder.decode_window(np.zeros((1, 491), dtype=np.float32))
+    ljp_n = dec_n["ljp_cam"][0]
+    hips_n = np.array([-float(ljp_n[0, 0]), float(dec_n["srp_y_cam"][0]), -float(ljp_n[0, 2])], dtype=np.float32)
+    stage_n = extract_smplh_body14_stage(ljp_n, hips_n)
+    cv_s = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+    for k in range(25):
+        d_k = 3.2 - 0.045 * k  # steady dolly from 3.2m in toward ~2.1m
+        c_k = np.array([0.0, float(hips_n[1]), d_k], dtype=np.float32)
+        j_cv = ((stage_n - c_k[None, :]) @ cv_s.T).astype(np.float32)
+        obs_k = FrameCameraObservation(
+            sam_cam_t=np.array([0.0, 0.9, d_k], dtype=np.float32),
+            sam_j3d_cam=j_cv,
+            cam_k=cam_k,
+            image_hw=(h, w),
+            bbox_xyxy=box0,
+            r_vo_yup=np.eye(3, dtype=np.float32),
+            vo_inliers=25,
+            is_cut=(k == 0),
+            shot_id=0,
+            trans_flow_px=(0.0 if k == 0 else 0.34),
+        )
+        p_k = slow_solver.solve_frame(obs_k, ljp_cam_52=ljp_n, hips_pos_rh=hips_n)
+    assert p_k.orbit_distance < 2.55
+
 
 def test_stalled_camera_reader_hot_swap_and_close_release_devices(monkeypatch) -> None:
     """Verify hot-swapping away from a stalled camera starts live reads on the new device immediately,
