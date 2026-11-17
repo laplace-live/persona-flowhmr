@@ -276,6 +276,33 @@ def test_cli_rolls_back_published_outputs(source_file, tmp_path, inference, monk
     assert set(tmp_path.iterdir()) == {source_file, avatar, camera, unrelated}
 
 
+def test_cli_warns_on_locked_backup_after_publishing_all_outputs(source_file, tmp_path, inference, monkeypatch, capsys):
+    avatar, camera = tmp_path / "avatar.vrma", tmp_path / "camera.vmd"
+    avatar.write_bytes(b"earlier avatar")
+    camera.write_bytes(b"earlier camera")
+    unlink_file = Path.unlink
+    backups = []
+
+    def lock_first_backup(path, **kwargs):
+        if path.suffix == ".bak":
+            backups.append(path)
+            if len(backups) == 1:
+                raise PermissionError("backup locked")
+        return unlink_file(path, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", lock_first_backup)
+    args = ["export", "--video", str(source_file), "--avatar", str(avatar), "--camera-motion", str(camera)]
+    assert cli.main(args) == 0
+    output = capsys.readouterr()
+    assert len(backups) == 2
+    assert "Warning" in output.err and "backup locked" in output.err and str(backups[0]) in output.err
+    assert str(avatar) in output.out and str(camera) in output.out
+    assert avatar.read_bytes().startswith(b"glTF")
+    assert camera.read_bytes().startswith(b"Vocaloid Motion Data")
+    assert backups[0].read_bytes() == b"earlier avatar"
+    assert set(tmp_path.iterdir()) == {source_file, avatar, camera, backups[0]}
+
+
 @pytest.mark.parametrize(
     "outputs",
     [

@@ -285,6 +285,13 @@ def _restore_output(dest: Path, backup: Path | None, staged_stat: os.stat_result
             raise OSError(f"Could not restore {dest}. The previous file is at {backup}: {exc}") from exc
 
 
+def _discard_export_temp(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"Warning: could not remove temporary export file {path}: {exc}", file=sys.stderr)
+
+
 def _publish_outputs(staged: list[tuple[Path, Path]]) -> None:
     """Install a take as a group, keeping displaced files on their original filesystem."""
     if len(staged) == 1:
@@ -302,14 +309,14 @@ def _publish_outputs(staged: list[tuple[Path, Path]]) -> None:
                 try:
                     dest.replace(backup)
                 except BaseException:
-                    backup.unlink(missing_ok=True)
+                    _discard_export_temp(backup)
                     raise
                 backups.append(backup)
             rollback.callback(_restore_output, dest, backup, staged_stat)
             tmp.replace(dest)
         rollback.pop_all()
     for backup in backups:
-        backup.unlink()
+        _discard_export_temp(backup)
 
 
 def cmd_export(args: argparse.Namespace) -> int:
@@ -354,10 +361,11 @@ def cmd_export(args: argparse.Namespace) -> int:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with tempfile.NamedTemporaryFile(dir=dest.parent, suffix=dest.suffix, delete=False) as fp:
                     tmp = Path(fp.name)
-                cleanup.callback(tmp.unlink, missing_ok=True)
+                cleanup.callback(_discard_export_temp, tmp)
                 write_motion(tmp, frames, camera=camera)
                 staged.append((tmp, dest))
             _publish_outputs(staged)
+            cleanup.pop_all()  # Each staged file now lives at its final path.
             for _, dest in staged:
                 print(f"Wrote {dest} ({len(frames)} source frames at 30 Hz)")
     except (OSError, ValueError, RuntimeError) as exc:
