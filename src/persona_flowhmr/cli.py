@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import os
 import signal
 import sys
+import tempfile
 import time
+from pathlib import Path
 from typing import get_args
 
 from .config import (
@@ -27,35 +30,11 @@ from .paths import DEFAULT_DEMO_VIDEO, SETTINGS_FILE
 from .setup_models import check_models_status, download_missing_models
 
 
-def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
-    """Engine flags: each `dest` is an `EngineConfig` field; flags left unset keep the base config's value."""
-    p.add_argument("--source", dest="source_mode", choices=get_args(SourceMode), help="Input source mode")
-    p.add_argument("--video", dest="video_path", metavar="VIDEO", help="Debug video file path")
-    p.add_argument(
-        "--no-loop",
-        dest="loop_video",
-        action="store_const",
-        const=False,
-        help="Play debug video once instead of looping",
-    )
-    p.add_argument(
-        "--camera",
-        dest="camera_index",
-        metavar="CAMERA",
-        type=int,
-        help="Camera device index when --source=camera",
-    )
+def _add_solve_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--preset",
         choices=tuple(LATENCY_PRESETS),
         help="Latency / smoothness sliding-window preset",
-    )
-    p.add_argument(
-        "--fps",
-        dest="playout_fps",
-        type=int,
-        choices=get_args(PlayoutFps),
-        help="VMC output playout FPS (30 or 60)",
     )
     p.add_argument("--mirror", action="store_const", const=True, help="Mirror left/right body & root travel")
     p.add_argument(
@@ -135,6 +114,34 @@ def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
         const=False,
         help="Disable torch.compile Triton acceleration",
     )
+
+
+def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
+    """Engine flags: each `dest` is an `EngineConfig` field; flags left unset keep the base config's value."""
+    p.add_argument("--source", dest="source_mode", choices=get_args(SourceMode), help="Input source mode")
+    p.add_argument("--video", dest="video_path", metavar="VIDEO", help="Debug video file path")
+    p.add_argument(
+        "--no-loop",
+        dest="loop_video",
+        action="store_const",
+        const=False,
+        help="Play debug video once instead of looping",
+    )
+    p.add_argument(
+        "--camera",
+        dest="camera_index",
+        metavar="CAMERA",
+        type=int,
+        help="Camera device index when --source=camera",
+    )
+    p.add_argument(
+        "--fps",
+        dest="playout_fps",
+        type=int,
+        choices=get_args(PlayoutFps),
+        help="VMC output playout FPS (30 or 60)",
+    )
+    _add_solve_args(p)
     p.add_argument("--vmc-host", help="Target VMC receiver UDP host")
     p.add_argument("--vmc-port", type=int, help="Target VMC receiver UDP port")
     p.add_argument("--no-vmc", dest="vmc_enabled", action="store_const", const=False, help="Disable UDP VMC output")
@@ -257,6 +264,116 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _restore_output(dest: Path, backup: Path | None, staged_stat: os.stat_result) -> None:
+    try:
+        current = dest.lstat()
+    except FileNotFoundError:
+        current = None
+    if current is not None and (
+        not os.path.samestat(current, staged_stat)
+        or (current.st_size, current.st_mtime_ns) != (staged_stat.st_size, staged_stat.st_mtime_ns)
+    ):
+        if backup is not None:
+            raise OSError(f"{dest} changed during export. The previous file is at {backup}")
+        return
+    if backup is None and current is not None:
+        dest.unlink(missing_ok=True)
+    elif backup is not None:
+        try:
+            backup.replace(dest)
+        except OSError as exc:
+            raise OSError(f"Could not restore {dest}. The previous file is at {backup}: {exc}") from exc
+
+
+def _discard_export_temp(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"Warning: could not remove temporary export file {path}: {exc}", file=sys.stderr)
+
+
+def _publish_outputs(staged: list[tuple[Path, Path]]) -> None:
+    """Install a take as a group, keeping displaced files on their original filesystem."""
+    if len(staged) == 1:
+        tmp, dest = staged[0]
+        tmp.replace(dest)
+        return
+    backups = []
+    with contextlib.ExitStack() as rollback:
+        for tmp, dest in staged:
+            staged_stat = tmp.stat()
+            backup = None
+            if dest.is_file() or dest.is_symlink():
+                with tempfile.NamedTemporaryFile(dir=dest.parent, suffix=".bak", delete=False) as fp:
+                    backup = Path(fp.name)
+                try:
+                    dest.replace(backup)
+                except BaseException:
+                    _discard_export_temp(backup)
+                    raise
+                backups.append(backup)
+            rollback.callback(_restore_output, dest, backup, staged_stat)
+            tmp.replace(dest)
+        rollback.pop_all()
+    for backup in backups:
+        _discard_export_temp(backup)
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Solve a finite video once and serialize each requested track at the source rate."""
+    from .engine import StreamingMocapEngine
+    from .motion_export import AVATAR_FORMATS, write_motion
+
+    outputs = [(Path(p), False) for p in args.avatar]
+    if args.camera_motion:
+        outputs.append((Path(args.camera_motion), True))
+    source = Path(args.video_path).resolve()
+    try:
+        if not source.is_file():
+            raise ValueError(f"Video file not found: {source}")
+        if not outputs:
+            raise ValueError("Specify at least one --avatar or --camera-motion file.")
+        seen = {source}
+        for dest, camera in outputs:
+            formats = ("vmd",) if camera else AVATAR_FORMATS
+            if dest.suffix.lower()[1:] not in formats:
+                raise ValueError(f"{dest}: expected {', '.join(formats)} extension.")
+            if dest.resolve() in seen or dest.is_dir():
+                raise ValueError(f"Each output requires a distinct file path: {dest}")
+            seen.add(dest.resolve())
+        cfg = _config_from_args(args, base=EngineConfig(loop_video=False, vmc_enabled=False))
+        if args.camera_motion and not cfg.camera_tracking_enabled:
+            raise ValueError("Camera export requires camera tracking.")
+
+        engine = StreamingMocapEngine(cfg)
+        try:
+            engine.record_video()
+            while engine.is_running:
+                time.sleep(0.1)
+        finally:
+            engine.stop()
+        if engine.telemetry.state == "error":
+            raise RuntimeError(engine.telemetry.error)
+        frames = engine.recording.frames()
+        with contextlib.ExitStack() as cleanup:
+            staged = []
+            for dest, camera in outputs:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(dir=dest.parent, suffix=dest.suffix, delete=False) as fp:
+                    tmp = Path(fp.name)
+                cleanup.callback(_discard_export_temp, tmp)
+                write_motion(tmp, frames, camera=camera)
+                staged.append((tmp, dest))
+            _publish_outputs(staged)
+            cleanup.pop_all()  # Each staged file now lives at its final path.
+            for _, dest in staged:
+                print(f"Wrote {dest} ({len(frames)} source frames at 30 Hz)")
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"Export failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="persona-flowhmr", description="FlowHMR -> LAPLACE Persona Live Mocap")
     sub = parser.add_subparsers(dest="command")
@@ -279,6 +396,15 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--duration", type=float, default=0.0, help="Optional run duration in seconds (0 = until Ctrl+C)")
     _add_common_engine_args(p_run)
     p_run.set_defaults(func=cmd_run)
+
+    p_export = sub.add_parser("export", help="Export animation from one complete video at 30 Hz")
+    p_export.add_argument("--video", dest="video_path", required=True, help="Source video file")
+    p_export.add_argument(
+        "--avatar", action="append", default=[], metavar="FILE", help="Avatar .vrma, .fbx or .vmd (repeatable)"
+    )
+    p_export.add_argument("--camera-motion", metavar="FILE", help="Camera .vmd output")
+    _add_solve_args(p_export)
+    p_export.set_defaults(func=cmd_export)
 
     args = parser.parse_args(argv)
     if not hasattr(args, "func"):

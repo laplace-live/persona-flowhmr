@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from persona_flowhmr import web_ui
+from persona_flowhmr.camera_tracker import decompose_three_camera_pose
 from persona_flowhmr.config import EngineConfig
 from persona_flowhmr.engine import StreamingMocapEngine
+from persona_flowhmr.retarget import CanonicalPoseFrame
 
 
 def test_dashboard_single_line_buttons_and_pick_video_endpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -87,3 +91,49 @@ def test_settings_persisted_across_refresh_and_restart(tmp_path: Path) -> None:
     reloaded = EngineConfig.load(settings_file)
     assert reloaded.playout_fps == 30
     assert reloaded.plugin_api_token == "sk-lp-v1-test-token"
+
+
+def test_recording_controls_and_download_cleanup(monkeypatch, tmp_path):
+    eng = StreamingMocapEngine(EngineConfig(), settings_path=tmp_path / "settings.json")
+    with TestClient(web_ui.create_app(eng)) as client:
+        assert client.post("/api/recording/start").status_code == 409
+        monkeypatch.setattr(eng, "_recording_available", True)
+        manual = {"available": True, "full_video": False, "video_result": None, "has_camera": False, "finishing": False}
+        assert client.post("/api/recording/start").json()["recording"] == manual | {"active": True, "frames": 0}
+        assert client.get("/api/recording/download/avatar.vmd").status_code == 409
+        assert client.post("/api/recording/stop").json()["recording"]["active"] is False
+        assert client.get("/api/recording/download/avatar.vmd").status_code == 409
+
+        client.post("/api/recording/start")
+        frame = CanonicalPoseFrame(0., 100., 0, np.tile([0., 0., 0., 1.], (52, 1)), np.array([0., 1., 0.]))
+        eng.telemetry.frames_captured = 1
+        pending = client.post("/api/recording/stop").json()["recording"]
+        assert pending["active"] and pending["finishing"] and pending["frames"] == 0
+        assert client.get("/api/recording/download/avatar.vmd").status_code == 409
+        eng.recording.append([frame], mirror=False, follow=True)
+        assert client.get("/api/status").json()["recording"] == manual | {"active": False, "frames": 1}
+        temp_dir = tmp_path / "downloads"
+        temp_dir.mkdir()
+        monkeypatch.setattr(web_ui.tempfile, "tempdir", str(temp_dir))
+        for suffix in ("vrma", "fbx", "vmd"):
+            filename = f"avatar.{suffix}"
+            response = client.get(f"/api/recording/download/{filename}")
+            assert response.status_code == 200
+            assert len(response.content) > 100
+            assert response.headers["content-disposition"] == f'attachment; filename="{filename}"'
+            assert not list(temp_dir.iterdir())
+        assert client.get("/api/recording/download/camera.vmd").status_code == 422
+        assert not list(temp_dir.iterdir())
+        assert client.get("/api/recording/download/camera.fbx").status_code == 422
+        assert client.get("/api/status").json()["recording"]["frames"] == 1
+
+        client.post("/api/recording/start")
+        camera = decompose_three_camera_pose(np.array([0, 1, 3]), np.eye(3), 3., 50.)
+        eng.telemetry.frames_captured = 2
+        eng.recording.append([replace(frame, frame_index=1, media_time_s=1 / 30, camera=camera)], mirror=False, follow=True)
+        client.post("/api/recording/stop")
+        take_files = set(temp_dir.iterdir())
+        response = client.get("/api/recording/download/camera.vmd")
+        assert response.status_code == 200
+        assert response.content[30:50].rstrip(b"\0").decode("shift_jis") == "カメラ・照明"
+        assert set(temp_dir.iterdir()) == take_files

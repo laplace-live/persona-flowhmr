@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import argparse
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import pytest
+from fastapi.testclient import TestClient
 
 from persona_flowhmr import cli, engine
 from persona_flowhmr.config import EngineConfig
 from persona_flowhmr.engine import StreamingMocapEngine
 from persona_flowhmr.paths import DEFAULT_DEMO_VIDEO
 from persona_flowhmr.retarget import CanonicalPoseFrame
+from persona_flowhmr.web_ui import create_app
 
 
 def _parse_engine_flags(argv: list[str]) -> argparse.Namespace:
@@ -62,6 +65,56 @@ def test_live_settings_act_only_on_changed_values(tmp_path: Path, monkeypatch: p
     # Keys that are not config fields are ignored instead of overwriting config attributes.
     eng.update_live_settings({"get_preset": 1, "save": None})
     assert eng.get_status()["config"]["preset"] == "low"
+
+
+def test_manual_take_rejects_restart_before_applying_any_settings(tmp_path, monkeypatch):
+    path = tmp_path / "settings.json"
+    config = EngineConfig(preset="low", mirror=False, follow_movement=True, plugin_api_token="original")
+    config.save(path)
+    eng = StreamingMocapEngine(config, settings_path=path)
+    monkeypatch.setattr(eng, "_recording_available", True)
+    monkeypatch.setattr(StreamingMocapEngine, "is_running", property(lambda self: True))
+    with TestClient(create_app(eng)) as client:
+        assert client.post("/api/recording/start").status_code == 200
+        original = path.read_bytes()
+        change = {"mirror": True, "plugin_api_token": "replacement", "preset": "balanced"}
+        blocked = client.post("/api/config", json=change)
+        assert blocked.status_code == 409 and "Finish the current take" in blocked.json()["detail"]
+        assert eng.recording.active and not config.mirror and config.preset == "low"
+        assert config.plugin_api_token == "original" and path.read_bytes() == original
+
+        form = asdict(config) | {"mirror": True, "follow_movement": False, "plugin_api_token": ""}
+        allowed = client.post("/api/config", json=form)
+        assert allowed.status_code == 200 and allowed.json()["recording"]["active"]
+        live = allowed.json()["live_config_fields"]
+        assert "mirror" in live and "follow_movement" in live and "preset" not in live
+        assert config.mirror and not config.follow_movement and config.plugin_api_token == "original"
+        assert EngineConfig.load(path) == config
+
+
+def test_manual_start_rejects_a_concurrent_stream_shutdown(monkeypatch):
+    eng = StreamingMocapEngine()
+    eng._recording_available = True
+    entered = threading.Event()
+    release = threading.Event()
+    stop_workers = eng._stop_workers
+
+    def paused_stop():
+        entered.set()
+        assert release.wait(timeout=5)
+        stop_workers()
+
+    monkeypatch.setattr(eng, "_stop_workers", paused_stop)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        stopping = pool.submit(eng.stop)
+        try:
+            assert entered.wait(timeout=5)
+            with pytest.raises(ValueError, match="Stream controls are busy"):
+                eng.begin_recording()
+            assert not eng.recording.active
+        finally:
+            release.set()
+        stopping.result(timeout=5)
 
 
 class _FakeClock:
