@@ -634,10 +634,15 @@ class BackgroundVisualOdometry:
             med_zoom = float(np.sum(ac * bc) / denom_z) if denom_z > 1e-6 else 1.0
             zoom_res_480 = float(np.median(np.linalg.norm(bc - med_zoom * ac, axis=-1))) * norm_480
 
-            if has_spread and zoom_res_480 < 0.85 and 0.92 <= med_zoom <= 1.08:
+            if (
+                has_spread
+                and zoom_res_480 < 0.85
+                and 0.92 <= med_zoom <= 1.08
+                and abs(med_zoom - 1.0) >= 0.0005
+            ):
                 # Accumulate coherent sub-threshold scale steps against `_zoom_anchor_bbox` so slow sustained
                 # zooms (e.g. 0.15%-0.20%/frame) are preserved instead of discarded when `_prev_gray` advances.
-                if (med_zoom - 1.0) * (self._pending_zoom - 1.0) < -1e-7:
+                if abs(self._pending_zoom - 1.0) < 1e-6 or (med_zoom - 1.0) * (self._pending_zoom - 1.0) < -1e-7:
                     self._pending_zoom = 1.0
                     self._zoom_anchor_bbox = prev_bbox.copy()
                 anchor_box = self._zoom_anchor_bbox if self._zoom_anchor_bbox is not None else prev_bbox
@@ -683,11 +688,12 @@ class BackgroundVisualOdometry:
                         self._zoom_anchor_bbox = cur_bbox.copy()
                 else:
                     self._pending_zoom = cand_zoom
-                    if self._zoom_anchor_bbox is None:
-                        self._zoom_anchor_bbox = prev_bbox.copy()
             else:
                 self._pending_zoom = 1.0
                 self._zoom_anchor_bbox = cur_bbox.copy()
+        else:
+            self._pending_zoom = 1.0
+            self._zoom_anchor_bbox = cur_bbox.copy()
 
         delta_r_cv, n_inliers = self._ransac_ray_rotation(p0, p1, cam_k, cam_k1=eff_k1)
         rays0 = np.stack([(p0[:, 0] - cx) / fx, (p0[:, 1] - cy) / fy, np.ones(len(p0), dtype=np.float64)], axis=-1)
@@ -697,8 +703,9 @@ class BackgroundVisualOdometry:
         fy_out = fy * eff_zoom
         u_pred = fx_out * (rays0_rot[:, 0] / z_rot) + cx
         v_pred = fy_out * (rays0_rot[:, 1] / z_rot) + cy
-        if commit_zoom is not None and n_inliers >= self.min_inliers:
-            self.zoom_scale = float(np.clip(self.zoom_scale * commit_zoom, 0.4, 3.5))
+        if commit_zoom is not None:
+            if n_inliers >= self.min_inliers:
+                self.zoom_scale = float(np.clip(self.zoom_scale * commit_zoom, 0.4, 3.5))
             self._pending_zoom = 1.0
             self._zoom_anchor_bbox = cur_bbox.copy()
 

@@ -1084,6 +1084,22 @@ def test_vo_optical_zoom_vs_wall_dolly_and_pre_cut_incoming_crossfade() -> None:
         vo_slow_zoom.step(z_img, _scale_box(box0, zk), cam_k, allow_zoom=True)
     assert vo_slow_zoom.zoom_scale > 1.018
 
+    # 8. Pure pan while performer changes size refreshes `_zoom_anchor_bbox` so a subsequent zoom succeeds!
+    vo_pan_then_zoom = BackgroundVisualOdometry()
+    vo_pan_then_zoom.step(base, box0, cam_k, allow_zoom=True)
+    panned_fast = cv2.warpAffine(
+        base,
+        np.array([[1.0, 0.0, -4.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    box_bigger = _scale_box(box0, 1.12)
+    vo_pan_then_zoom.step(panned_fast, box_bigger, cam_k, allow_zoom=True)
+    panned_zoomed = cv2.warpAffine(panned_fast, m_zoom, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    vo_pan_then_zoom.step(panned_zoomed, _scale_box(box_bigger, zoom_factor), cam_k, allow_zoom=True)
+    assert vo_pan_then_zoom.zoom_scale > 1.02
+
 
 def test_stalled_camera_reader_hot_swap_and_close_release_devices(monkeypatch) -> None:
     """Verify hot-swapping away from a stalled camera starts live reads on the new device immediately,
