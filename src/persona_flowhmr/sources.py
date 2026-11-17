@@ -293,7 +293,7 @@ class CameraSource:
             timeout_s=open_timeout_s,
         )
 
-        self._cap = cap
+        self._cap: cv2.VideoCapture | None = cap
         self._device_gen = 0
         self._retired_caps: list[cv2.VideoCapture] = []
         self._clock = _FrameClock(target_fps)
@@ -327,7 +327,8 @@ class CameraSource:
         )
 
         with self._lock:
-            self._retired_caps.append(self._cap)
+            if self._cap is not None:
+                self._retired_caps.append(self._cap)
             self._cap = new_cap
             self._device_gen += 1
             self.camera_index = new_idx
@@ -349,6 +350,8 @@ class CameraSource:
                 with self._lock:
                     cap = self._cap
                     gen = self._device_gen
+                if cap is None:
+                    break
                 # Perform blocking driver read without holding `_lock` so `switch_device` and `close` never stall.
                 ok, bgr = cap.read()
                 if not ok or bgr is None:
@@ -363,8 +366,10 @@ class CameraSource:
             if self._stop.is_set():
                 with self._lock:
                     active_cap = self._cap
-                with contextlib.suppress(Exception):
-                    active_cap.release()
+                    self._cap = None
+                if active_cap is not None:
+                    with contextlib.suppress(Exception):
+                        active_cap.release()
 
     def read_next(self) -> SampledFrame | None:
         if self._stop.is_set():
@@ -380,12 +385,24 @@ class CameraSource:
         self._stop.set()
         if self._reader_thread.is_alive():
             self._reader_thread.join(timeout=1.0)
-        if not self._reader_thread.is_alive():
-            self._drain_retired_caps()
-            with self._lock:
-                cap = self._cap
-            with contextlib.suppress(Exception):
-                cap.release()
+        with self._lock:
+            pending_caps = list(self._retired_caps)
+            self._retired_caps.clear()
+            if self._cap is not None:
+                pending_caps.append(self._cap)
+                self._cap = None
+        if pending_caps:
+            def _release_all() -> None:
+                for c in pending_caps:
+                    with contextlib.suppress(Exception):
+                        c.release()
+
+            if self._reader_thread.is_alive():
+                rel_t = threading.Thread(target=_release_all, name="camera-force-release", daemon=True)
+                rel_t.start()
+                rel_t.join(timeout=0.5)
+            else:
+                _release_all()
 
 
 def list_available_cameras(max_probe: int = 4) -> list[dict[str, int | str]]:

@@ -1046,3 +1046,66 @@ def test_vo_optical_zoom_vs_wall_dolly_and_pre_cut_incoming_crossfade() -> None:
     # Frame 4 was crossfaded between `f_a` pelvis height and `dec_b_raw[0]`, and outgoing `_tail` was cleared!
     assert float(f_a[-1].hips_pos_rh[1]) < float(f_b[0].hips_pos_rh[1]) < float(dec_b_raw[0])
     assert stitcher._tail is None
+
+    # 5. One-sided background (left half black, features only on right half) still recovers optical zoom!
+    one_sided = base.copy()
+    one_sided[:, : w // 2 + 20] = 0
+    one_sided_zoomed = cv2.warpAffine(one_sided, m_zoom, (w, h), flags=cv2.INTER_LINEAR)
+    box_left = np.array([60.0, 70.0, 180.0, 310.0], dtype=np.float32)
+    vo_oneside = BackgroundVisualOdometry()
+    vo_oneside.step(one_sided, box_left, cam_k, allow_zoom=True)
+    vo_oneside.step(one_sided_zoomed, _scale_box(box_left, zoom_factor), cam_k, allow_zoom=True)
+    assert vo_oneside.zoom_scale > 1.02
+
+    # 6. Sustained sub-threshold slow pan (~0.14 px/frame < 0.28 deadband) accumulates across frames!
+    vo_slow = BackgroundVisualOdometry()
+    vo_slow.step(base, box0, cam_k, allow_zoom=False)
+    for k in range(1, 16):
+        dx = -0.18 * k  # ~0.135 px/frame at 480p long-side
+        m_pan = np.array([[1.0, 0.0, dx], [0.0, 1.0, 0.0]], dtype=np.float32)
+        panned = cv2.warpAffine(base, m_pan, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        r_cur, _ = vo_slow.step(panned, box0, cam_k, allow_zoom=False)
+    yaw_accum_deg = abs(math.degrees(math.atan2(float(r_cur[2, 0]), float(r_cur[2, 2]))))
+    assert yaw_accum_deg > 0.12
+
+
+def test_stalled_camera_reader_close_releases_device(monkeypatch) -> None:
+    """Verify `CameraSource.close()` releases active capture in bounded time even when `cap.read()` is stalled."""
+    import time
+
+    from persona_flowhmr import sources
+
+    released = threading.Event()
+    unblock_read = threading.Event()
+
+    class StalledCap:
+        def __init__(self) -> None:
+            self._primed = False
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, *_args) -> bool:
+            return True
+
+        def read(self):
+            if not self._primed:
+                self._primed = True
+                return True, np.zeros((64, 64, 3), dtype=np.uint8)
+            unblock_read.wait(timeout=5.0)
+            return False, None
+
+        def release(self) -> None:
+            released.set()
+
+    monkeypatch.setattr(sources.cv2, "VideoCapture", lambda *_a, **_kw: StalledCap())
+    cam = sources.CameraSource(0, width=64, height=64, target_fps=30.0)
+    time.sleep(0.05)  # ensure `_reader_loop` is blocked inside second `cap.read()`
+    t0 = time.perf_counter()
+    try:
+        cam.close()
+        elapsed = time.perf_counter() - t0
+        assert released.is_set(), "Expected close() to release capture even while reader is stalled in read()"
+        assert elapsed < 2.0
+    finally:
+        unblock_read.set()

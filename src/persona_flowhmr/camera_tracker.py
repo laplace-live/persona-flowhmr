@@ -524,18 +524,19 @@ class BackgroundVisualOdometry:
             self.zoom_scale = 1.0
             return self._r_yup.copy(), 0
 
-        self._prev_bbox = cur_bbox
-
-        # Mask out expanded person bounding box so moving limbs never corrupt background camera motion.
+        # Mask out expanded person bounding boxes (both reference frame and current frame) so moving limbs
+        # never corrupt background features even while `_prev_gray` stays anchored across sub-threshold frames.
         mask = np.full((sh, sw), 255, dtype=np.uint8)
-        bx1, by1, bx2, by2 = (cur_bbox * scale).tolist()
-        pad_x = 0.14 * max(1.0, bx2 - bx1)
-        pad_y = 0.10 * max(1.0, by2 - by1)
-        ix1 = max(0, int(math.floor(bx1 - pad_x)))
-        iy1 = max(0, int(math.floor(by1 - pad_y)))
-        ix2 = min(sw, int(math.ceil(bx2 + pad_x)))
-        iy2 = min(sh, int(math.ceil(by2 + pad_y)))
-        mask[iy1:iy2, ix1:ix2] = 0
+        boxes_to_mask = [cur_bbox] if prev_bbox is None else [prev_bbox, cur_bbox]
+        for b_m in boxes_to_mask:
+            bx1, by1, bx2, by2 = (b_m * scale).tolist()
+            pad_x = 0.14 * max(1.0, bx2 - bx1)
+            pad_y = 0.10 * max(1.0, by2 - by1)
+            ix1 = max(0, int(math.floor(bx1 - pad_x)))
+            iy1 = max(0, int(math.floor(by1 - pad_y)))
+            ix2 = min(sw, int(math.ceil(bx2 + pad_x)))
+            iy2 = min(sh, int(math.ceil(by2 + pad_y)))
+            mask[iy1:iy2, ix1:ix2] = 0
 
         pts0 = cv2.goodFeaturesToTrack(
             self._prev_gray,
@@ -546,14 +547,16 @@ class BackgroundVisualOdometry:
         )
         if pts0 is None or len(pts0) < self.min_inliers:
             self._prev_gray = gray
+            self._prev_bbox = cur_bbox
             self.last_trans_flow_px = 0.0
             return self._r_yup.copy(), 0
 
         lk_kw = dict(winSize=(13, 13), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 12, 0.03))
         pts1, st_fwd, lk_err = cv2.calcOpticalFlowPyrLK(self._prev_gray, gray, pts0, None, **lk_kw)
-        self._prev_gray = gray
 
         if pts1 is None or st_fwd is None:
+            self._prev_gray = gray
+            self._prev_bbox = cur_bbox
             self.last_trans_flow_px = 0.0
             return self._r_yup.copy(), 0
 
@@ -564,7 +567,7 @@ class BackgroundVisualOdometry:
         p1 = pts1.reshape(-1, 2)[valid] / scale
 
         # Reject points landing inside current expanded bbox as well.
-        raw_bx1, raw_by1, raw_bx2, raw_by2 = np.asarray(bbox_xyxy, dtype=np.float32).tolist()
+        raw_bx1, raw_by1, raw_bx2, raw_by2 = cur_bbox.tolist()
         raw_px, raw_py = 0.14 * max(1.0, raw_bx2 - raw_bx1), 0.10 * max(1.0, raw_by2 - raw_by1)
         outside1 = ~(
             (p1[:, 0] >= raw_bx1 - raw_px)
@@ -574,16 +577,22 @@ class BackgroundVisualOdometry:
         )
         p0, p1 = p0[outside1], p1[outside1]
         if len(p0) < self.min_inliers:
+            self._prev_gray = gray
+            self._prev_bbox = cur_bbox
             self.last_trans_flow_px = 0.0
             return self._r_yup.copy(), 0
 
         # Resolution-invariant 480p-long-side flow normalization for both landscape and portrait inputs.
         norm_480 = 480.0 / float(long_side)
-        # Deadband sub-pixel sensor/compression noise on locked tripod cameras so rotation never random-walks.
+        # Deadband sub-pixel sensor/compression noise on locked tripod cameras while keeping `_prev_gray`
+        # anchored as a keyframe so slow sustained pans/tilts accumulate cleanly instead of being discarded.
         raw_flow_480 = float(np.median(np.linalg.norm(p1 - p0, axis=-1))) * norm_480
         if raw_flow_480 < 0.28:
             self.last_trans_flow_px = raw_flow_480
             return self._r_yup.copy(), int(len(p0))
+
+        self._prev_gray = gray
+        self._prev_bbox = cur_bbox
 
         fx = max(1.0, float(cam_k[0, 0]))
         fy = max(1.0, float(cam_k[1, 1]))
@@ -591,7 +600,8 @@ class BackgroundVisualOdometry:
         cy = float(cam_k[1, 2])
 
         # Estimate candidate optical zoom BEFORE pure-rotation RANSAC so radial edge expansion doesn't get
-        # misfit as a one-sided pan. Subtracting median displacement cancels first-order pan/tilt shift.
+        # misfit as a one-sided pan. Centering `(a_far, b_far)` cancels translation/pan shift even on
+        # one-sided backgrounds after performer masking.
         eff_zoom = 1.0
         eff_k1: np.ndarray | None = None
         du0 = p0[:, 0] - cx
@@ -600,12 +610,12 @@ class BackgroundVisualOdometry:
         far_mask = r0 >= 0.12 * float(long_side)
         if allow_zoom and prev_bbox is not None and int(np.sum(far_mask)) >= self.min_inliers:
             du_far = du0[far_mask]
-            both_sides = bool(np.any(du_far < -0.05 * w) and np.any(du_far > 0.05 * w))
             a_far = np.stack([du_far, dv0[far_mask]], axis=-1).astype(np.float64)
             b_far = np.stack([p1[far_mask, 0] - cx, p1[far_mask, 1] - cy], axis=-1).astype(np.float64)
             ac = a_far - np.mean(a_far, axis=0)
             bc = b_far - np.mean(b_far, axis=0)
             denom_z = float(np.sum(ac * ac))
+            has_spread = denom_z >= float(len(ac)) * (0.06 * float(long_side)) ** 2
             med_zoom = float(np.sum(ac * bc) / denom_z) if denom_z > 1e-6 else 1.0
             zoom_res_480 = float(np.median(np.linalg.norm(bc - med_zoom * ac, axis=-1))) * norm_480
 
@@ -639,7 +649,7 @@ class BackgroundVisualOdometry:
                 )
 
             if (
-                both_sides
+                has_spread
                 and fg_agrees
                 and zoom_res_480 < 0.85
                 and 0.92 <= med_zoom <= 1.08

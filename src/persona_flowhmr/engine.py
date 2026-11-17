@@ -419,6 +419,7 @@ class StreamingMocapEngine:
         self._decoder: MotionLatentDecoder | None = None
 
         self._stop_event = threading.Event()
+        self._queue_event = threading.Event()
         self._threads: list[threading.Thread] = []
         self._peeked_frame: SampledFrame | None = None
         self._evicted_lock = threading.Lock()
@@ -567,6 +568,7 @@ class StreamingMocapEngine:
         with self._evicted_lock:
             self._evicted_switch_min_frame = None
             self._evicted_reset_min_frame = None
+            self._queue_event.clear()
         self._live_jpeg.clear()
         self._synced_jpeg.clear()
         self.telemetry = EngineTelemetry(
@@ -612,6 +614,7 @@ class StreamingMocapEngine:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._queue_event.set()
         for t in self._threads:
             if t.is_alive():
                 t.join(timeout=3.0)
@@ -633,26 +636,27 @@ class StreamingMocapEngine:
         while not self._stop_event.is_set():
             try:
                 frame_queue.put(item, timeout=0.1)
+                with self._evicted_lock:
+                    self._queue_event.set()
                 return
             except queue.Full:
                 if drop_oldest:
-                    with contextlib.suppress(queue.Empty):
+                    with self._evicted_lock, contextlib.suppress(queue.Empty):
                         evicted = frame_queue.get_nowait()
                         if evicted is not None and (evicted.is_camera_switch or evicted.is_stream_reset):
                             ef = int(evicted.frame_index)
-                            with self._evicted_lock:
-                                if evicted.is_camera_switch:
-                                    self._evicted_switch_min_frame = (
-                                        ef
-                                        if self._evicted_switch_min_frame is None
-                                        else min(self._evicted_switch_min_frame, ef)
-                                    )
-                                if evicted.is_stream_reset:
-                                    self._evicted_reset_min_frame = (
-                                        ef
-                                        if self._evicted_reset_min_frame is None
-                                        else min(self._evicted_reset_min_frame, ef)
-                                    )
+                            if evicted.is_camera_switch:
+                                self._evicted_switch_min_frame = (
+                                    ef
+                                    if self._evicted_switch_min_frame is None
+                                    else min(self._evicted_switch_min_frame, ef)
+                                )
+                            if evicted.is_stream_reset:
+                                self._evicted_reset_min_frame = (
+                                    ef
+                                    if self._evicted_reset_min_frame is None
+                                    else min(self._evicted_reset_min_frame, ef)
+                                )
 
     def _capture_worker(
         self,
@@ -744,25 +748,38 @@ class StreamingMocapEngine:
             batch.append(self._peeked_frame)
             self._peeked_frame = None
         while len(batch) < goal and not self._stop_event.is_set():
-            try:
-                item = frame_queue.get(timeout=0.05)
-            except queue.Empty:
+            with self._evicted_lock:
+                try:
+                    item = frame_queue.get_nowait()
+                except queue.Empty:
+                    self._queue_event.clear()
+                    empty = True
+                    item = None
+                    carry_sw = False
+                    carry_rst = False
+                else:
+                    empty = False
+                    if item is not None:
+                        carry_sw = (
+                            self._evicted_switch_min_frame is not None
+                            and item.frame_index >= self._evicted_switch_min_frame
+                        )
+                        carry_rst = (
+                            self._evicted_reset_min_frame is not None
+                            and item.frame_index >= self._evicted_reset_min_frame
+                        )
+                        if carry_sw:
+                            self._evicted_switch_min_frame = None
+                        if carry_rst:
+                            self._evicted_reset_min_frame = None
+                    else:
+                        carry_sw = False
+                        carry_rst = False
+            if empty:
+                self._queue_event.wait(0.05)
                 continue
             if item is None:
                 return batch, True
-            with self._evicted_lock:
-                carry_sw = (
-                    self._evicted_switch_min_frame is not None
-                    and item.frame_index >= self._evicted_switch_min_frame
-                )
-                carry_rst = (
-                    self._evicted_reset_min_frame is not None
-                    and item.frame_index >= self._evicted_reset_min_frame
-                )
-                if carry_sw:
-                    self._evicted_switch_min_frame = None
-                if carry_rst:
-                    self._evicted_reset_min_frame = None
             if carry_sw or carry_rst:
                 item = replace(
                     item,
