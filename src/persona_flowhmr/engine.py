@@ -12,13 +12,14 @@ import time
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 import torch
+from pydantic import TypeAdapter, ValidationError
 
 from .camera_tracker import (
     BackgroundVisualOdometry,
@@ -482,24 +483,31 @@ class StreamingMocapEngine:
                 raise ValueError("Wait for the current recording or shutdown to finish before changing settings.")
             return self._apply_settings(patch)
 
+    @staticmethod
+    def _settings_values(patch: dict[str, Any]) -> dict[str, Any]:
+        values = {k: v for k, v in patch.items() if k in CONFIG_FIELDS}
+        if values.get("plugin_api_token") == "" and not patch.get("clear_plugin_api_token", False):
+            # The dashboard's redacted token field preserves the saved credential.
+            values.pop("plugin_api_token")
+        if "camera_avatar_scale" in values:
+            values["camera_avatar_scale"] = sanitize_avatar_scale(values["camera_avatar_scale"])
+        if "camera_fov_deg" in values:
+            values["camera_fov_deg"] = sanitize_camera_fov_deg(values["camera_fov_deg"])
+        return values
+
+    def _store_settings(self, values: dict[str, Any]) -> set[str]:
+        changed = {k for k, v in values.items() if getattr(self.config, k) != v}
+        for k in changed:
+            setattr(self.config, k, values[k])
+        if changed and self._settings_path is not None:
+            with contextlib.suppress(OSError):
+                self.config.save(self._settings_path)
+        return changed
+
     def _apply_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
         was_running = self.is_running
-        changed: set[str] = set()
-
         with self._lock:
-            for k, v in patch.items():
-                if k not in CONFIG_FIELDS:
-                    continue
-                if k == "plugin_api_token" and v == "" and not patch.get("clear_plugin_api_token", False):
-                    # Empty token from redacted UI form keeps existing token unless explicitly cleared.
-                    continue
-                if k == "camera_avatar_scale":
-                    v = sanitize_avatar_scale(v)
-                elif k == "camera_fov_deg":
-                    v = sanitize_camera_fov_deg(v)
-                if getattr(self.config, k) != v:
-                    setattr(self.config, k, v)
-                    changed.add(k)
+            changed = self._store_settings(self._settings_values(patch))
 
             if not self.config.camera_tracking_enabled:
                 self.telemetry.camera_distance_m = 0.0
@@ -509,10 +517,6 @@ class StreamingMocapEngine:
 
             if self._vmc_sender is not None:
                 self._vmc_sender.set_target(self.config.vmc_host, int(self.config.vmc_port))
-
-            if changed and self._settings_path is not None:
-                with contextlib.suppress(OSError):
-                    self.config.save(self._settings_path)
 
         if was_running and (changed - _LIVE_FIELDS):
             self._stop_workers(wait=True)
@@ -616,13 +620,23 @@ class StreamingMocapEngine:
                 return
             self._start_workers(realtime_source=realtime_source, playout=playout, full_video=False)
 
-    def record_video(self) -> None:
+    def record_video(self, settings: dict[str, Any] | None = None) -> None:
         """Record one complete video at source timestamps, without wall-clock playout."""
         with self._lifecycle_lock:
             if self.is_running:
                 raise ValueError("Stop the current stream before recording a full video.")
-            if self.config.source_mode != "video" or not Path(self.config.video_path).is_file():
+            values = self._settings_values(settings or {})
+            candidate = self.config
+            if values:
+                try:
+                    candidate = TypeAdapter(EngineConfig).validate_python(asdict(self.config) | values)
+                except ValidationError as exc:
+                    field = exc.errors()[0]["loc"][0]
+                    raise ValueError(f"Invalid recording setting: {field}") from None
+            if candidate.source_mode != "video" or not Path(candidate.video_path).is_file():
                 raise ValueError("Choose an existing video file to record.")
+            with self._lock:
+                self._store_settings({k: getattr(candidate, k) for k in values})
             self._start_workers(realtime_source=False, playout=False, full_video=True)
 
     def _start_workers(self, *, realtime_source: bool, playout: bool, full_video: bool) -> None:

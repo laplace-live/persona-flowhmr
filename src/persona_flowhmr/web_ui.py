@@ -518,7 +518,10 @@ _DASHBOARD_HTML = """<!doctype html>
       videoStartError = '';
       renderRecording(latestStatus);
       try {
-        const error = await applyConfig() || await postStatus('/api/recording/video');
+        clearTimeout(saveTimer);
+        const settings = gatherConfig();
+        await saveQueue.catch(() => {});
+        const error = await postStatus('/api/recording/video', settings);
         if (error) throw new Error(error);
       } catch (e) {
         videoStartError = e.message;
@@ -757,8 +760,8 @@ def create_app(engine: StreamingMocapEngine | None = None) -> FastAPI:
         return control(eng.begin_recording)
 
     @app.post("/api/recording/video")
-    def record_video() -> dict[str, Any]:
-        return control(eng.record_video)
+    def record_video(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        return control(lambda: eng.record_video(settings))
 
     @app.post("/api/recording/stop")
     def finish_recording() -> dict[str, Any]:
