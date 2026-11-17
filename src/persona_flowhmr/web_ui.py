@@ -27,6 +27,12 @@ from .motion_export import AVATAR_FORMATS, write_motion
 from .setup_models import check_models_status, download_missing_models
 from .sources import list_available_cameras
 
+_DOWNLOAD_TRACKS = {
+    "camera.vmd": ("camera.vmd",),
+    **{f"avatar.{ext}": (f"avatar.{ext}",) for ext in AVATAR_FORMATS},
+    **{f"avatar-{ext}-camera.zip": ("camera.vmd", f"avatar.{ext}") for ext in AVATAR_FORMATS},
+}
+
 
 class SetupModelsRequest(BaseModel):
     hf_token: str | None = None
@@ -374,7 +380,7 @@ _DASHBOARD_HTML = """<!doctype html>
               <option value="camera.vmd">Camera · VMD</option>
             </optgroup>
           </select>
-          <button id="downloadTake" disabled onclick="downloadTake()">Download</button>
+          <button id="downloadTakeBtn" disabled onclick="downloadTake()">Download</button>
         </div>
         <div id="takeStatus" style="margin-top:8px;color:var(--muted);"></div>
         <div id="takeError" role="alert" style="color:var(--bad);"></div>
@@ -387,9 +393,10 @@ _DASHBOARD_HTML = """<!doctype html>
     let saveTimer = null;
     let saveQueue = Promise.resolve();
     let latestStatus = null;
-    let startingVideo = false;
+    let videoStart = null;
     let pickingVideo = false;
     let videoStartError = '';
+    let settingsError = '';
     const videoPath = document.getElementById('video_path');
     const autoRecord = document.getElementById('autoRecordVideo');
     const autoRecordKey = 'persona-flowhmr.autoRecordVideo';
@@ -466,7 +473,7 @@ _DASHBOARD_HTML = """<!doctype html>
       }
     }
     function gatherConfig() {
-      return Object.fromEntries([...cfgFields()].map(el => [el.id, readField(el)]));
+      return Object.fromEntries([...cfgFields()].filter(el => !el.disabled).map(el => [el.id, readField(el)]));
     }
     function fillForm(c) {
       const camSel = document.getElementById('camera_index');
@@ -488,8 +495,16 @@ _DASHBOARD_HTML = """<!doctype html>
       };
       const r = await fetch(url, init);
       const data = await r.json();
+      const error = r.ok ? null : (data.detail || 'Request failed.');
+      if (url === '/api/config') {
+        settingsError = error;
+        if (r.status === 409) {
+          initialized = false;
+          await pollStatus();
+        }
+      }
       if (r.ok) renderStatus(data);
-      return r.ok ? null : (data.detail || 'Request failed.');
+      return error;
     }
     function applyConfig() {
       clearTimeout(saveTimer);
@@ -498,10 +513,20 @@ _DASHBOARD_HTML = """<!doctype html>
       return saveQueue;
     }
     async function startEngine() {
-      await applyConfig();
-      await postStatus('/api/start');
+      if (!await applyConfig()) await postStatus('/api/start');
     }
     async function stopEngine() {
+      if (videoStart) {
+        if (videoStart.sent) {
+          // Let the server acknowledge this start before sending its stop.
+          videoStart.cancelled = true;
+        } else {
+          videoStart = null;
+          videoStartError = 'Recording cancelled before starting.';
+        }
+        renderRecording(latestStatus);
+        return;
+      }
       await postStatus('/api/stop');
     }
     async function videoSelected() {
@@ -513,27 +538,32 @@ _DASHBOARD_HTML = """<!doctype html>
       }
     }
     async function recordFullVideo() {
-      if (startingVideo || !latestStatus || latestStatus.running || latestStatus.recording.full_video) return;
-      startingVideo = true;
+      if (videoStart || !latestStatus || latestStatus.running || latestStatus.recording.full_video) return;
+      const settings = gatherConfig();
+      const start = {sent: false, cancelled: false};
+      videoStart = start;
       videoStartError = '';
       renderRecording(latestStatus);
       try {
         clearTimeout(saveTimer);
-        const settings = gatherConfig();
         await saveQueue.catch(() => {});
+        if (videoStart !== start) return;
+        start.sent = true;
         const error = await postStatus('/api/recording/video', settings);
         if (error) throw new Error(error);
+        if (start.cancelled && latestStatus.recording.full_video) await postStatus('/api/stop');
       } catch (e) {
         videoStartError = e.message;
       } finally {
-        startingVideo = false;
-        renderRecording(latestStatus);
-        await pollStatus();
+        if (videoStart === start) {
+          videoStart = null;
+          renderRecording(latestStatus);
+          await pollStatus();
+        }
       }
     }
     let takeActive = false;
     let changingTake = false;
-    let downloadingTake = false;
     async function changeRecording() {
       changingTake = true;
       document.getElementById('recordTake').disabled = true;
@@ -551,27 +581,30 @@ _DASHBOARD_HTML = """<!doctype html>
         await pollStatus();
       }
     }
-    async function downloadTake() {
-      downloadingTake = true;
-      document.getElementById('downloadTake').disabled = true;
+    function downloadTake() {
+      const filename = document.getElementById('exportFile').value;
       const error = document.getElementById('takeError');
       error.textContent = '';
-      try {
-        const filename = document.getElementById('exportFile').value;
-        const r = await fetch('/api/recording/download/' + filename);
-        if (!r.ok) throw new Error((await r.json()).detail || 'Could not export the take.');
-        const url = URL.createObjectURL(await r.blob());
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = filename;
-        link.click();
-        setTimeout(() => URL.revokeObjectURL(url), 10000);
-      } catch (e) {
-        error.textContent = e.message;
-      } finally {
-        downloadingTake = false;
-        await pollStatus();
+      // Each format can download independently. Attachments go to the browser's download
+      // manager; only an error response navigates the frame and fires its load event.
+      const id = 'download-' + filename;
+      let frame = document.getElementById(id);
+      if (!frame) {
+        frame = document.createElement('iframe');
+        frame.id = id;
+        frame.hidden = true;
+        frame.onload = () => {
+          try {
+            const response = frame.contentDocument;
+            if (response.URL === 'about:blank') return;
+            error.textContent = JSON.parse(response.body.textContent).detail || 'Could not export the take.';
+          } catch {
+            error.textContent = 'Could not export the take.';
+          }
+        };
+        document.body.appendChild(frame);
       }
+      frame.contentWindow.location.replace('/api/recording/download/' + encodeURIComponent(filename));
     }
     async function setupSam() {
       const tok = document.getElementById('hf_token').value.trim();
@@ -585,19 +618,24 @@ _DASHBOARD_HTML = """<!doctype html>
     }
     function renderRecording(s) {
       const take = s.recording;
-      const full = startingVideo || take.full_video;
-      cfgFields().forEach(el => { el.disabled = full; });
-      videoPath.disabled = full || (autoRecord.checked && s.running);
+      const full = Boolean(videoStart || take.full_video);
+      cfgFields().forEach(el => {
+        el.disabled = full || (take.active && !s.live_config_fields.includes(el.id));
+      });
+      if (autoRecord.checked && s.running) videoPath.disabled = true;
       document.getElementById('browseVideoBtn').disabled = videoPath.disabled || pickingVideo;
       document.getElementById('startStream').disabled = full;
       document.getElementById('applySettings').disabled = full;
-      document.getElementById('stopStream').textContent = take.full_video ? 'Cancel recording' : 'Stop';
+      const stopButton = document.getElementById('stopStream');
+      stopButton.textContent = full ? 'Cancel recording' : 'Stop';
+      stopButton.disabled = Boolean(videoStart?.cancelled);
       document.getElementById('recordVideo').disabled = full || s.running || !videoPath.value.trim();
       const frames = take.frames.toLocaleString() + ' frames';
       const cameraEnabled = take.full_video ? s.config.camera_tracking_enabled
         : document.getElementById('camera_tracking_enabled').checked;
       const tracks = cameraEnabled ? 'avatar and camera' : 'avatar';
-      const progress = take.full_video && take.frames ? 'Recording ' + tracks + ' · ' + frames : 'Preparing video…';
+      let progress = take.full_video && take.frames ? 'Recording ' + tracks + ' · ' + frames : 'Preparing video…';
+      if (videoStart?.cancelled) progress = 'Cancelling recording…';
       const results = {complete: 'Video complete', error: 'Recording failed', cancelled: 'Recording cancelled'};
       let videoStatus = 'Records ' + tracks + ' from start to end.';
       if (s.running) videoStatus = 'Stop the stream to record the full video.';
@@ -608,17 +646,18 @@ _DASHBOARD_HTML = """<!doctype html>
       const recordButton = document.getElementById('recordTake');
       recordButton.textContent = take.active ? 'Finish take' : (take.frames ? 'Record new take' : 'Record take');
       recordButton.hidden = full;
-      recordButton.disabled = changingTake || full || (!take.available && !take.active);
+      recordButton.disabled = changingTake || full || take.finishing || (!take.available && !take.active);
       const ready = !full && !take.active && take.frames > 0;
       const formats = document.getElementById('exportFile');
       for (const option of formats.options) {
         option.disabled = ready && !take.has_camera && option.value.includes('camera');
       }
       if (formats.selectedOptions[0]?.disabled) formats.value = 'avatar.vrma';
-      document.getElementById('downloadTake').disabled = downloadingTake || !ready;
+      document.getElementById('downloadTakeBtn').disabled = !ready;
       let takeStatus = take.available ? 'Ready to record' : 'Choose a video or start a stream to record a take.';
       if (ready) takeStatus = (take.has_camera ? 'Avatar and camera' : 'Avatar') + ' · ' + frames;
       if (take.active) takeStatus = 'Recording · ' + frames;
+      if (take.finishing) takeStatus = 'Finishing take · ' + frames;
       if (full) takeStatus = progress;
       document.getElementById('takeStatus').textContent = takeStatus;
     }
@@ -639,8 +678,8 @@ _DASHBOARD_HTML = """<!doctype html>
 
       document.getElementById('samAlert').style.display = s.models.sam3d_ready ? 'none' : 'block';
       const errEl = document.getElementById('errAlert');
-      errEl.style.display = t.error ? 'block' : 'none';
-      errEl.textContent = t.error || '';
+      errEl.textContent = t.error || settingsError || '';
+      errEl.style.display = errEl.textContent ? 'block' : 'none';
 
       document.getElementById('m_play_fps').textContent = t.playout_fps.toFixed(1);
       document.getElementById('m_cap_fps').textContent = t.capture_fps.toFixed(1);
@@ -769,24 +808,24 @@ def create_app(engine: StreamingMocapEngine | None = None) -> FastAPI:
 
     @app.get("/api/recording/download/{filename}")
     def download_recording(filename: str) -> FileResponse:
-        camera = filename == "camera.vmd"
-        bundles = {f"avatar-{ext}-camera.zip": f"avatar.{ext}" for ext in AVATAR_FORMATS}
-        avatar = bundles.get(filename)
-        if not camera and avatar is None and filename not in bundles.values():
+        tracks = _DOWNLOAD_TRACKS.get(filename)
+        if tracks is None:
             raise HTTPException(status_code=422, detail="Unsupported motion download.")
         try:
             frames = eng.recording.frames()
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        with tempfile.NamedTemporaryFile(suffix=Path(filename).suffix, delete=False) as temp:
+        bundled = len(tracks) > 1
+        suffix = ".zip" if bundled else Path(tracks[0]).suffix
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp:
             path = Path(temp.name)
         try:
-            if avatar is None:
-                write_motion(path, frames, camera=camera)
+            if not bundled:
+                write_motion(path, frames, camera=tracks[0] == "camera.vmd")
                 return _MotionDownload(path, filename=filename, media_type="application/octet-stream")
             with tempfile.TemporaryDirectory() as folder, ZipFile(path, "w", ZIP_DEFLATED, compresslevel=1) as bundle:
                 # Writing the camera first reports missing tracking before encoding the skeleton.
-                for name in ("camera.vmd", avatar):
+                for name in tracks:
                     track = Path(folder) / name
                     write_motion(track, frames, camera=name == "camera.vmd")
                     bundle.write(track, arcname=name)

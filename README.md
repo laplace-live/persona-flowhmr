@@ -84,7 +84,7 @@ In the dashboard, enable **Auto-record when I select a video**, then browse for 
 
 Enable **Dynamic 6-DoF Camera Tracking** to capture avatar and camera together. Under **Motion recording**, choose a paired ZIP to download your avatar format and the synchronized camera VMD, or download either track individually. All downloads use the same take.
 
-For a live camera or an excerpt from a running stream, use **Record take** and **Finish take**. The take follows the mirror and root-movement settings and stays in memory until a new take starts or the server exits.
+For a live camera or an excerpt from a running stream, use **Record take** and **Finish take**. The take follows the mirror and root-movement settings. The recorder keeps the latest take in a local temporary file for repeated downloads. Budget about 100 MiB of temporary disk space per hour of recording, plus space for the exported files.
 
 ### 4. Tests & Linting
 ```bash

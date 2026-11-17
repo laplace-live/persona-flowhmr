@@ -19,7 +19,15 @@ def test_full_video_controls_are_opt_in_and_offer_paired_and_individual_download
     auto = controls["autoRecordVideo"]
     assert auto["type"] == "checkbox" and "checked" not in auto and "data-cfg" not in auto
     assert controls["recordVideo"]["onclick"] == "recordFullVideo()"
+    assert controls["downloadTakeBtn"]["onclick"] == "downloadTake()"
+    assert "downloadTake" not in controls
     assert formats == {
         "avatar-vrma-camera.zip", "avatar-fbx-camera.zip", "avatar-vmd-camera.zip",
         "avatar.vrma", "avatar.fbx", "avatar.vmd", "camera.vmd",
     }
+
+
+def test_dashboard_downloads_go_directly_to_the_attachment_endpoint():
+    assert "location.replace('/api/recording/download/'" in _DASHBOARD_HTML
+    assert ".blob()" not in _DASHBOARD_HTML
+    assert "createObjectURL" not in _DASHBOARD_HTML

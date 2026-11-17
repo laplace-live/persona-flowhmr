@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from persona_flowhmr import motion_vrma
 from persona_flowhmr.motion_vrma import write_vrma
 from persona_flowhmr.retarget import CanonicalPoseFrame
 
@@ -16,7 +17,9 @@ def _pose(i: int) -> CanonicalPoseFrame:
     return CanonicalPoseFrame(i / 30, i / 30, i, quats, np.array([i / 30, 0.8, -0.2]))
 
 
-def test_vrma_hierarchy_and_animation_keys(tmp_path: Path):
+@pytest.mark.parametrize("chunk_size", [1, 2, 1024])
+def test_vrma_hierarchy_and_animation_keys(tmp_path: Path, monkeypatch, chunk_size):
+    monkeypatch.setattr(motion_vrma, "_CHUNK_FRAMES", chunk_size)
     path = tmp_path / "motion.vrma"
     poses = [_pose(i) for i in (90, 91, 93)]
     write_vrma(path, poses)
@@ -63,6 +66,39 @@ def test_vrma_hierarchy_and_animation_keys(tmp_path: Path):
         assert np.all((actual[1:] * actual[:-1]).sum(axis=1) >= 0)
 
 
-def test_vrma_rejects_nonmonotonic_time(tmp_path):
+def test_vrma_rejects_nonmonotonic_time_across_chunks_without_replacing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(motion_vrma, "_CHUNK_FRAMES", 2)
+    path = tmp_path / "motion.vrma"
+    path.write_bytes(b"prior take")
     with pytest.raises(ValueError, match="timestamps"):
-        write_vrma(tmp_path / "motion.vrma", [_pose(8), _pose(8)])
+        write_vrma(path, [_pose(7), _pose(8), _pose(8)])
+    assert path.read_bytes() == b"prior take" and list(tmp_path.iterdir()) == [path]
+
+
+def test_vrma_reads_a_large_source_in_one_bounded_pass(tmp_path, monkeypatch):
+    class LazyTake:
+        passes = 0
+
+        def __len__(self):
+            return 41
+
+        def __getitem__(self, i):
+            assert isinstance(i, int)
+            return _pose(range(len(self))[i])
+
+        def __iter__(self):
+            self.passes += 1
+            return (self[i] for i in range(len(self)))
+
+    original_stack = np.stack
+    chunk_size = 7
+
+    def bounded_stack(values):
+        assert len(values) <= chunk_size
+        return original_stack(values)
+
+    monkeypatch.setattr(motion_vrma, "_CHUNK_FRAMES", chunk_size)
+    monkeypatch.setattr(motion_vrma.np, "stack", bounded_stack)
+    source = LazyTake()
+    write_vrma(tmp_path / "motion.vrma", source)
+    assert source.passes == 1

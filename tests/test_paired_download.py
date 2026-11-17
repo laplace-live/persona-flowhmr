@@ -55,13 +55,23 @@ def test_paired_download_uses_same_take_as_individual_files(recorded_engine, ext
 
 
 def test_paired_download_requires_camera_and_cleans_partial_archive(recorded_engine, monkeypatch, tmp_path):
-    monkeypatch.setattr(web_ui.tempfile, "tempdir", str(tmp_path))
     frames = [replace(frame, camera=None) for frame in recorded_engine.recording.frames()]
     recorded_engine.recording.start()
     recorded_engine.recording.append(frames, mirror=False, follow=True)
     recorded_engine.recording.stop()
+    monkeypatch.setattr(web_ui.tempfile, "tempdir", str(tmp_path))
     with TestClient(web_ui.create_app(recorded_engine)) as client:
         response = client.get("/api/recording/download/avatar-vrma-camera.zip")
         assert response.status_code == 422
         assert "camera" in response.json()["detail"].lower()
         assert not list(tmp_path.iterdir())
+
+
+def test_download_rejects_unlisted_names_before_allocating_files(recorded_engine, monkeypatch):
+    def unexpected_allocation(*args, **kwargs):
+        pytest.fail("Unrecognized downloads must not allocate a temp file")
+
+    monkeypatch.setattr(web_ui.tempfile, "NamedTemporaryFile", unexpected_allocation)
+    with TestClient(web_ui.create_app(recorded_engine)) as client:
+        for name in ("unlisted.vmd", "..%5Cavatar.vmd", "avatar-unknown-camera.zip"):
+            assert client.get(f"/api/recording/download/{name}").status_code == 422

@@ -443,19 +443,25 @@ class StreamingMocapEngine:
         return any(t.is_alive() for t in self._threads)
 
     def begin_recording(self) -> None:
-        with self._lock:
-            if self._video_result == "recording":
-                raise ValueError("A full-video recording is in progress.")
-            if not self._recording_available:
-                raise ValueError("Start a stream before recording.")
-            self._video_result = None
-            self.recording.start()
+        # A queued request could otherwise start a take on a different stream after a restart.
+        if not self._lifecycle_lock.acquire(blocking=False):
+            raise ValueError("Stream controls are busy. Try recording once the stream is ready.")
+        try:
+            with self._lock:
+                if self._video_result == "recording":
+                    raise ValueError("A full-video recording is in progress.")
+                if self._stop_event.is_set() or not self._recording_available:
+                    raise ValueError("Start a stream before recording.")
+                self._video_result = None
+                self.recording.start(lambda: self.telemetry.frames_captured)
+        finally:
+            self._lifecycle_lock.release()
 
     def finish_recording(self) -> None:
         with self._lock:
             if self._video_result == "recording":
                 raise ValueError("Full-video recording finishes at the end of the file. Use Stop to cancel.")
-            self.recording.stop()
+            self.recording.finish(lambda: self.telemetry.frames_captured)
 
     def _close_recording(self) -> None:
         with self._lock:
@@ -497,6 +503,8 @@ class StreamingMocapEngine:
 
     def _store_settings(self, values: dict[str, Any]) -> set[str]:
         changed = {k for k, v in values.items() if getattr(self.config, k) != v}
+        if self.recording.active and (changed - _LIVE_FIELDS):
+            raise ValueError("Finish the current take before changing settings that restart the stream.")
         for k in changed:
             setattr(self.config, k, values[k])
         if changed and self._settings_path is not None:
@@ -1622,6 +1630,7 @@ class StreamingMocapEngine:
             "running": self.is_running,
             "recording": recording,
             "config": self.config.to_dict(),
+            "live_config_fields": sorted(_LIVE_FIELDS),
             "presets": _PRESET_DETAILS,
             "telemetry": vars(self.telemetry).copy(),
             "models": check_models_status(),

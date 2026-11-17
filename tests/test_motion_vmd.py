@@ -62,9 +62,8 @@ def test_avatar_vmd_can_be_decoded_as_mmd_fk(tmp_path):
     assert toggles == {"左足ＩＫ": 0, "右足ＩＫ": 0, "左つま先ＩＫ": 0, "右つま先ＩＫ": 0}
 
 
-def test_camera_vmd_preserves_orbit_fov_and_cuts_on_shared_timeline(tmp_path):
-    pose = _pose()
-    cam = CameraPoseFrame(
+def _camera():
+    return CameraPoseFrame(
         position_rh=np.array([0.0, 1.0, 3.0]),
         quat_rh_xyzw=np.array([0.0, 0.0, 0.0, 1.0]),
         orbit_azimuth=7.4,
@@ -74,6 +73,11 @@ def test_camera_vmd_preserves_orbit_fov_and_cuts_on_shared_timeline(tmp_path):
         roll=-0.15,
         fov_deg=54.8,
     )
+
+
+def test_camera_vmd_preserves_orbit_fov_and_cuts_on_shared_timeline(tmp_path):
+    pose = _pose()
+    cam = _camera()
     path = tmp_path / "camera.vmd"
     write_camera_vmd(
         path,
@@ -117,3 +121,24 @@ def test_vmd_rejects_invalid_motion_values(tmp_path):
     pose.quats_rh_xyzw[0] = 0
     with pytest.raises(ValueError, match="quaternions"):
         write_avatar_vmd(path, [pose])
+
+
+@pytest.mark.parametrize("writer", [write_avatar_vmd, write_camera_vmd])
+@pytest.mark.parametrize("existing", [False, True])
+def test_invalid_later_frame_preserves_destination(tmp_path, writer, existing):
+    path = tmp_path / "take.vmd"
+    valid = replace(_pose(), camera=_camera())
+    if existing:
+        writer(path, [valid])
+        original = path.read_bytes()
+    bad = replace(
+        valid,
+        media_time_s=valid.media_time_s + 1 / 30,
+        quats_rh_xyzw=np.zeros_like(valid.quats_rh_xyzw),
+        camera=replace(valid.camera, fov_deg=float("nan")),
+    )
+    with pytest.raises(ValueError):
+        writer(path, [valid, bad])
+    if existing:
+        assert path.read_bytes() == original
+    assert list(tmp_path.iterdir()) == ([path] if existing else [])

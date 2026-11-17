@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import math
 import struct
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import numpy as np
 
 from .camera_tracker import CameraPoseFrame
+from .motion_io import atomic_motion_stream
 from .motion_skeleton import REFERENCE_HEIGHT_M, REST_HIPS_HEIGHT_M
 from .retarget import CanonicalPoseFrame, quat_mul_xyzw
 
@@ -85,32 +86,34 @@ def _arm_rest_rotations() -> tuple[np.ndarray, np.ndarray]:
 _PARENT_REST, _INVERSE_REST = _arm_rest_rotations()
 
 
-def _vmd_timeline(frames: Sequence[CanonicalPoseFrame]) -> dict[int, CanonicalPoseFrame]:
+def _vmd_timeline(frames: Sequence[CanonicalPoseFrame]) -> Iterator[tuple[int, CanonicalPoseFrame]]:
     if not frames:
         raise ValueError("VMD export requires at least one motion frame")
     origin = frames[0].media_time_s
-    keys = {}
-    previous = -math.inf
+    last: tuple[int, CanonicalPoseFrame] | None = None
     for frame in frames:
         time = frame.media_time_s
-        if not math.isfinite(time) or time < previous:
+        if not math.isfinite(time) or (last is not None and time < last[1].media_time_s):
             raise ValueError("VMD timestamps must be finite and chronological")
         number = round((time - origin) * 30)
         if number > 0xFFFFFFFF:
             raise ValueError("VMD duration exceeds the 32-bit frame limit")
         # VMD is fixed at 30 fps. Last key wins if multiple samples land on one tick.
-        keys[number] = frame
-        previous = time
-    return keys
+        if last is not None and number != last[0]:
+            yield last
+        last = (number, frame)
+    if last is not None:
+        yield last
 
 
 def write_avatar_vmd(path: Path, frames: Sequence[CanonicalPoseFrame]) -> None:
     """Write root motion and local bone rotations on the 30 Hz media timeline."""
-    keys = _vmd_timeline(frames)
-    with Path(path).open("wb") as stream:
+    with atomic_motion_stream(path) as stream:
         stream.write(_HEADER.pack(_SIGNATURE, b"FlowHMR"))
-        stream.write(struct.pack("<I", len(keys) * len(_BONE_FIELDS)))
-        for number, pose in keys.items():
+        count_offset = stream.tell()
+        stream.write(bytes(4))
+        count = 0
+        for number, pose in _vmd_timeline(frames):
             norms = np.linalg.norm(pose.quats_rh_xyzw, axis=1)
             if not np.all(np.isfinite(pose.hips_pos_rh)) or not np.all(np.isfinite(norms) & (norms > 1e-8)):
                 raise ValueError("VMD requires finite hips positions and nonzero finite quaternions")
@@ -122,20 +125,21 @@ def write_avatar_vmd(path: Path, frames: Sequence[CanonicalPoseFrame]) -> None:
             for index, name in _BONE_FIELDS:
                 position = center if index == 0 else (0.0, 0.0, 0.0)
                 stream.write(_BONE.pack(name, number, *position, *rotations[index], _BONE_LINEAR))
+            count += len(_BONE_FIELDS)
         # Empty morph/camera/light/shadow sections. Disable the model's default
         # foot and toe IK at frame zero so they cannot override the exported FK.
         stream.write(struct.pack("<5I", 0, 0, 0, 0, 1))
         stream.write(struct.pack("<IBI", 0, 1, len(_IK_NAMES)))
         for name in _IK_NAMES:
             stream.write(struct.pack("<20sB", name, 0))
+        stream.seek(count_offset)
+        stream.write(struct.pack("<I", count))
 
 
-def write_camera_vmd(path: Path, frames: Sequence[CanonicalPoseFrame]) -> None:
-    """Write target, distance, pitch/yaw/roll, and vertical FOV on the avatar timeline."""
-    keys: dict[int, CameraPoseFrame] = {}
+def _camera_keys(frames: Sequence[CanonicalPoseFrame]) -> Iterator[tuple[int, CameraPoseFrame]]:
     previous: CameraPoseFrame | None = None
     previous_number = -1
-    for number, pose in _vmd_timeline(frames).items():
+    for number, pose in _vmd_timeline(frames):
         # Live camera output holds its last pose while tracking is disabled.
         # Keep the camera clip aligned to the avatar through the end of the take.
         camera = pose.camera or previous
@@ -144,15 +148,22 @@ def write_camera_vmd(path: Path, frames: Sequence[CanonicalPoseFrame]) -> None:
         if camera.is_cut and previous is not None and number - previous_number > 1:
             # Adjacent camera keys switch instantly in MMD. Preserve the cut even
             # when the tracker skipped samples between the shots.
-            keys[number - 1] = previous
-        keys[number] = camera
+            yield number - 1, previous
+        yield number, camera
         previous, previous_number = camera, number
-    if not keys:
+    if previous is None:
         raise ValueError("Camera VMD export requires tracked camera poses")
-    with Path(path).open("wb") as stream:
+
+
+def write_camera_vmd(path: Path, frames: Sequence[CanonicalPoseFrame]) -> None:
+    """Write target, distance, pitch/yaw/roll, and vertical FOV on the avatar timeline."""
+    with atomic_motion_stream(path) as stream:
         stream.write(_HEADER.pack(_SIGNATURE, "カメラ・照明".encode("shift_jis")))
-        stream.write(struct.pack("<3I", 0, 0, len(keys)))
-        for number, cam in keys.items():
+        stream.write(bytes(8))  # bone and morph key counts
+        count_offset = stream.tell()
+        stream.write(bytes(4))
+        count = 0
+        for count, (number, cam) in enumerate(_camera_keys(frames), start=1):
             if not np.all(np.isfinite([
                 *cam.orbit_target_rh, cam.orbit_distance, cam.orbit_elevation, cam.orbit_azimuth, cam.roll, cam.fov_deg,
             ])) or not 1 <= cam.fov_deg <= 179:
@@ -171,3 +182,5 @@ def write_camera_vmd(path: Path, frames: Sequence[CanonicalPoseFrame]) -> None:
                 )
             )
         stream.write(struct.pack("<3I", 0, 0, 0))
+        stream.seek(count_offset)
+        stream.write(struct.pack("<I", count))

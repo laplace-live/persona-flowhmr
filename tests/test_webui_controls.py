@@ -98,7 +98,7 @@ def test_recording_controls_and_download_cleanup(monkeypatch, tmp_path):
     with TestClient(web_ui.create_app(eng)) as client:
         assert client.post("/api/recording/start").status_code == 409
         monkeypatch.setattr(eng, "_recording_available", True)
-        manual = {"available": True, "full_video": False, "video_result": None, "has_camera": False}
+        manual = {"available": True, "full_video": False, "video_result": None, "has_camera": False, "finishing": False}
         assert client.post("/api/recording/start").json()["recording"] == manual | {"active": True, "frames": 0}
         assert client.get("/api/recording/download/avatar.vmd").status_code == 409
         assert client.post("/api/recording/stop").json()["recording"]["active"] is False
@@ -106,8 +106,12 @@ def test_recording_controls_and_download_cleanup(monkeypatch, tmp_path):
 
         client.post("/api/recording/start")
         frame = CanonicalPoseFrame(0., 100., 0, np.tile([0., 0., 0., 1.], (52, 1)), np.array([0., 1., 0.]))
+        eng.telemetry.frames_captured = 1
+        pending = client.post("/api/recording/stop").json()["recording"]
+        assert pending["active"] and pending["finishing"] and pending["frames"] == 0
+        assert client.get("/api/recording/download/avatar.vmd").status_code == 409
         eng.recording.append([frame], mirror=False, follow=True)
-        assert client.post("/api/recording/stop").json()["recording"] == manual | {"active": False, "frames": 1}
+        assert client.get("/api/status").json()["recording"] == manual | {"active": False, "frames": 1}
         temp_dir = tmp_path / "downloads"
         temp_dir.mkdir()
         monkeypatch.setattr(web_ui.tempfile, "tempdir", str(temp_dir))
@@ -125,9 +129,11 @@ def test_recording_controls_and_download_cleanup(monkeypatch, tmp_path):
 
         client.post("/api/recording/start")
         camera = decompose_three_camera_pose(np.array([0, 1, 3]), np.eye(3), 3., 50.)
-        eng.recording.append([replace(frame, camera=camera)], mirror=False, follow=True)
+        eng.telemetry.frames_captured = 2
+        eng.recording.append([replace(frame, frame_index=1, media_time_s=1 / 30, camera=camera)], mirror=False, follow=True)
         client.post("/api/recording/stop")
+        take_files = set(temp_dir.iterdir())
         response = client.get("/api/recording/download/camera.vmd")
         assert response.status_code == 200
         assert response.content[30:50].rstrip(b"\0").decode("shift_jis") == "カメラ・照明"
-        assert not list(temp_dir.iterdir())
+        assert set(temp_dir.iterdir()) == take_files

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from persona_flowhmr import engine, web_ui
+from persona_flowhmr import engine, recorded_frames, web_ui
 from persona_flowhmr.config import EngineConfig
 from persona_flowhmr.sources import SampledFrame
 
@@ -83,6 +83,20 @@ def test_empty_or_unreadable_video_finishes_with_error(video_engine, monkeypatch
     assert status["telemetry"]["state"] == "error"
     assert ("decoder failed" if failure else "no readable frames") in status["telemetry"]["error"]
     source.close.assert_called_once()
+
+
+def test_final_spool_write_failure_is_reported_before_full_video_completes(video_engine, monkeypatch):
+    source = Mock()
+    source.read_next.side_effect = [SampledFrame(0, 0, 1, np.zeros((32, 32, 3), dtype=np.uint8)), None]
+    monkeypatch.setattr(engine, "VideoFileSource", Mock(return_value=source))
+    spool = Mock()
+    spool.write.side_effect = OSError("disk full")
+    monkeypatch.setattr(recorded_frames, "TemporaryFile", Mock(return_value=spool))
+    video_engine.record_video()
+    status = _wait_for_end(video_engine)
+    assert status["recording"]["video_result"] == "error"
+    assert status["recording"]["frames"] == 0
+    assert "disk full" in status["telemetry"]["error"]
 
 
 def test_cancelling_armed_video_and_conflicting_controls(video_engine, monkeypatch):

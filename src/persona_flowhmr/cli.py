@@ -264,6 +264,54 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _restore_output(dest: Path, backup: Path | None, staged_stat: os.stat_result) -> None:
+    try:
+        current = dest.lstat()
+    except FileNotFoundError:
+        current = None
+    if current is not None and (
+        not os.path.samestat(current, staged_stat)
+        or (current.st_size, current.st_mtime_ns) != (staged_stat.st_size, staged_stat.st_mtime_ns)
+    ):
+        if backup is not None:
+            raise OSError(f"{dest} changed during export. The previous file is at {backup}")
+        return
+    if backup is None and current is not None:
+        dest.unlink(missing_ok=True)
+    elif backup is not None:
+        try:
+            backup.replace(dest)
+        except OSError as exc:
+            raise OSError(f"Could not restore {dest}. The previous file is at {backup}: {exc}") from exc
+
+
+def _publish_outputs(staged: list[tuple[Path, Path]]) -> None:
+    """Install a take as a group, keeping displaced files on their original filesystem."""
+    if len(staged) == 1:
+        tmp, dest = staged[0]
+        tmp.replace(dest)
+        return
+    backups = []
+    with contextlib.ExitStack() as rollback:
+        for tmp, dest in staged:
+            staged_stat = tmp.stat()
+            backup = None
+            if dest.is_file() or dest.is_symlink():
+                with tempfile.NamedTemporaryFile(dir=dest.parent, suffix=".bak", delete=False) as fp:
+                    backup = Path(fp.name)
+                try:
+                    dest.replace(backup)
+                except BaseException:
+                    backup.unlink(missing_ok=True)
+                    raise
+                backups.append(backup)
+            rollback.callback(_restore_output, dest, backup, staged_stat)
+            tmp.replace(dest)
+        rollback.pop_all()
+    for backup in backups:
+        backup.unlink()
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     """Solve a finite video once and serialize each requested track at the source rate."""
     from .engine import StreamingMocapEngine
@@ -309,8 +357,8 @@ def cmd_export(args: argparse.Namespace) -> int:
                 cleanup.callback(tmp.unlink, missing_ok=True)
                 write_motion(tmp, frames, camera=camera)
                 staged.append((tmp, dest))
-            for tmp, dest in staged:
-                tmp.replace(dest)
+            _publish_outputs(staged)
+            for _, dest in staged:
                 print(f"Wrote {dest} ({len(frames)} source frames at 30 Hz)")
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"Export failed: {exc}", file=sys.stderr)

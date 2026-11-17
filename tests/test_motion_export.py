@@ -1,5 +1,6 @@
 import json
 import struct
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -7,8 +8,9 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from persona_flowhmr import cli, engine, motion_vmd
+from persona_flowhmr import cli, engine, motion_vmd, recorded_frames
 from persona_flowhmr.camera_tracker import CameraPoseFrame
+from persona_flowhmr.config import EngineConfig
 from persona_flowhmr.motion_export import MotionRecording
 from persona_flowhmr.retarget import CanonicalPoseFrame
 from persona_flowhmr.sources import SampledFrame
@@ -75,6 +77,81 @@ def test_recording_lifecycle_preserves_finished_take_during_next_recording():
     rec.stop()
     assert [f.frame_index for f in first] == [1]
     assert [f.frame_index for f in rec.frames()] == [3]
+
+
+@pytest.mark.parametrize("failure", [0, OSError("disk full")])
+def test_spool_retries_short_writes_and_preserves_committed_frames(monkeypatch, tmp_path, failure):
+    frames = recorded_frames.RecordedFrames()
+    with (tmp_path / "spool").open("w+b", buffering=0) as raw:
+        spool = Mock(wraps=raw)
+        factory = Mock(return_value=spool)
+        monkeypatch.setattr(recorded_frames, "TemporaryFile", factory)
+        spool.write.side_effect = lambda view: raw.write(view[:97])
+        frames.extend([_frame(0), _frame(1)])
+        factory.assert_called_once_with(buffering=0)
+        assert spool.write.call_count > 1
+        expected_size = raw.tell()
+
+        def incomplete_batch(view):
+            if raw.tell() == expected_size:
+                return raw.write(view[:97])
+            if isinstance(failure, OSError):
+                raise failure
+            return failure
+
+        spool.write.side_effect = incomplete_batch
+        with pytest.raises(OSError):
+            frames.extend([_frame(2)])
+        assert raw.seek(0, 2) == expected_size
+        assert [frame.frame_index for frame in frames] == [0, 1]
+        spool.write.side_effect = raw.write
+        frames.extend([_frame(3)])
+        assert [frame.frame_index for frame in frames] == [0, 1, 3]
+
+
+def test_manual_capture_interval_filters_delayed_batches_and_finishes_without_another_click():
+    stream = engine.StreamingMocapEngine(EngineConfig())
+    stream._recording_available = True
+    stream.telemetry.frames_captured = 3
+    stream.begin_recording()
+    stream.telemetry.frames_captured = 7
+    poses = [replace(_frame(i), camera=None) if 3 <= i < 7 else _frame(i) for i in range(10)]
+    stream.recording.append(poses[:5], mirror=False, follow=True)
+    stream.finish_recording()
+    assert stream.recording.status() == {"active": True, "finishing": True, "frames": 2, "has_camera": False}
+    stream.telemetry.frames_captured = len(poses)
+    stream.finish_recording()  # A retried request keeps the original upper boundary.
+    with pytest.raises(ValueError, match="final frames"):
+        stream.begin_recording()
+    stream.recording.append(poses[5:], mirror=False, follow=True)
+    assert stream.recording.status() == {"active": False, "finishing": False, "frames": 4, "has_camera": False}
+    assert [p.frame_index for p in stream.recording.frames()] == [3, 4, 5, 6]
+
+
+def test_empty_manual_interval_finishes_immediately_despite_uncommitted_frames():
+    stream = engine.StreamingMocapEngine(EngineConfig())
+    stream._recording_available = True
+    stream.telemetry.frames_captured = 3
+    stream.begin_recording()
+    stream.finish_recording()
+    assert not stream.recording.active
+    stream.recording.append([_frame(i) for i in range(3)], mirror=False, follow=True)
+    with pytest.raises(ValueError, match="No motion"):
+        stream.recording.frames()
+
+
+def test_stopping_stream_releases_partially_drained_manual_take():
+    stream = engine.StreamingMocapEngine(EngineConfig())
+    stream._recording_available = True
+    stream.begin_recording()
+    stream.telemetry.frames_captured = 3
+    stream.finish_recording()
+    stream.recording.append([_frame(0)], mirror=False, follow=True)
+    assert stream.recording.status()["finishing"]
+    stream.stop()
+    assert not stream.recording.status()["finishing"]
+    stream.recording.append([_frame(1)], mirror=False, follow=True)
+    assert [p.frame_index for p in stream.recording.frames()] == [0]
 
 
 @pytest.fixture
@@ -169,6 +246,34 @@ def test_cli_writer_failure_preserves_previous_files(source_file, tmp_path, infe
     assert avatar.read_bytes() == b"previous take"
     assert set(tmp_path.iterdir()) == {source_file, avatar}
     inference.return_value.stop.assert_called_once()
+
+
+@pytest.mark.parametrize("phase", ["backup", "install"])
+def test_cli_rolls_back_published_outputs(source_file, tmp_path, inference, monkeypatch, capsys, phase):
+    avatar = tmp_path / "avatar.vrma"
+    new_avatar = tmp_path / "new-avatar.fbx"
+    camera = tmp_path / "camera.vmd"
+    unrelated = tmp_path / "avatar.bak"
+    avatar.write_bytes(b"earlier avatar")
+    camera.write_bytes(b"earlier camera")
+    unrelated.write_bytes(b"unrelated backup")
+    replace_file = Path.replace
+
+    def fail_on_camera(path, target):
+        if (phase == "backup" and path == camera) or (phase == "install" and target == camera and path.suffix != ".bak"):
+            assert avatar.read_bytes().startswith(b"glTF")
+            assert new_avatar.exists()
+            raise PermissionError("camera locked")
+        return replace_file(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_on_camera)
+    args = ["export", "--video", str(source_file), "--avatar", str(avatar), "--avatar", str(new_avatar)]
+    assert cli.main([*args, "--camera-motion", str(camera)]) == 1
+    assert "camera locked" in capsys.readouterr().err
+    assert avatar.read_bytes() == b"earlier avatar"
+    assert camera.read_bytes() == b"earlier camera"
+    assert unrelated.read_bytes() == b"unrelated backup"
+    assert set(tmp_path.iterdir()) == {source_file, avatar, camera, unrelated}
 
 
 @pytest.mark.parametrize(

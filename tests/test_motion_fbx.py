@@ -4,8 +4,10 @@ import struct
 from pathlib import Path
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
+from persona_flowhmr import motion_fbx
 from persona_flowhmr.motion_fbx import write_fbx
 from persona_flowhmr.retarget import CanonicalPoseFrame
 
@@ -44,7 +46,16 @@ def _records(data, offset, end):
         offset = stop
 
 
-def test_fbx_preserves_skeleton_timing_root_translation_and_local_rotations(tmp_path: Path):
+def test_fbx_preserves_skeleton_timing_root_translation_and_local_rotations(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(motion_fbx, "_BLOCK_FRAMES", 2)
+    batch_sizes = []
+    to_eulers = motion_fbx._continuous_eulers
+
+    def convert(quats, previous):
+        batch_sizes.append(len(quats))
+        return to_eulers(quats, previous)
+
+    monkeypatch.setattr(motion_fbx, "_continuous_eulers", convert)
     frames = []
     for i, pitch in enumerate((85, 91, 96)):
         quats = np.tile([0.0, 0.0, 0.0, 1.0], (52, 1))
@@ -53,6 +64,7 @@ def test_fbx_preserves_skeleton_timing_root_translation_and_local_rotations(tmp_
         frames.append(CanonicalPoseFrame(index / 30, index / 30, index, quats, np.array([i * 0.1, 0.9, 0.0])))
     path = tmp_path / "clip.fbx"
     write_fbx(path, frames)
+    assert batch_sizes == [2, 1]  # Euler continuity spans the conversion boundary.
     data = path.read_bytes()
     assert data.startswith(b"Kaydara FBX Binary  \x00\x1a\x00" + struct.pack("<I", 7400))
     sections = {name: children for name, _, children in _records(data, 27, len(data))}
@@ -81,3 +93,18 @@ def test_fbx_preserves_skeleton_timing_root_translation_and_local_rotations(tmp_
     np.testing.assert_allclose(hips, [[0, 90, 0], [10, 90, 0], [20, 90, 0]])
     eulers = read_track("mixamorigLeftHandIndex1", "Lcl Rotation")
     np.testing.assert_allclose(eulers, [[13, 85, -52], [13, 91, -52], [13, 96, -52]], atol=1e-4)
+
+
+def test_fbx_rejects_unrepresentable_offsets_before_reading_frames(tmp_path: Path):
+    class HugeTake:
+        def __len__(self):
+            return 3_000_000
+
+        def __getitem__(self, index):
+            raise AssertionError("oversized take should be rejected before reading frames")
+
+    path = tmp_path / "take.fbx"
+    path.write_bytes(b"earlier take")
+    with pytest.raises(ValueError, match="4 GiB"):
+        write_fbx(path, HugeTake())
+    assert path.read_bytes() == b"earlier take"
