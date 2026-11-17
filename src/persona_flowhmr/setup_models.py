@@ -159,6 +159,7 @@ def download_missing_models(hf_token: str | None = None) -> dict[str, Any]:
         ("checkpoints/flowhmr_latest/flowhmr_latest.ckpt", FLOWHMR_CKPT_PATH),
         ("checkpoints/flowhmr_latest/config.yml", FLOWHMR_CFG_PATH),
         ("assets/body_models/smpl_neutral_J_regressor.pt", J_REGRESSOR_PATH),
+        ("assets/motion_stats.json", MOTION_STATS_PATH),
     ):
         if not dst.is_file():
             dst.parent.mkdir(parents=True, exist_ok=True)
