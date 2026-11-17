@@ -68,7 +68,25 @@ uv run persona-flowhmr run \
 uv run persona-flowhmr run --source camera --camera 0 --preset low --fps 60 --mirror
 ```
 
-### 3. Tests & Linting
+### 3. Export avatar and camera motion
+
+To export a complete video, specify one or more destinations. The CLI solves the video once, including its final partial window, and writes the selected tracks at 30 Hz.
+
+```bash
+uv run persona-flowhmr export --video "dance.mp4" \
+  --avatar output/dance.vrma --avatar output/dance.fbx \
+  --avatar output/dance.vmd --camera-motion output/dance-camera.vmd
+```
+
+VRMA and binary FBX contain 52 animated joints and hips travel. FBX uses Mixamo bone names. Avatar VMD targets standard Japanese MMD bone names and combines the two chest rotations. Camera VMD stores the tracked orbit target, distance, rotation, and vertical field of view. In Persona, import the avatar file under **Animations** and the camera file under **Camera Motion**.
+
+In the dashboard, enable **Auto-record when I select a video**, then browse for a file or enter its path. The dashboard records from frame zero through the last frame and finishes automatically, even when **Loop Debug Video** is checked. For a file already selected, use **Record full video**. Full-video recording runs at the speed of inference. It also works when the machine cannot process the clip in real time.
+
+Enable **Dynamic 6-DoF Camera Tracking** to capture avatar and camera together. Under **Motion recording**, choose a paired ZIP to download your avatar format and the synchronized camera VMD, or download either track individually. All downloads use the same take.
+
+For a live camera or an excerpt from a running stream, use **Record take** and **Finish take**. The take follows the mirror and root-movement settings and stays in memory until a new take starts or the server exits.
+
+### 4. Tests & Linting
 ```bash
 uv run pytest -v
 uv run ruff check

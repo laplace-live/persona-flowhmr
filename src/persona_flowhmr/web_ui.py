@@ -8,18 +8,22 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette.types import Receive, Scope, Send
 
 from . import __version__
 from .engine import StreamingMocapEngine
+from .motion_export import AVATAR_FORMATS, write_motion
 from .setup_models import check_models_status, download_missing_models
 from .sources import list_available_cameras
 
@@ -30,6 +34,14 @@ class SetupModelsRequest(BaseModel):
 
 class PickVideoRequest(BaseModel):
     current_path: str | None = None
+
+
+class _MotionDownload(FileResponse):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            Path(self.path).unlink(missing_ok=True)
 
 
 _PICKER_LOCK = threading.Lock()
@@ -179,8 +191,8 @@ _DASHBOARD_HTML = """<!doctype html>
       <span id="stateBadge" class="badge">STOPPED</span>
     </div>
     <div class="actions">
-      <button class="primary" onclick="startEngine()">Start Stream</button>
-      <button class="danger" onclick="stopEngine()">Stop</button>
+      <button id="startStream" class="primary" onclick="startEngine()">Start Stream</button>
+      <button id="stopStream" class="danger" onclick="stopEngine()">Stop</button>
     </div>
   </header>
   <main>
@@ -200,7 +212,10 @@ _DASHBOARD_HTML = """<!doctype html>
             <input type="text" id="video_path" data-cfg placeholder="Select or enter video path..." />
             <button id="browseVideoBtn" type="button" style="flex:none;" onclick="pickVideoFile()">Browse…</button>
           </div>
-          <label class="check"><input type="checkbox" id="loop_video" data-cfg checked /> Loop Debug Video</label>
+          <label class="check"><input type="checkbox" id="loop_video" data-cfg checked /> Loop during streaming</label>
+          <label class="check"><input type="checkbox" id="autoRecordVideo" /> Auto-record when I select a video</label>
+          <button id="recordVideo" class="primary" disabled onclick="recordFullVideo()">Record full video</button>
+          <div id="videoRecordStatus" role="status" style="margin-top:8px;color:var(--muted);"></div>
         </div>
         <div id="cameraFields" class="field" style="display:none;">
           <label>Camera Device</label>
@@ -297,7 +312,7 @@ _DASHBOARD_HTML = """<!doctype html>
         <div class="field"><label>Bearer Token (Settings → Developer)</label><input type="password" id="plugin_api_token" data-cfg placeholder="Paste token if enabled" /></div>
         <label class="check"><input type="checkbox" id="plugin_api_sync_camera" data-cfg checked /> Sync Stage Camera (`scene.patch -> vrmCamera`)</label>
         <label class="check"><input type="checkbox" id="plugin_api_inject_params" data-cfg /> Also Inject Live2D Angles (`param.inject`)</label>
-        <button class="primary" style="width:100%;margin-top:6px;" onclick="applyConfig()">Apply Settings</button>
+        <button id="applySettings" class="primary" style="width:100%;margin-top:6px;" onclick="applyConfig()">Apply Settings</button>
       </section>
     </div>
 
@@ -342,12 +357,47 @@ _DASHBOARD_HTML = """<!doctype html>
           <div class="metric"><div class="k">Backend</div><div class="v" id="m_back">—</div></div>
         </div>
       </section>
+      <section class="card" style="margin-top:14px;">
+        <h2>Motion recording</h2>
+        <div class="row" style="flex-wrap:wrap;">
+          <button id="recordTake" disabled onclick="changeRecording()">Record take</button>
+          <select id="exportFile" aria-label="Export files">
+            <optgroup label="Avatar and camera (ZIP)">
+              <option value="avatar-vrma-camera.zip">Avatar VRMA + camera VMD</option>
+              <option value="avatar-fbx-camera.zip">Avatar FBX + camera VMD</option>
+              <option value="avatar-vmd-camera.zip">Avatar VMD + camera VMD</option>
+            </optgroup>
+            <optgroup label="Individual tracks">
+              <option value="avatar.vrma">Avatar · VRMA</option>
+              <option value="avatar.fbx">Avatar · FBX</option>
+              <option value="avatar.vmd">Avatar · VMD</option>
+              <option value="camera.vmd">Camera · VMD</option>
+            </optgroup>
+          </select>
+          <button id="downloadTake" disabled onclick="downloadTake()">Download</button>
+        </div>
+        <div id="takeStatus" style="margin-top:8px;color:var(--muted);"></div>
+        <div id="takeError" role="alert" style="color:var(--bad);"></div>
+      </section>
     </div>
   </main>
 
   <script>
     let initialized = false;
     let saveTimer = null;
+    let saveQueue = Promise.resolve();
+    let latestStatus = null;
+    let startingVideo = false;
+    let pickingVideo = false;
+    let videoStartError = '';
+    const videoPath = document.getElementById('video_path');
+    const autoRecord = document.getElementById('autoRecordVideo');
+    const autoRecordKey = 'persona-flowhmr.autoRecordVideo';
+    try { autoRecord.checked = localStorage.getItem(autoRecordKey) === 'true'; } catch {}
+    autoRecord.addEventListener('change', () => {
+      try { localStorage.setItem(autoRecordKey, String(autoRecord.checked)); } catch {}
+      if (latestStatus) renderRecording(latestStatus);
+    });
     // Config controls carry `data-cfg` (id == EngineConfig field); `data-int` / `data-float` mark numeric fields.
     const cfgFields = () => document.querySelectorAll('[data-cfg]');
     function readField(el) {
@@ -393,13 +443,13 @@ _DASHBOARD_HTML = """<!doctype html>
     }
     async function pickVideoFile() {
       const btn = document.getElementById('browseVideoBtn');
-      const input = document.getElementById('video_path');
+      pickingVideo = true;
       btn.disabled = true;
       try {
         const r = await fetch('/api/pick-video', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({current_path: input.value}),
+          body: JSON.stringify({current_path: videoPath.value}),
         });
         const d = await r.json();
         if (!r.ok) {
@@ -407,11 +457,12 @@ _DASHBOARD_HTML = """<!doctype html>
           return;
         }
         if (d.path) {
-          input.value = d.path;
-          await applyConfig();
+          videoPath.value = d.path;
+          await videoSelected();
         }
       } finally {
-        btn.disabled = false;
+        pickingVideo = false;
+        if (latestStatus) renderRecording(latestStatus);
       }
     }
     function gatherConfig() {
@@ -436,10 +487,15 @@ _DASHBOARD_HTML = """<!doctype html>
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
       };
       const r = await fetch(url, init);
-      if (r.ok) renderStatus(await r.json());
+      const data = await r.json();
+      if (r.ok) renderStatus(data);
+      return r.ok ? null : (data.detail || 'Request failed.');
     }
-    async function applyConfig() {
-      await postStatus('/api/config', gatherConfig());
+    function applyConfig() {
+      clearTimeout(saveTimer);
+      const config = gatherConfig();
+      saveQueue = saveQueue.catch(() => {}).then(() => postStatus('/api/config', config));
+      return saveQueue;
     }
     async function startEngine() {
       await applyConfig();
@@ -447,6 +503,72 @@ _DASHBOARD_HTML = """<!doctype html>
     }
     async function stopEngine() {
       await postStatus('/api/stop');
+    }
+    async function videoSelected() {
+      videoStartError = '';
+      if (autoRecord.checked && videoPath.value.trim()) {
+        await recordFullVideo();
+      } else {
+        await applyConfig();
+      }
+    }
+    async function recordFullVideo() {
+      if (startingVideo || !latestStatus || latestStatus.running || latestStatus.recording.full_video) return;
+      startingVideo = true;
+      videoStartError = '';
+      renderRecording(latestStatus);
+      try {
+        const error = await applyConfig() || await postStatus('/api/recording/video');
+        if (error) throw new Error(error);
+      } catch (e) {
+        videoStartError = e.message;
+      } finally {
+        startingVideo = false;
+        renderRecording(latestStatus);
+        await pollStatus();
+      }
+    }
+    let takeActive = false;
+    let changingTake = false;
+    let downloadingTake = false;
+    async function changeRecording() {
+      changingTake = true;
+      document.getElementById('recordTake').disabled = true;
+      const error = document.getElementById('takeError');
+      error.textContent = '';
+      try {
+        const r = await fetch('/api/recording/' + (takeActive ? 'stop' : 'start'), {method: 'POST'});
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || 'Could not update the recording.');
+        renderStatus(data);
+      } catch (e) {
+        error.textContent = e.message;
+      } finally {
+        changingTake = false;
+        await pollStatus();
+      }
+    }
+    async function downloadTake() {
+      downloadingTake = true;
+      document.getElementById('downloadTake').disabled = true;
+      const error = document.getElementById('takeError');
+      error.textContent = '';
+      try {
+        const filename = document.getElementById('exportFile').value;
+        const r = await fetch('/api/recording/download/' + filename);
+        if (!r.ok) throw new Error((await r.json()).detail || 'Could not export the take.');
+        const url = URL.createObjectURL(await r.blob());
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+      } catch (e) {
+        error.textContent = e.message;
+      } finally {
+        downloadingTake = false;
+        await pollStatus();
+      }
     }
     async function setupSam() {
       const tok = document.getElementById('hf_token').value.trim();
@@ -458,7 +580,47 @@ _DASHBOARD_HTML = """<!doctype html>
       if (d.sam3d_download_error) alert(d.sam3d_download_error);
       await pollStatus();
     }
+    function renderRecording(s) {
+      const take = s.recording;
+      const full = startingVideo || take.full_video;
+      cfgFields().forEach(el => { el.disabled = full; });
+      videoPath.disabled = full || (autoRecord.checked && s.running);
+      document.getElementById('browseVideoBtn').disabled = videoPath.disabled || pickingVideo;
+      document.getElementById('startStream').disabled = full;
+      document.getElementById('applySettings').disabled = full;
+      document.getElementById('stopStream').textContent = take.full_video ? 'Cancel recording' : 'Stop';
+      document.getElementById('recordVideo').disabled = full || s.running || !videoPath.value.trim();
+      const frames = take.frames.toLocaleString() + ' frames';
+      const cameraEnabled = take.full_video ? s.config.camera_tracking_enabled
+        : document.getElementById('camera_tracking_enabled').checked;
+      const tracks = cameraEnabled ? 'avatar and camera' : 'avatar';
+      const progress = take.full_video && take.frames ? 'Recording ' + tracks + ' · ' + frames : 'Preparing video…';
+      const results = {complete: 'Video complete', error: 'Recording failed', cancelled: 'Recording cancelled'};
+      let videoStatus = 'Records ' + tracks + ' from start to end.';
+      if (s.running) videoStatus = 'Stop the stream to record the full video.';
+      if (results[take.video_result]) videoStatus = results[take.video_result] + ' · ' + frames;
+      if (full) videoStatus = progress;
+      document.getElementById('videoRecordStatus').textContent = videoStartError || videoStatus;
+      takeActive = take.active;
+      const recordButton = document.getElementById('recordTake');
+      recordButton.textContent = take.active ? 'Finish take' : (take.frames ? 'Record new take' : 'Record take');
+      recordButton.hidden = full;
+      recordButton.disabled = changingTake || full || (!take.available && !take.active);
+      const ready = !full && !take.active && take.frames > 0;
+      const formats = document.getElementById('exportFile');
+      for (const option of formats.options) {
+        option.disabled = ready && !take.has_camera && option.value.includes('camera');
+      }
+      if (formats.selectedOptions[0]?.disabled) formats.value = 'avatar.vrma';
+      document.getElementById('downloadTake').disabled = downloadingTake || !ready;
+      let takeStatus = take.available ? 'Ready to record' : 'Choose a video or start a stream to record a take.';
+      if (ready) takeStatus = (take.has_camera ? 'Avatar and camera' : 'Avatar') + ' · ' + frames;
+      if (take.active) takeStatus = 'Recording · ' + frames;
+      if (full) takeStatus = progress;
+      document.getElementById('takeStatus').textContent = takeStatus;
+    }
     function renderStatus(s) {
+      latestStatus = s;
       if (!initialized) {
         fillForm(s.config);
         initialized = true;
@@ -466,6 +628,7 @@ _DASHBOARD_HTML = """<!doctype html>
       document.getElementById('plugin_api_token').placeholder = s.config.has_plugin_api_token
         ? 'Token saved (paste to replace)'
         : 'Paste token if enabled';
+      renderRecording(s);
       const t = s.telemetry;
       const badge = document.getElementById('stateBadge');
       badge.textContent = t.state.toUpperCase();
@@ -502,7 +665,11 @@ _DASHBOARD_HTML = """<!doctype html>
         renderStatus(await r.json());
       } catch (_e) {}
     }
-    cfgFields().forEach(el => el.addEventListener('change', scheduleSaveConfig));
+    videoPath.addEventListener('input', () => {
+      videoStartError = '';
+      if (latestStatus) renderRecording(latestStatus);
+    });
+    cfgFields().forEach(el => el.addEventListener('change', el === videoPath ? videoSelected : scheduleSaveConfig));
     setInterval(pollStatus, 400);
     pollStatus();
   </script>
@@ -564,17 +731,69 @@ def create_app(engine: StreamingMocapEngine | None = None) -> FastAPI:
 
     @app.post("/api/config")
     def api_config(patch: dict[str, Any]) -> dict[str, Any]:
-        return eng.update_live_settings(patch)
+        try:
+            return eng.update_live_settings(patch)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def control(action: Callable[[], None]) -> dict[str, Any]:
+        try:
+            action()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return eng.get_status()
 
     @app.post("/api/start")
     def api_start() -> dict[str, Any]:
-        eng.start(realtime_source=True)
-        return eng.get_status()
+        return control(eng.start)
 
     @app.post("/api/stop")
     def api_stop() -> dict[str, Any]:
         eng.stop()
         return eng.get_status()
+
+    @app.post("/api/recording/start")
+    def start_recording() -> dict[str, Any]:
+        return control(eng.begin_recording)
+
+    @app.post("/api/recording/video")
+    def record_video() -> dict[str, Any]:
+        return control(eng.record_video)
+
+    @app.post("/api/recording/stop")
+    def finish_recording() -> dict[str, Any]:
+        return control(eng.finish_recording)
+
+    @app.get("/api/recording/download/{filename}")
+    def download_recording(filename: str) -> FileResponse:
+        camera = filename == "camera.vmd"
+        bundles = {f"avatar-{ext}-camera.zip": f"avatar.{ext}" for ext in AVATAR_FORMATS}
+        avatar = bundles.get(filename)
+        if not camera and avatar is None and filename not in bundles.values():
+            raise HTTPException(status_code=422, detail="Unsupported motion download.")
+        try:
+            frames = eng.recording.frames()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        with tempfile.NamedTemporaryFile(suffix=Path(filename).suffix, delete=False) as temp:
+            path = Path(temp.name)
+        try:
+            if avatar is None:
+                write_motion(path, frames, camera=camera)
+                return _MotionDownload(path, filename=filename, media_type="application/octet-stream")
+            with tempfile.TemporaryDirectory() as folder, ZipFile(path, "w", ZIP_DEFLATED, compresslevel=1) as bundle:
+                # Writing the camera first reports missing tracking before encoding the skeleton.
+                for name in ("camera.vmd", avatar):
+                    track = Path(folder) / name
+                    write_motion(track, frames, camera=name == "camera.vmd")
+                    bundle.write(track, arcname=name)
+                    track.unlink()
+            return _MotionDownload(path, filename=filename, media_type="application/zip")
+        except BaseException as exc:
+            path.unlink(missing_ok=True)
+            if isinstance(exc, ValueError):
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise
 
     @app.post("/api/setup-models")
     def api_setup_models(req: SetupModelsRequest) -> dict[str, Any]:

@@ -37,6 +37,7 @@ from .config import (
     sanitize_avatar_scale,
     sanitize_camera_fov_deg,
 )
+from .motion_export import MotionRecording
 from .paths import FLOWHMR_CFG_PATH, FLOWHMR_CKPT_PATH, MOTION_STATS_PATH, YOLOX_CKPT_PATH, is_sam3d_available
 from .perception import (
     BatchedYoloxTracker,
@@ -399,7 +400,13 @@ class StreamingMocapEngine:
         self.config = config or EngineConfig()
         self._settings_path = Path(settings_path) if settings_path is not None else None
         self._lock = threading.Lock()
+        # Public start/stop/settings requests can arrive from different dashboard tabs.
+        # Workers only take _lock, including when finishing while stop() joins them.
+        self._lifecycle_lock = threading.RLock()
         self.telemetry = EngineTelemetry()
+        self.recording = MotionRecording()
+        self._recording_available = False
+        self._video_result: str | None = None
 
         self._preview = PreviewRingBuffer(max_items=_PREVIEW_FRAMES, max_width=640)
         self._playout_buffer = PosePlayoutBuffer(max_frames=900)
@@ -419,6 +426,7 @@ class StreamingMocapEngine:
         self._decoder: MotionLatentDecoder | None = None
 
         self._stop_event = threading.Event()
+        self._first_commit_event: threading.Event | None = None
         self._queue_event = threading.Event()
         self._threads: list[threading.Thread] = []
         self._peeked_frame: SampledFrame | None = None
@@ -433,8 +441,48 @@ class StreamingMocapEngine:
     def is_running(self) -> bool:
         return any(t.is_alive() for t in self._threads)
 
+    def begin_recording(self) -> None:
+        with self._lock:
+            if self._video_result == "recording":
+                raise ValueError("A full-video recording is in progress.")
+            if not self._recording_available:
+                raise ValueError("Start a stream before recording.")
+            self._video_result = None
+            self.recording.start()
+
+    def finish_recording(self) -> None:
+        with self._lock:
+            if self._video_result == "recording":
+                raise ValueError("Full-video recording finishes at the end of the file. Use Stop to cancel.")
+            self.recording.stop()
+
+    def _close_recording(self) -> None:
+        with self._lock:
+            self._recording_available = False
+            self.recording.stop()
+            if self._video_result == "recording":
+                if self.telemetry.state == "error":
+                    self._video_result = "error"
+                elif self._stop_event.is_set():
+                    self._video_result = "cancelled"
+                elif not self.telemetry.frames_captured:
+                    self.telemetry.state = self._video_result = "error"
+                    self.telemetry.error = "The video contained no readable frames."
+                elif self.recording.status()["frames"] != self.telemetry.frames_captured:
+                    self.telemetry.state = self._video_result = "error"
+                    self.telemetry.error = "The recording ended before all captured poses were committed."
+                else:
+                    self._video_result = "complete"
+                    self.telemetry.state = "stopped"
+
     def update_live_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
         """Apply a (partial) config patch: live fields take effect immediately, others restart a running stream."""
+        with self._lifecycle_lock:
+            if self._video_result == "recording" or (self.is_running and self._stop_event.is_set()):
+                raise ValueError("Wait for the current recording or shutdown to finish before changing settings.")
+            return self._apply_settings(patch)
+
+    def _apply_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
         was_running = self.is_running
         changed: set[str] = set()
 
@@ -467,7 +515,7 @@ class StreamingMocapEngine:
                     self.config.save(self._settings_path)
 
         if was_running and (changed - _LIVE_FIELDS):
-            self.stop()
+            self._stop_workers(wait=True)
             self.start()  # also reconnects the Plugin API client
         elif changed & _PLUGIN_CONNECTION_FIELDS:
             self._sync_plugin_client()
@@ -557,11 +605,27 @@ class StreamingMocapEngine:
             "(or select `replay` backend for pipeline testing)."
         )
 
-    def start(self, *, realtime_source: bool = True) -> None:
+    def start(self, *, realtime_source: bool = True, playout: bool = True) -> None:
         """Start capture, GPU sliding-window inference, and 30/60 Hz VMC playout threads."""
-        if self.is_running:
-            return
+        with self._lifecycle_lock:
+            if self._video_result == "recording":
+                raise ValueError("A full-video recording is in progress.")
+            if self.is_running:
+                if self._stop_event.is_set():
+                    raise ValueError("The previous stream is still stopping.")
+                return
+            self._start_workers(realtime_source=realtime_source, playout=playout, full_video=False)
 
+    def record_video(self) -> None:
+        """Record one complete video at source timestamps, without wall-clock playout."""
+        with self._lifecycle_lock:
+            if self.is_running:
+                raise ValueError("Stop the current stream before recording a full video.")
+            if self.config.source_mode != "video" or not Path(self.config.video_path).is_file():
+                raise ValueError("Choose an existing video file to record.")
+            self._start_workers(realtime_source=False, playout=False, full_video=True)
+
+    def _start_workers(self, *, realtime_source: bool, playout: bool, full_video: bool) -> None:
         self._stop_event.clear()
         self._preview.clear()
         self._playout_buffer.clear()
@@ -582,12 +646,12 @@ class StreamingMocapEngine:
             target_latency_ms=self.config.get_preset().playout_delay_s * 1000.0,
         )
 
-        if self._vmc_sender is None:
-            self._vmc_sender = VmcUdpSender(self.config.vmc_host, self.config.vmc_port)
-        else:
-            self._vmc_sender.set_target(self.config.vmc_host, self.config.vmc_port)
-
-        self._sync_plugin_client()
+        if playout:
+            if self._vmc_sender is None:
+                self._vmc_sender = VmcUdpSender(self.config.vmc_host, self.config.vmc_port)
+            else:
+                self._vmc_sender.set_target(self.config.vmc_host, self.config.vmc_port)
+            self._sync_plugin_client()
 
         preset = self.config.get_preset()
         sam_stride = max(1, self.config.effective_sam_stride())
@@ -598,7 +662,7 @@ class StreamingMocapEngine:
         self._threads = [
             threading.Thread(
                 target=self._capture_worker,
-                args=(frame_queue, warmup_done_event, realtime_source),
+                args=(frame_queue, warmup_done_event, realtime_source, False if full_video else self.config.loop_video),
                 name="mocap-capture",
                 daemon=True,
             ),
@@ -608,23 +672,39 @@ class StreamingMocapEngine:
                 name="mocap-gpu",
                 daemon=True,
             ),
-            threading.Thread(
-                target=self._playout_worker,
-                args=(first_commit_event, realtime_source),
-                name="mocap-playout",
-                daemon=True,
-            ),
         ]
+        if playout:
+            self._threads.append(
+                threading.Thread(
+                    target=self._playout_worker,
+                    args=(first_commit_event, realtime_source),
+                    name="mocap-playout",
+                    daemon=True,
+                )
+            )
+        with self._lock:
+            self._recording_available = True
+            if full_video:
+                self.recording.start()
+                self._video_result = "recording"
+        self._first_commit_event = first_commit_event
         for t in self._threads:
             t.start()
 
     def stop(self) -> None:
+        with self._lifecycle_lock:
+            self._stop_workers()
+
+    def _stop_workers(self, *, wait: bool = False) -> None:
         self._stop_event.set()
+        self._close_recording()
         self._queue_event.set()
+        if self._first_commit_event is not None:
+            self._first_commit_event.set()
         for t in self._threads:
             if t.is_alive():
-                t.join(timeout=3.0)
-        self._threads.clear()
+                t.join(timeout=None if wait else 3.0)
+        self._threads = [thread for thread in self._threads if thread.is_alive()]
         if self._plugin_client is not None:
             self._plugin_client.stop()
             self._plugin_client = None
@@ -669,6 +749,7 @@ class StreamingMocapEngine:
         frame_queue: queue.Queue[SampledFrame | None],
         warmup_done_event: threading.Event,
         realtime_source: bool,
+        loop_video: bool,
     ) -> None:
         source: VideoFileSource | CameraSource | None = None
         try:
@@ -690,7 +771,7 @@ class StreamingMocapEngine:
             else:
                 source = VideoFileSource(
                     self.config.video_path,
-                    loop=self.config.loop_video,
+                    loop=loop_video,
                     realtime=realtime_source,
                     target_fps=MODEL_FPS,
                 )
@@ -1092,6 +1173,7 @@ class StreamingMocapEngine:
             warmup_done_event.set()
             first_commit_event.set()
         finally:
+            self._close_recording()
             if vo_pool is not None:
                 vo_pool.shutdown(wait=True)
 
@@ -1279,6 +1361,8 @@ class StreamingMocapEngine:
                         camera_solver.anchor_stream_origin(cf.hips_pos_rh)
 
             self._playout_buffer.push_many(committed)
+            if self.recording.active:
+                self.recording.append(committed, mirror=self.config.mirror, follow=self.config.follow_movement)
             next_emit_frame += stride
             if not first_commit_event.is_set():
                 self.telemetry.state = "streaming"
@@ -1514,8 +1598,15 @@ class StreamingMocapEngine:
     def get_status(self) -> dict[str, Any]:
         client = self._plugin_client
         self.telemetry.plugin_api_connected = client is not None and client.is_connected
+        with self._lock:
+            recording = self.recording.status() | {
+                "available": self._recording_available,
+                "full_video": self._video_result == "recording",
+                "video_result": self._video_result if self._video_result != "recording" else None,
+            }
         return {
             "running": self.is_running,
+            "recording": recording,
             "config": self.config.to_dict(),
             "presets": _PRESET_DETAILS,
             "telemetry": vars(self.telemetry).copy(),
