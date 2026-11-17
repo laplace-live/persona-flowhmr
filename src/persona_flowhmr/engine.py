@@ -11,7 +11,8 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,16 +25,24 @@ from .camera_tracker import (
     FrameCameraObservation,
     ShotCutDetector,
     StreamingCameraSolver,
-    camera_to_persona_vrm_camera,
     camera_to_vmc_transform,
+    yup_rel_to_opencv_camera_r,
 )
-from .config import CONFIG_FIELDS, LATENCY_PRESETS, MODEL_FPS, EngineConfig, LatencyPreset
+from .config import (
+    CONFIG_FIELDS,
+    LATENCY_PRESETS,
+    MODEL_FPS,
+    EngineConfig,
+    LatencyPreset,
+    sanitize_avatar_scale,
+    sanitize_camera_fov_deg,
+)
 from .paths import FLOWHMR_CFG_PATH, FLOWHMR_CKPT_PATH, MOTION_STATS_PATH, YOLOX_CKPT_PATH, is_sam3d_available
 from .perception import (
     BatchedYoloxTracker,
     ReplayTokenExtractor,
     Sam3DStreamExtractor,
-    default_camera_intrinsics,
+    camera_intrinsics,
 )
 from .persona_api import PersonaPluginClient
 from .playout import PosePlayoutBuffer
@@ -82,6 +91,7 @@ _LIVE_FIELDS = frozenset(
         "follow_movement",
         "camera_tracking_enabled",
         "camera_avatar_scale",
+        "camera_fov_deg",
         "vmc_enabled",
         "vmc_host",
         "vmc_port",
@@ -411,6 +421,9 @@ class StreamingMocapEngine:
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
         self._peeked_frame: SampledFrame | None = None
+        self._evicted_lock = threading.Lock()
+        self._evicted_switch = False
+        self._evicted_reset = False
 
     @property
     def is_running(self) -> bool:
@@ -428,9 +441,19 @@ class StreamingMocapEngine:
                 if k == "plugin_api_token" and v == "" and not patch.get("clear_plugin_api_token", False):
                     # Empty token from redacted UI form keeps existing token unless explicitly cleared.
                     continue
+                if k == "camera_avatar_scale":
+                    v = sanitize_avatar_scale(v)
+                elif k == "camera_fov_deg":
+                    v = sanitize_camera_fov_deg(v)
                 if getattr(self.config, k) != v:
                     setattr(self.config, k, v)
                     changed.add(k)
+
+            if not self.config.camera_tracking_enabled:
+                self.telemetry.camera_distance_m = 0.0
+                self.telemetry.camera_azimuth_deg = 0.0
+                self.telemetry.camera_elevation_deg = 0.0
+                self.telemetry.camera_fov_deg = 0.0
 
             if self._vmc_sender is not None:
                 self._vmc_sender.set_target(self.config.vmc_host, int(self.config.vmc_port))
@@ -464,7 +487,10 @@ class StreamingMocapEngine:
         )
         client.start(timeout_s=3.0)
         self._plugin_client = client
-        self._configure_plugin_receiver()
+        if self.config.plugin_api_auto_configure_vmc:
+            self._configure_plugin_receiver()
+        elif client.is_connected:
+            client.refresh_vrm_placement()
 
     def _configure_plugin_receiver(self) -> None:
         """Ensure Persona has an enabled `vmc` source on our port, bound to the primary VRM avatar."""
@@ -538,6 +564,9 @@ class StreamingMocapEngine:
         self._latest_emitted_pose = None
         self._frame0_mono = 0.0
         self._peeked_frame = None
+        with self._evicted_lock:
+            self._evicted_switch = False
+            self._evicted_reset = False
         self._live_jpeg.clear()
         self._synced_jpeg.clear()
         self.telemetry = EngineTelemetry(
@@ -600,7 +629,7 @@ class StreamingMocapEngine:
         *,
         drop_oldest: bool = False,
     ) -> None:
-        """Block until `item` is queued or the engine stops; `drop_oldest` evicts stale frames instead of waiting."""
+        """Block until `item` is queued or the engine stops; `drop_oldest` evicts stale frames while preserving switch/reset boundaries."""
         while not self._stop_event.is_set():
             try:
                 frame_queue.put(item, timeout=0.1)
@@ -608,7 +637,11 @@ class StreamingMocapEngine:
             except queue.Full:
                 if drop_oldest:
                     with contextlib.suppress(queue.Empty):
-                        frame_queue.get_nowait()
+                        evicted = frame_queue.get_nowait()
+                        if evicted is not None and (evicted.is_camera_switch or evicted.is_stream_reset):
+                            with self._evicted_lock:
+                                self._evicted_switch = self._evicted_switch or evicted.is_camera_switch
+                                self._evicted_reset = self._evicted_reset or evicted.is_stream_reset
 
     def _capture_worker(
         self,
@@ -654,12 +687,19 @@ class StreamingMocapEngine:
                         break
 
                 if isinstance(source, CameraSource) and source.camera_index != int(self.config.camera_index):
-                    source.switch_device(
-                        self.config.camera_index,
-                        width=self.config.camera_width,
-                        height=self.config.camera_height,
-                        target_fps=MODEL_FPS,
-                    )
+                    try:
+                        source.switch_device(
+                            self.config.camera_index,
+                            width=self.config.camera_width,
+                            height=self.config.camera_height,
+                            target_fps=MODEL_FPS,
+                        )
+                        if self.telemetry.error.startswith("Camera switch failed:"):
+                            self.telemetry.error = ""
+                    except Exception as exc:
+                        # Keep streaming from the active camera if the newly selected device fails to open.
+                        self.config.camera_index = source.camera_index
+                        self.telemetry.error = f"Camera switch failed: {exc}"
                 sample = source.read_next()
                 if sample is None:
                     break
@@ -699,6 +739,17 @@ class StreamingMocapEngine:
                 continue
             if item is None:
                 return batch, True
+            with self._evicted_lock:
+                carry_sw = self._evicted_switch
+                carry_rst = self._evicted_reset
+                self._evicted_switch = False
+                self._evicted_reset = False
+            if carry_sw or carry_rst:
+                item = replace(
+                    item,
+                    is_camera_switch=item.is_camera_switch or carry_sw,
+                    is_stream_reset=item.is_stream_reset or carry_rst,
+                )
             if batch and item.rgb.shape != batch[0].rgb.shape:
                 # Split batch cleanly at a live camera resolution change so stacked tensors stay homogeneous.
                 self._peeked_frame = item
@@ -712,6 +763,7 @@ class StreamingMocapEngine:
         warmup_done_event: threading.Event,
         first_commit_event: threading.Event,
     ) -> None:
+        vo_pool: ThreadPoolExecutor | None = None
         try:
             extractor, active_backend = self._ensure_models_loaded()
             self.telemetry.active_backend = active_backend
@@ -729,7 +781,7 @@ class StreamingMocapEngine:
             # never pay Dynamo/Triton compilation latency mid-stream.
             yolox.warmup(max(1, (kf_chunk * sam_stride + yolox.yolo_stride) // yolox.yolo_stride))
             if is_sam:
-                extractor.warmup()
+                extractor.warmup(include_camera=bool(self.config.camera_tracking_enabled))
             self._solver.warmup(preset.window_frames, steps=2)
             if self._stop_event.is_set():
                 warmup_done_event.set()
@@ -738,11 +790,18 @@ class StreamingMocapEngine:
             self.telemetry.state = "buffering"
             warmup_done_event.set()
             stitcher = StreamingStitcher(self._decoder, fps=MODEL_FPS)
-            cut_detector = ShotCutDetector()
-            vo_tracker = BackgroundVisualOdometry()
-            camera_solver = StreamingCameraSolver(avatar_scale=float(self.config.camera_avatar_scale))
+            cut_detector: ShotCutDetector | None = None
+            vo_tracker: BackgroundVisualOdometry | None = None
+            camera_solver: StreamingCameraSolver | None = None
+            stream_frame0_hips: list[np.ndarray | None] = [None]
             shot_id = 0
             prev_track_cam = bool(self.config.camera_tracking_enabled)
+            if prev_track_cam:
+                cut_detector = ShotCutDetector()
+                vo_tracker = BackgroundVisualOdometry()
+                camera_solver = StreamingCameraSolver(avatar_scale=sanitize_avatar_scale(self.config.camera_avatar_scale))
+                vo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mocap-vo")
+
             history: deque[FrameFeatureItem] = deque(maxlen=preset.window_frames + 128)
             keyframes = _KeyframeInterpolator()
             next_emit_frame = 0
@@ -765,19 +824,32 @@ class StreamingMocapEngine:
                     rgb_list = [s.rgb for s in batch]
                     stream_resets = [s.is_stream_reset for s in batch]
                     h, w = rgb_list[0].shape[:2]
-                    cam_k0 = default_camera_intrinsics(h, w)
+                    fov_cfg = sanitize_camera_fov_deg(self.config.camera_fov_deg)
+                    cam_k0 = camera_intrinsics(h, w, fov_deg=fov_cfg)
                     cam_k = np.repeat(cam_k0[None], len(batch), axis=0)
 
                     cut_flags: list[bool] = []
                     shot_ids: list[int] = []
                     if track_cam:
-                        if toggled_cam_on:
+                        if cut_detector is None or vo_tracker is None or camera_solver is None:
+                            cut_detector = ShotCutDetector()
+                            vo_tracker = BackgroundVisualOdometry()
+                            camera_solver = StreamingCameraSolver(
+                                avatar_scale=sanitize_avatar_scale(self.config.camera_avatar_scale)
+                            )
+                            if vo_pool is None:
+                                vo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mocap-vo")
+                        elif toggled_cam_on:
                             cut_detector.reset()
                             vo_tracker.reset()
-                            camera_solver.reset()
+                            camera_solver.reset(keep_origin=True)
+                        if stream_frame0_hips[0] is not None:
+                            camera_solver.anchor_stream_origin(stream_frame0_hips[0])
+
                         for idx_in_b, s in enumerate(batch):
                             if s.is_stream_reset:
                                 cut_detector.reset()
+                                vo_tracker.reset()
                                 is_cut = False
                                 shot_id += 1
                             else:
@@ -793,10 +865,12 @@ class StreamingMocapEngine:
                     else:
                         for s in batch:
                             if s.is_stream_reset or s.is_camera_switch:
-                                cut_detector.reset()
-                                vo_tracker.reset()
+                                if cut_detector is not None:
+                                    cut_detector.reset()
+                                if vo_tracker is not None:
+                                    vo_tracker.reset()
                                 shot_id += 1
-                            cut_flags.append(False)
+                            cut_flags.append(bool(s.is_camera_switch))
                             shot_ids.append(shot_id)
                         cut_or_reset = [s.is_stream_reset or s.is_camera_switch for s in batch]
 
@@ -807,14 +881,39 @@ class StreamingMocapEngine:
                     t1 = time.perf_counter()
 
                     if track_cam:
-                        vo_rots: list[np.ndarray] = []
-                        vo_inliers: list[int] = []
-                        vo_flows: list[float] = []
-                        for s, bbox, is_boundary in zip(batch, bboxes, cut_or_reset):
-                            r_vo, n_inl = vo_tracker.step(s.rgb, bbox, cam_k0, is_cut=is_boundary)
-                            vo_rots.append(r_vo)
-                            vo_inliers.append(n_inl)
-                            vo_flows.append(float(vo_tracker.last_trans_flow_px))
+                        assert vo_tracker is not None and vo_pool is not None
+                        cur_zoom = float(vo_tracker.zoom_scale)
+                        for idx_f, bnd in enumerate(cut_or_reset):
+                            if bnd:
+                                cur_zoom = 1.0
+                            if abs(cur_zoom - 1.0) > 1e-4:
+                                cam_k[idx_f, 0, 0] *= cur_zoom
+                                cam_k[idx_f, 1, 1] *= cur_zoom
+                        cam_k_pre = cam_k.copy()
+
+                        def _step_vo_batch(
+                            vt: BackgroundVisualOdometry = vo_tracker,
+                            b_frames: list[SampledFrame] = batch,
+                            b_boxes: np.ndarray = bboxes,
+                            base_k0: np.ndarray = cam_k0,
+                            b_bounds: list[bool] = cut_or_reset,
+                        ) -> tuple[list[np.ndarray], list[int], list[float], np.ndarray]:
+                            rots: list[np.ndarray] = []
+                            inls: list[int] = []
+                            flows: list[float] = []
+                            ks = np.repeat(base_k0[None], len(b_frames), axis=0)
+                            for idx_f, (sf, bx, bnd) in enumerate(zip(b_frames, b_boxes, b_bounds)):
+                                r_v, n_i = vt.step(sf.rgb, bx, base_k0, is_cut=bnd)
+                                rots.append(r_v)
+                                inls.append(n_i)
+                                flows.append(float(vt.last_trans_flow_px))
+                                if abs(vt.zoom_scale - 1.0) > 1e-4:
+                                    ks[idx_f, 0, 0] = base_k0[0, 0] * vt.zoom_scale
+                                    ks[idx_f, 1, 1] = base_k0[1, 1] * vt.zoom_scale
+                            return rots, inls, flows, ks
+
+                        # Run CPU OpenCV optical-flow VO concurrently while the GPU executes SAM 3D Body.
+                        vo_future = vo_pool.submit(_step_vo_batch)
 
                         if keyframe_mode:
                             kf_pos = _plan_keyframes(
@@ -826,16 +925,22 @@ class StreamingMocapEngine:
                             kf_tokens, kf_cam_t, kf_j3d = extractor.extract_chunk_with_camera(
                                 [rgb_list[i] for i in kf_pos],
                                 bboxes[kf_pos],
-                                cam_k[kf_pos],
+                                cam_k_pre[kf_pos],
                             )
+                            vo_rots, vo_inliers, vo_flows, cam_k = vo_future.result()
+                            if len(kf_pos) > 0:
+                                kf_cam_t[:, 2] *= cam_k[kf_pos, 0, 0] / np.maximum(cam_k_pre[kf_pos, 0, 0], 1e-6)
                         else:
                             tokens, cam_ts, j3ds = _extract_dense_with_camera(
                                 extractor,
                                 rgb_list,
                                 bboxes,
-                                cam_k,
+                                cam_k_pre,
                                 stream_resets,
                             )
+                            vo_rots, vo_inliers, vo_flows, cam_k = vo_future.result()
+                            if len(cam_ts) > 0:
+                                cam_ts[:, 2] *= cam_k[:, 0, 0] / np.maximum(cam_k_pre[:, 0, 0], 1e-6)
                     else:
                         if keyframe_mode:
                             kf_pos = _plan_keyframes(
@@ -874,7 +979,13 @@ class StreamingMocapEngine:
                                 )
                             )
                         else:
-                            metas.append(_PendingFrameMeta(sample=s, shot_id=shot_ids[i]))
+                            metas.append(
+                                _PendingFrameMeta(
+                                    sample=s,
+                                    is_cut=cut_flags[i],
+                                    shot_id=shot_ids[i],
+                                )
+                            )
 
                     if keyframe_mode:
                         if track_cam:
@@ -902,8 +1013,8 @@ class StreamingMocapEngine:
                 if history:
                     self.telemetry.frames_perceived = history[-1].frame_index + 1
 
-                raw_scale = float(self.config.camera_avatar_scale)
-                camera_solver.avatar_scale = max(0.1, raw_scale) if math.isfinite(raw_scale) else 1.0
+                if camera_solver is not None:
+                    camera_solver.avatar_scale = sanitize_avatar_scale(self.config.camera_avatar_scale)
                 next_emit_frame = self._solve_ready_windows(
                     history,
                     next_emit_frame,
@@ -911,6 +1022,7 @@ class StreamingMocapEngine:
                     preset=preset,
                     stitcher=stitcher,
                     camera_solver=camera_solver,
+                    stream_frame0_hips=stream_frame0_hips,
                     first_commit_event=first_commit_event,
                 )
         except Exception as exc:
@@ -919,6 +1031,9 @@ class StreamingMocapEngine:
             self._stop_event.set()
             warmup_done_event.set()
             first_commit_event.set()
+        finally:
+            if vo_pool is not None:
+                vo_pool.shutdown(wait=True)
 
     def _solve_ready_windows(
         self,
@@ -928,7 +1043,8 @@ class StreamingMocapEngine:
         eos: bool,
         preset: LatencyPreset,
         stitcher: StreamingStitcher,
-        camera_solver: StreamingCameraSolver,
+        camera_solver: StreamingCameraSolver | None,
+        stream_frame0_hips: list[np.ndarray | None],
         first_commit_event: threading.Event,
     ) -> int:
         """Solve and commit every stride window whose frames are available; returns the next frame to emit."""
@@ -978,10 +1094,11 @@ class StreamingMocapEngine:
             track_cam = bool(self.config.camera_tracking_enabled)
             if track_cam and win_items[0].cam_obs is not None:
                 r_win0 = win_items[0].cam_obs.r_vo_yup
-                cam_r_w_9 = np.stack(
+                rel_yup = np.stack(
                     [(it.cam_obs.r_vo_yup if it.cam_obs is not None else r_win0) @ r_win0.T for it in win_items],
                     axis=0,
-                ).reshape(-1, 9)
+                )
+                cam_r_w_9 = yup_rel_to_opencv_camera_r(rel_yup).reshape(-1, 9)
                 window_vo_yaw = math.atan2(float(r_win0[2, 0]), float(r_win0[2, 2]))
             else:
                 cam_r_w_9 = None
@@ -998,7 +1115,10 @@ class StreamingMocapEngine:
 
             stride_items = [by_idx.get(next_emit_frame + i) or shot_last for i in range(stride)]
             stride_cam_obs = [it.cam_obs for it in stride_items if it.cam_obs is not None]
-            have_stride_cam = track_cam and len(stride_cam_obs) == len(stride_items)
+            have_stride_cam = track_cam and camera_solver is not None and len(stride_cam_obs) == len(stride_items)
+            if have_stride_cam and camera_solver is not None and stream_frame0_hips[0] is not None:
+                camera_solver.anchor_stream_origin(stream_frame0_hips[0])
+
             committed = stitcher.commit_window(
                 latent_win,
                 emit_offset_in_window=preset.history_frames,
@@ -1014,6 +1134,12 @@ class StreamingMocapEngine:
                 follow_movement=self.config.follow_movement,
                 anchor_world_yaw_across_cuts=have_stride_cam,
             )
+            for cf, it in zip(committed, stride_items):
+                if it.is_stream_reset or stream_frame0_hips[0] is None:
+                    stream_frame0_hips[0] = cf.hips_pos_rh.copy()
+                    if camera_solver is not None:
+                        camera_solver.anchor_stream_origin(cf.hips_pos_rh)
+
             self._playout_buffer.push_many(committed)
             next_emit_frame += stride
             if not first_commit_event.is_set():
@@ -1098,6 +1224,11 @@ class StreamingMocapEngine:
                 self.telemetry.camera_azimuth_deg = round(math.degrees(cam_pose.orbit_azimuth), 1)
                 self.telemetry.camera_elevation_deg = round(math.degrees(cam_pose.orbit_elevation), 1)
                 self.telemetry.camera_fov_deg = round(cam_pose.fov_deg, 1)
+            elif not self.config.camera_tracking_enabled:
+                self.telemetry.camera_distance_m = 0.0
+                self.telemetry.camera_azimuth_deg = 0.0
+                self.telemetry.camera_elevation_deg = 0.0
+                self.telemetry.camera_fov_deg = 0.0
 
             if self.config.vmc_enabled and self._vmc_sender is not None:
                 bones = pose_to_vmc_bones(
@@ -1115,12 +1246,7 @@ class StreamingMocapEngine:
             client = self._plugin_client
             if client is not None and client.is_connected and self.config.plugin_api_enabled:
                 if cam_pose is not None and self.config.plugin_api_sync_camera:
-                    vrm_cam = camera_to_persona_vrm_camera(
-                        cam_pose,
-                        mirror=self.config.mirror,
-                        vrm_placement=client.bound_vrm_placement,
-                    )
-                    client.send_vrm_camera_fire_and_forget(vrm_cam)
+                    client.sync_camera_pose_fire_and_forget(cam_pose, mirror=self.config.mirror)
                     self.telemetry.plugin_api_camera_syncs = client.camera_patches_sent
 
                 if (

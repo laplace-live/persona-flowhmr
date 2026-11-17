@@ -523,14 +523,23 @@ def test_camera_tracking_disabled_skips_cut_vo_and_camera_extraction(monkeypatch
     eng._decoder = MotionLatentDecoder(MOTION_STATS_PATH, motion_style="basic")
     monkeypatch.setattr(eng, "_ensure_models_loaded", lambda: (DummyExtractor(), "replay"))
     monkeypatch.setattr(
-        engine.ShotCutDetector,
-        "step",
-        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("ShotCutDetector.step must not run when disabled")),
+        engine,
+        "ShotCutDetector",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("ShotCutDetector must not be constructed when disabled")),
     )
     monkeypatch.setattr(
-        engine.BackgroundVisualOdometry,
-        "step",
-        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("BackgroundVisualOdometry.step must not run when disabled")),
+        engine,
+        "BackgroundVisualOdometry",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("BackgroundVisualOdometry must not be constructed when disabled")
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "StreamingCameraSolver",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("StreamingCameraSolver must not be constructed when disabled")
+        ),
     )
 
     fq: queue.Queue[SampledFrame | None] = queue.Queue()
@@ -620,3 +629,274 @@ def test_playout_worker_recovers_slipped_latency_when_buffer_headroom_returns(mo
     assert 800.0 <= recovered_ms <= 860.0, f"Expected latency to self-heal back to ~800ms, got {recovered_ms}"
     # Recovery must never drain buffer lead into new underruns.
     assert underrun_after_refill[-1] == underrun_after_refill[0]
+
+
+def test_yup_rel_to_opencv_camera_r_and_panning_overlap_tail_alignment() -> None:
+    """Verify OpenCV `camera_R` sign parity with upstream FlowHMR and seam-free overlap blending during pans."""
+    from persona_flowhmr.camera_tracker import yup_rel_to_opencv_camera_r
+
+    # Camera pans right by +15 deg: in OpenCV (`+X right, +Y down, +Z forward`), `R_cv = R_y(-15 deg)`.
+    ang = math.radians(-15.0)
+    c, s = math.cos(ang), math.sin(ang)
+    r_cv = np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=np.float32)
+    cv_to_three = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+    r_vo_yup = cv_to_three @ r_cv @ cv_to_three
+    recovered_cv = yup_rel_to_opencv_camera_r(r_vo_yup[None])[0]
+    assert np.allclose(recovered_cv, r_cv, atol=1e-6)
+
+    # Overlap crossfade across a +30 deg camera pan between Window 1 (yaw=0) and Window 2 (yaw=+30 deg)
+    # must preserve constant world heading (0 deg) and constant world velocity (+1 m/s along +Z).
+    decoder = MotionLatentDecoder(MOTION_STATS_PATH, motion_style="basic")
+    stitcher = StreamingStitcher(decoder, fps=30.0)
+
+    def _encode_window(raw_yaw_deg: float, world_vz: float = 1.0) -> np.ndarray:
+        lat = np.zeros((16, 491), dtype=np.float32)
+        # In camera frame rotated by `window_vo_yaw = -raw_yaw_deg`, a world +Z velocity `(0, world_vz)`
+        # has `srv_xz_cam = (-vx_rh, -vz_rh)` where `(vx_rh, vz_rh) = R_y(raw_yaw) @ (0, world_vz)`.
+        rad = math.radians(raw_yaw_deg)
+        cr, sr = math.cos(rad), math.sin(rad)
+        srv_cam = np.array([-(sr * world_vz), -(cr * world_vz)], dtype=np.float32)
+        lat[:, 0:2] = ((srv_cam - decoder.srv_mean[[0, 2]]) / decoder.srv_std[[0, 2]])[None, :]
+        # Also rotate pelvis local joint offset `ljp_mean[0]` by `raw_yaw_deg` so wobble cancels cleanly.
+        ljp_rot = decoder.ljp_mean.copy()
+        ry = np.array([[cr, 0.0, sr], [0.0, 1.0, 0.0], [-sr, 0.0, cr]], dtype=np.float32)
+        ljp_rot = ljp_rot @ ry.T
+        lat[:, 3:159] = ((ljp_rot - decoder.ljp_mean) / decoder.ljp_std).reshape(156)[None, :]
+        r_root = ry @ np.diag([-1.0, 1.0, -1.0]).astype(np.float32)
+        lat[:, 159:165] = ((r_root[:, :2].reshape(6) - decoder.lrot_mean[0]) / decoder.lrot_std[0])[None, :]
+        return lat
+
+    w1 = _encode_window(0.0)
+    f1 = stitcher.commit_window(
+        w1,
+        emit_offset_in_window=4,
+        stride_frames=4,
+        overlap_frames=2,
+        first_emit_frame_index=0,
+        capture_mono_times=[i / 30.0 for i in range(4)],
+        window_vo_yaw_rad=0.0,
+    )
+    w2 = _encode_window(-30.0)
+    f2 = stitcher.commit_window(
+        w2,
+        emit_offset_in_window=4,
+        stride_frames=4,
+        overlap_frames=2,
+        first_emit_frame_index=4,
+        capture_mono_times=[(4 + i) / 30.0 for i in range(4)],
+        window_vo_yaw_rad=math.radians(30.0),
+    )
+    # Every frame across the 2-frame overlap seam keeps identity world root quaternion (0 deg twitch!).
+    for pose in f1 + f2:
+        assert np.allclose(pose.quats_rh_xyzw[0], [0.0, 0.0, 0.0, 1.0], atol=1e-4)
+    # World X drift across the pan seam stays zero while Z advances steadily at 1 m/s.
+    assert abs(float(f2[-1].hips_pos_rh[0] - f1[0].hips_pos_rh[0])) < 1e-3
+    assert abs(float(f2[-1].hips_pos_rh[2] - f1[0].hips_pos_rh[2]) - (7.0 / 30.0)) < 1e-2
+
+
+def test_cut_roll_and_live_framing_rebase_on_static_tripod() -> None:
+    """Verify cut-frame roll/steep-tilt recovery, live `avatar_scale` / `follow_movement` tripod rebase,
+    and preserved travel origin across `reset(keep_origin=True)`.
+    """
+    decoder = MotionLatentDecoder(MOTION_STATS_PATH, motion_style="basic")
+    cam_solver = StreamingCameraSolver(avatar_scale=1.0)
+    h, w = 720, 1280
+    cam_k = default_camera_intrinsics(h, w)
+    cv_to_three = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+
+    dec0 = decoder.decode_window(np.zeros((1, 491), dtype=np.float32))
+    ljp_neutral = dec0["ljp_cam"][0]
+    hips_origin = np.array([-float(ljp_neutral[0, 0]), float(dec0["srp_y_cam"][0]), -float(ljp_neutral[0, 2])], dtype=np.float32)
+    cam_solver.anchor_stream_origin(hips_origin)
+
+    # Simulate live-enabling camera tracking after avatar has already walked +1.5m along X:
+    cam_solver.reset(keep_origin=True)
+    hips_displaced = hips_origin + np.array([1.5, 0.0, 0.0], dtype=np.float32)
+    stage_j14 = extract_smplh_body14_stage(ljp_neutral, hips_displaced)
+
+    # Cut to a camera at dist=3.2m, el=-32 deg (steep tilt > 22 deg), roll=+16 deg framing the displaced avatar.
+    c_pos, r_w_cam = _persona_orbit_to_three_matrix_and_pos(
+        {
+            "orbit": {
+                "azimuth": 0.0,
+                "elevation": math.radians(-32.0),
+                "distance": 3.2,
+                "targetX": 1.5,
+                "targetY": float(hips_origin[1]),
+                "targetZ": 0.0,
+            },
+            "roll": math.radians(16.0),
+        }
+    )
+    j14_cv = ((r_w_cam.T @ (stage_j14 - c_pos[None, :]).T).T @ cv_to_three.T).astype(np.float32)
+    obs_cut = FrameCameraObservation(
+        sam_cam_t=np.array([0.0, 0.9, 3.2], dtype=np.float32),
+        sam_j3d_cam=j14_cv,
+        cam_k=cam_k,
+        image_hw=(h, w),
+        bbox_xyxy=np.array([450.0, 100.0, 830.0, 680.0], dtype=np.float32),
+        r_vo_yup=np.eye(3, dtype=np.float32),
+        vo_inliers=28,
+        is_cut=True,
+        shot_id=1,
+        trans_flow_px=0.05,
+    )
+    p_cut = cam_solver.solve_frame(obs_cut, ljp_cam_52=ljp_neutral, hips_pos_rh=hips_displaced, follow_movement=True)
+    assert abs(math.degrees(p_cut.orbit_elevation) - (-32.0)) < 2.0
+    assert abs(math.degrees(p_cut.roll) - 16.0) < 2.0
+    assert abs(float(p_cut.orbit_target_rh[0]) - 1.5) < 0.15
+
+    # Next frame on locked tripod (`vo_inliers=28, trans_flow_px=0.05`), change `avatar_scale` live to 1.5
+    # and `follow_movement=False`: camera must immediately rebase instead of staying frozen!
+    obs_static = FrameCameraObservation(
+        sam_cam_t=obs_cut.sam_cam_t,
+        sam_j3d_cam=j14_cv,
+        cam_k=cam_k,
+        image_hw=(h, w),
+        bbox_xyxy=obs_cut.bbox_xyxy,
+        r_vo_yup=np.eye(3, dtype=np.float32),
+        vo_inliers=28,
+        is_cut=False,
+        shot_id=1,
+        trans_flow_px=0.05,
+    )
+    cam_solver.avatar_scale = 1.5
+    p_rebased = cam_solver.solve_frame(obs_static, ljp_cam_52=ljp_neutral, hips_pos_rh=hips_displaced, follow_movement=False)
+    assert p_rebased.orbit_distance > p_cut.orbit_distance * 1.35
+    assert abs(float(p_rebased.orbit_target_rh[0])) < 0.25
+
+
+def test_preview_per_frame_dims_and_eviction_preserves_camera_switch() -> None:
+    """Verify `PreviewRingBuffer` keeps per-frame `orig_hw` across resolution changes and `_put_until_stopped`
+    carries evicted `is_camera_switch` markers forward.
+    """
+    import queue
+
+    from persona_flowhmr.engine import StreamingMocapEngine
+    from persona_flowhmr.sources import PreviewRingBuffer, SampledFrame
+
+    ring = PreviewRingBuffer(max_items=8, max_width=320)
+    ring.record_frame(0, np.zeros((720, 1280, 3), dtype=np.uint8))
+    ring.record_frame(1, np.zeros((480, 640, 3), dtype=np.uint8))
+    snap0 = ring.get_synced_bgr(0)
+    snap1 = ring.get_synced_bgr(1)
+    assert snap0 is not None and snap0[3] == (720, 1280)
+    assert snap1 is not None and snap1[3] == (480, 640)
+
+    eng = StreamingMocapEngine()
+    fq: queue.Queue[SampledFrame | None] = queue.Queue(maxsize=2)
+    rgb = np.zeros((64, 64, 3), dtype=np.uint8)
+    eng._put_until_stopped(fq, SampledFrame(0, 0.0, 1.0, rgb, is_camera_switch=True), drop_oldest=True)
+    eng._put_until_stopped(fq, SampledFrame(1, 0.033, 1.033, rgb), drop_oldest=True)
+    # Frame 2 evicts Frame 0 (`is_camera_switch=True`); `_take_batch` must preserve `is_camera_switch` on Frame 1!
+    eng._put_until_stopped(fq, SampledFrame(2, 0.066, 1.066, rgb), drop_oldest=True)
+    fq.put_nowait(None) if not fq.full() else None
+    batch, _ = eng._take_batch(fq, 2)
+    assert len(batch) == 2
+    assert batch[0].frame_index == 1
+    assert batch[0].is_camera_switch is True
+
+
+def test_persona_sync_camera_pose_refreshes_placement_and_fails_closed() -> None:
+    """Verify `sync_camera_pose_fire_and_forget` loads placement even without `ensure_vmc_receiver`,
+    skips sending when `instance.get` fails, and picks up updated placement after an event.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    state = {"fail_get": True, "offset_x": 2.5}
+    patched: list[dict] = []
+    server_ws_holder: list[object] = []
+
+    async def handler(ws):
+        server_ws_holder.append(ws)
+        await ws.send(
+            json.dumps(
+                {
+                    "kind": "hello",
+                    "protocol": 4,
+                    "app": {"name": "LAPLACE Persona", "version": "0.91.0", "platform": "win32", "capabilities": []},
+                }
+            )
+        )
+        async for raw in ws:
+            msg = json.loads(raw)
+            m = msg["method"]
+            req_id = msg["id"]
+            if m == "instance.list":
+                res = {"instances": [{"instanceId": "vrm-1", "kind": "model", "format": "vrm"}]}
+                await ws.send(json.dumps({"kind": "response", "id": req_id, "result": res}))
+            elif m == "instance.get":
+                if state["fail_get"]:
+                    await ws.send(json.dumps({"kind": "error", "id": req_id, "code": "ERR", "message": "lookup failed"}))
+                else:
+                    res = {"item": {"vrm": {"x": state["offset_x"], "y": 0.0, "z": 0.0, "scale": 1.0, "rotY": 0.0}}}
+                    await ws.send(json.dumps({"kind": "response", "id": req_id, "result": res}))
+            elif m == "scene.patch":
+                patched.append(msg["params"]["vrmCamera"])
+                await ws.send(json.dumps({"kind": "response", "id": req_id, "result": {}}))
+            else:
+                await ws.send(json.dumps({"kind": "response", "id": req_id, "result": {}}))
+
+    stop_srv = threading.Event()
+    srv_loop_holder: list[asyncio.AbstractEventLoop] = []
+
+    def _run_srv() -> None:
+        loop = asyncio.new_event_loop()
+        srv_loop_holder.append(loop)
+        asyncio.set_event_loop(loop)
+
+        async def _main() -> None:
+            async with websockets.serve(handler, "127.0.0.1", port):
+                while not stop_srv.is_set():
+                    await asyncio.sleep(0.02)
+
+        loop.run_until_complete(_main())
+
+    t = threading.Thread(target=_run_srv, daemon=True)
+    t.start()
+
+    cam_pose = decompose_three_camera_pose(
+        np.array([0.0, 1.0, 3.0], dtype=np.float32),
+        np.eye(3, dtype=np.float32),
+        3.0,
+        30.0,
+    )
+    client = PersonaPluginClient(url=f"ws://127.0.0.1:{port}", token="tok")
+    try:
+        assert client.start(timeout_s=5.0) is True
+        # 1. While `instance.get` fails, `sync_camera_pose_fire_and_forget` must fail closed (0 patches sent).
+        client.sync_camera_pose_fire_and_forget(cam_pose)
+        threading.Event().wait(0.12)
+        assert patched == []
+
+        # 2. Once `instance.get` succeeds (even without `ensure_vmc_receiver`), camera transforms by `offset_x=2.5`!
+        state["fail_get"] = False
+        client.sync_camera_pose_fire_and_forget(cam_pose)
+        for _ in range(40):
+            if patched:
+                break
+            threading.Event().wait(0.02)
+        assert len(patched) == 1
+        assert abs(float(patched[-1]["orbit"]["targetX"]) - 2.5) < 1e-4
+
+        # 3. Server event invalidates cached placement -> next sync picks up `offset_x = -1.25` immediately!
+        state["offset_x"] = -1.25
+        ws_conn = server_ws_holder[-1]
+        asyncio.run_coroutine_threadsafe(
+            ws_conn.send(json.dumps({"kind": "event", "event": "scene.changed"})),  # type: ignore[attr-defined]
+            srv_loop_holder[0],
+        ).result(timeout=2.0)
+        threading.Event().wait(0.05)
+        client.sync_camera_pose_fire_and_forget(cam_pose)
+        for _ in range(40):
+            if len(patched) >= 2:
+                break
+            threading.Event().wait(0.02)
+        assert len(patched) >= 2
+        assert abs(float(patched[-1]["orbit"]["targetX"]) - (-1.25)) < 1e-4
+    finally:
+        client.stop()
+        stop_srv.set()
+        t.join(timeout=2.0)

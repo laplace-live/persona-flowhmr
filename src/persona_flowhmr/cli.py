@@ -66,6 +66,7 @@ def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
         help="Lock horizontal XZ root travel at origin",
     )
     p.add_argument(
+        "--camera-tracking",
         "--camera-track",
         dest="camera_tracking_enabled",
         action="store_const",
@@ -73,6 +74,7 @@ def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
         help="Enable dynamic 6-DoF camera tracking",
     )
     p.add_argument(
+        "--no-camera-tracking",
         "--no-camera-track",
         dest="camera_tracking_enabled",
         action="store_const",
@@ -83,7 +85,13 @@ def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
         "--camera-scale",
         dest="camera_avatar_scale",
         type=float,
-        help="Avatar-to-performer camera framing scale (default: 1.0)",
+        help="Avatar-to-performer camera framing scale in [0.4, 2.5] (default: 1.0)",
+    )
+    p.add_argument(
+        "--camera-fov",
+        dest="camera_fov_deg",
+        type=float,
+        help="Calibrated vertical camera FOV in degrees (0 = auto intrinsics + optical zoom tracking)",
     )
     p.add_argument(
         "--backend",

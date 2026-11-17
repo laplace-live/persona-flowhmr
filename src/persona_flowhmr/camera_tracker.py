@@ -34,6 +34,16 @@ CAMERA_DISTANCE_MAX_M = 25.0
 # OpenCV (`+X right, +Y down, +Z forward`) <-> Three.js camera (`+X right, +Y up, -Z forward`).
 _CV_TO_THREE_CAM = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
 
+
+def yup_rel_to_opencv_camera_r(rel_r_yup: np.ndarray) -> np.ndarray:
+    """Convert `(..., 3, 3)` Three.js/Y-up relative camera rotation `S @ R_cv_rel @ S` back to OpenCV `R_cv_rel`.
+
+    Upstream FlowHMR (`_vggt_opencv_to_yup_rt` -> `build_feature_dict`) transforms world axes only (`R_cv @ S`),
+    so `R_t @ R_0^T` cancels `S` on the right and conditions MMDiT on OpenCV camera-space `R_cv_t @ R_cv_0^T`.
+    """
+    r = np.asarray(rel_r_yup, dtype=np.float32)
+    return (_CV_TO_THREE_CAM @ r @ _CV_TO_THREE_CAM).astype(np.float32, copy=False)
+
 # Corresponding anatomical indices between `mhr70` (`SAM 3D Body`) and `SMPL-H` (`FlowHMR` body22).
 # Index 0 in our 14-joint array is synthetic Mid-Hip (`mean(L_Hip, R_Hip)`), followed by 13 joints:
 #   [MidHip, L_Hip, R_Hip, Neck, L_Shoulder, R_Shoulder, L_Elbow, R_Elbow, L_Wrist, R_Wrist,
@@ -461,6 +471,7 @@ class BackgroundVisualOdometry:
         self.work_width = int(work_width)
         self.min_inliers = int(min_inliers)
         self.last_trans_flow_px: float = 0.0
+        self.zoom_scale: float = 1.0
         self._prev_gray: np.ndarray | None = None
         self._prev_hw: tuple[int, int] | None = None
         self._r_yup = np.eye(3, dtype=np.float32)
@@ -471,6 +482,7 @@ class BackgroundVisualOdometry:
         self._prev_hw = None
         self._r_yup = np.eye(3, dtype=np.float32)
         self.last_trans_flow_px = 0.0
+        self.zoom_scale = 1.0
 
     def step(
         self,
@@ -501,6 +513,7 @@ class BackgroundVisualOdometry:
             self._prev_hw = (sh, sw)
             self._r_yup = np.eye(3, dtype=np.float32)
             self.last_trans_flow_px = 0.0
+            self.zoom_scale = 1.0
             return self._r_yup.copy(), 0
 
         # Mask out expanded person bounding box so moving limbs never corrupt background camera motion.
@@ -563,7 +576,7 @@ class BackgroundVisualOdometry:
             return self._r_yup.copy(), int(len(p0))
 
         delta_r_cv, n_inliers = self._ransac_ray_rotation(p0, p1, cam_k)
-        # Measure non-rotational residual flow (parallax / radial dolly / zoom) in 480p-normalized pixels.
+        # Measure non-rotational residual flow (parallax / radial dolly) and isotropic optical zoom.
         fx = max(1.0, float(cam_k[0, 0]))
         fy = max(1.0, float(cam_k[1, 1]))
         cx = float(cam_k[0, 2])
@@ -573,6 +586,21 @@ class BackgroundVisualOdometry:
         z_rot = np.maximum(rays0_rot[:, 2], 1e-4)
         u_pred = fx * (rays0_rot[:, 0] / z_rot) + cx
         v_pred = fy * (rays0_rot[:, 1] / z_rot) + cy
+
+        du_rot = u_pred - cx
+        dv_rot = v_pred - cy
+        r_rot = np.hypot(du_rot, dv_rot)
+        far_mask = r_rot >= 0.12 * float(long_side)
+        if int(np.sum(far_mask)) >= self.min_inliers:
+            r_obs = np.hypot(p1[far_mask, 0] - cx, p1[far_mask, 1] - cy)
+            ratios = r_obs / np.maximum(r_rot[far_mask], 1.0)
+            med_zoom = float(np.median(ratios))
+            mad_zoom = float(np.median(np.abs(ratios - med_zoom)))
+            if mad_zoom < 0.008 and 0.92 <= med_zoom <= 1.08 and abs(med_zoom - 1.0) >= 0.0025:
+                self.zoom_scale = float(np.clip(self.zoom_scale * med_zoom, 0.4, 3.5))
+                u_pred = cx + med_zoom * du_rot
+                v_pred = cy + med_zoom * dv_rot
+
         self.last_trans_flow_px = float(np.median(np.hypot(p1[:, 0] - u_pred, p1[:, 1] - v_pred))) * norm_480
 
         if n_inliers < self.min_inliers:
@@ -655,14 +683,24 @@ class StreamingCameraSolver:
         self._fov_deg: float = 30.0
         self._prev_azimuth: float | None = None
         self._frame0_hips_rh: np.ndarray | None = None
+        self._last_avatar_scale: float | None = None
+        self._last_follow_movement: bool | None = None
 
-    def reset(self) -> None:
+    def anchor_stream_origin(self, hips_pos_rh: np.ndarray) -> None:
+        """Record stream frame-0 pelvis origin so live-enabling camera tracking preserves prior XZ travel."""
+        if self._frame0_hips_rh is None:
+            self._frame0_hips_rh = np.asarray(hips_pos_rh, dtype=np.float32).copy()
+
+    def reset(self, *, keep_origin: bool = False) -> None:
         self._shot_base_rot = None
         self._shot_cut_vo_yup = None
         self._r_world_from_cam = None
         self._pos_rh = None
         self._prev_azimuth = None
-        self._frame0_hips_rh = None
+        self._last_avatar_scale = None
+        self._last_follow_movement = None
+        if not keep_origin:
+            self._frame0_hips_rh = None
 
     def solve_frame(
         self,
@@ -678,11 +716,19 @@ class StreamingCameraSolver:
         if is_stream_reset or self._frame0_hips_rh is None:
             self._frame0_hips_rh = np.asarray(hips_pos_rh, dtype=np.float32).copy()
 
+        follow_flag = bool(follow_movement)
+        framing_changed = (
+            (self._last_avatar_scale is not None and abs(self.avatar_scale - self._last_avatar_scale) > 1e-6)
+            or (self._last_follow_movement is not None and follow_flag != self._last_follow_movement)
+        )
+        self._last_avatar_scale = float(self.avatar_scale)
+        self._last_follow_movement = follow_flag
+
         # Match Persona's `VrmPoseDriver.applyTranslation` (`hipsRest + (hips_t - hips_0)`):
         # At stream start, the avatar stands at `(0, hips_0_y * scale, 0)`, and travels by `(hips_t - hips_0)`.
         delta_hips = np.asarray(hips_pos_rh, dtype=np.float32) - self._frame0_hips_rh
-        fx_travel = float(delta_hips[0]) if follow_movement else 0.0
-        fz_travel = float(delta_hips[2]) if follow_movement else 0.0
+        fx_travel = float(delta_hips[0]) if follow_flag else 0.0
+        fz_travel = float(delta_hips[2]) if follow_flag else 0.0
         stage_hips = np.array(
             [
                 fx_travel * self.avatar_scale,
@@ -713,8 +759,8 @@ class StreamingCameraSolver:
         if is_cut:
             # Initialize new shot orientation ONCE at the cut boundary:
             # - Azimuth comes directly from FlowHMR's temporal shot yaw (`world_yaw_rad`).
-            # - Elevation comes from rigid 6-joint core torso alignment (never knees/ankles/arms),
-            #   only when the torso spine is upright and well-conditioned; otherwise level (`0 deg`).
+            # - Elevation & camera roll come from rigid 6-joint core torso alignment (never knees/ankles/arms)
+            #   when the torso is upright and well-conditioned; otherwise level (`0 deg`).
             spine_stage_y = float(stage_j14[3, 1] - stage_j14[0, 1])
             spine_cam_y = float(sam_j14_three_cam[3, 1] - sam_j14_three_cam[0, 1])
             torso_span_cam_x = max(
@@ -722,7 +768,7 @@ class StreamingCameraSolver:
                 abs(float(sam_j14_three_cam[1, 0] - sam_j14_three_cam[2, 0])),
             )
             ankles_below_hips = float(np.max(sam_j14_three_cam[12:14, 1])) < float(sam_j14_three_cam[0, 1])
-            min_upright_m = 0.28 * max(0.25, self.avatar_scale)
+            min_upright_m = 0.25 * max(0.25, self.avatar_scale)
             min_lateral_m = 0.05 * max(0.25, self.avatar_scale)
             if (
                 spine_stage_y >= min_upright_m
@@ -736,18 +782,29 @@ class StreamingCameraSolver:
                     _TORSO_TRANSLATION_WEIGHTS,
                 )
                 r_kab_torso = r_cam_from_world.T
-                raw_el = math.asin(float(np.clip(r_kab_torso[1, 2], -0.999, 0.999)))
-                # Suppress small `< 5 deg` single-frame spine-lean discrepancy so level studio/room cuts stay level.
-                if abs(raw_el) < math.radians(5.0):
-                    el_cut = 0.0
-                else:
-                    el_cut = float(np.clip(raw_el, math.radians(-22.0), math.radians(22.0)))
+                raw_el = math.asin(float(np.clip(r_kab_torso[1, 2], -0.9999, 0.9999)))
+                cos_el = math.cos(raw_el)
+                raw_roll = math.atan2(float(r_kab_torso[1, 0]), float(r_kab_torso[1, 1])) if abs(cos_el) > 1e-4 else 0.0
+                # Suppress small `< 4 deg` spine-lean / `< 3 deg` shoulder-shrug discrepancy on flat cuts.
+                el_cut = (
+                    0.0
+                    if abs(raw_el) < math.radians(4.0)
+                    else float(np.clip(raw_el, math.radians(-75.0), math.radians(75.0)))
+                )
+                roll_cut = (
+                    0.0
+                    if abs(raw_roll) < math.radians(3.0)
+                    else float(np.clip(raw_roll, math.radians(-75.0), math.radians(75.0)))
+                )
             else:
                 el_cut = 0.0
+                roll_cut = 0.0
 
             ce, se = math.cos(-el_cut), math.sin(-el_cut)
+            cr, sr = math.cos(roll_cut), math.sin(roll_cut)
             rx_neg_el = np.array([[1.0, 0.0, 0.0], [0.0, ce, -se], [0.0, se, ce]], dtype=np.float32)
-            self._shot_base_rot = (_rot_y_matrix(float(world_yaw_rad)) @ rx_neg_el).astype(np.float32)
+            rz_roll = np.array([[cr, -sr, 0.0], [sr, cr, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+            self._shot_base_rot = (_rot_y_matrix(float(world_yaw_rad)) @ rx_neg_el @ rz_roll).astype(np.float32)
             self._shot_cut_vo_yup = obs.r_vo_yup.copy()
             r_fused = self._shot_base_rot.copy()
         else:
@@ -766,7 +823,7 @@ class StreamingCameraSolver:
         raw_dist = float(np.clip(-p_cam_torso[2], CAMERA_DISTANCE_MIN_M, CAMERA_DISTANCE_MAX_M))
         raw_fov = vertical_fov_deg_from_k(obs.cam_k, h)
 
-        if is_cut:
+        if is_cut or framing_changed:
             pos_fused = raw_pos
             dist_fused = raw_dist
             fov_fused = raw_fov
@@ -774,11 +831,11 @@ class StreamingCameraSolver:
             assert self._pos_rh is not None
             step_m = float(np.linalg.norm(raw_pos - self._pos_rh))
             if obs.vo_inliers >= 12 and obs.trans_flow_px < 0.48:
-                # Background features prove the camera's 3D optical center is stationary (static or pure tripod pan):
+                # Background features prove the camera's 3D optical center is stationary (static, pan, or optical zoom):
                 # lock virtual tripod position & orbit distance completely (`0.0 m` post-cut drift).
                 pos_fused = self._pos_rh.copy()
                 dist_fused = self._dist_m
-                fov_fused = self._fov_deg
+                fov_fused = 0.75 * self._fov_deg + 0.25 * raw_fov if abs(raw_fov - self._fov_deg) > 0.1 else self._fov_deg
             elif obs.vo_inliers >= 12:
                 # Active physical camera translation / dolly / zoom observed in background parallax.
                 motion_gain = float(np.clip((obs.trans_flow_px - 0.42) / 1.4, 0.08, 1.0))

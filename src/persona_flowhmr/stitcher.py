@@ -121,6 +121,7 @@ class StreamingStitcher:
         # Uncommitted `O`-frame tail of the previous window (decoded fields), crossfaded into the next stride.
         self._tail: dict[str, np.ndarray] | None = None
         self._tail_start_frame = 0
+        self._tail_vo_yaw_rad = 0.0
         self._cum_root_xz_rh = np.zeros(2, dtype=np.float64)
         self._has_started = False
         self._shot_world_yaw_rad = 0.0
@@ -176,14 +177,38 @@ class StreamingStitcher:
             and not starts_with_cut_or_reset
         ):
             n_blend = min(overlap_frames, stride_frames, tail["quats_rh_xyzw"].shape[0])
+            tail_srv = tail["srv_xz_cam"][:n_blend].copy()
+            tail_srp = tail["srp_y_cam"][:n_blend]
+            tail_ljp = tail["ljp_cam"][:n_blend].copy()
+            tail_quats = tail["quats_rh_xyzw"][:n_blend].copy()
+
+            # Rotate previous window's tail into the current window's `window_vo_yaw_rad` reference frame
+            # before blending so camera pans never introduce heading or velocity seam errors.
+            delta_tail_yaw = self._tail_vo_yaw_rad - float(window_vo_yaw_rad)
+            if abs(delta_tail_yaw) > 1e-7:
+                cd, sd = math.cos(delta_tail_yaw), math.sin(delta_tail_yaw)
+                sx, sz = tail_srv[:, 0].copy(), tail_srv[:, 1].copy()
+                tail_srv[:, 0] = cd * sx + sd * sz
+                tail_srv[:, 1] = -sd * sx + cd * sz
+                jx, jz = tail_ljp[:, :, 0].copy(), tail_ljp[:, :, 2].copy()
+                tail_ljp[:, :, 0] = cd * jx + sd * jz
+                tail_ljp[:, :, 2] = -sd * jx + cd * jz
+                q_delta = np.array(
+                    [0.0, math.sin(0.5 * delta_tail_yaw), 0.0, math.cos(0.5 * delta_tail_yaw)],
+                    dtype=np.float32,
+                )
+                tail_quats[:, 0] = quat_mul_xyzw(np.broadcast_to(q_delta, tail_quats[:, 0].shape), tail_quats[:, 0])
+
             # Strictly interior ramp (1/(N+1) .. N/(N+1)) so frame -1 (prev window) and frame N (new window)
             # join without endpoint derivative snaps.
             alphas = np.linspace(0.0, 1.0, n_blend + 2, dtype=np.float32)[1:-1]
-            for key in ("srv_xz_cam", "srp_y_cam", "ljp_cam"):
-                a = alphas.reshape(-1, *([1] * (cur[key].ndim - 1)))
-                cur[key][:n_blend] = (1.0 - a) * tail[key][:n_blend] + a * cur[key][:n_blend]
+            cur["srv_xz_cam"][:n_blend] = (1.0 - alphas[:, None]) * tail_srv + alphas[:, None] * cur["srv_xz_cam"][:n_blend]
+            cur["srp_y_cam"][:n_blend] = (1.0 - alphas) * tail_srp + alphas * cur["srp_y_cam"][:n_blend]
+            cur["ljp_cam"][:n_blend] = (
+                (1.0 - alphas[:, None, None]) * tail_ljp + alphas[:, None, None] * cur["ljp_cam"][:n_blend]
+            )
             cur["quats_rh_xyzw"][:n_blend] = slerp_quat_xyzw(
-                tail["quats_rh_xyzw"][:n_blend],
+                tail_quats,
                 cur["quats_rh_xyzw"][:n_blend],
                 alphas[:, None],
             )
@@ -192,6 +217,7 @@ class StreamingStitcher:
         if overlap_frames > 0:
             self._tail = {k: v[n_commit:].copy() for k, v in decoded.items()}
             self._tail_start_frame = first_emit_frame_index + stride_frames
+            self._tail_vo_yaw_rad = float(window_vo_yaw_rad)
         else:
             self._tail = None
 

@@ -16,10 +16,16 @@ import asyncio
 import base64
 import json
 import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import websockets
+
+from .camera_tracker import camera_to_persona_vrm_camera
+
+if TYPE_CHECKING:
+    from .camera_tracker import CameraPoseFrame
 
 from . import __version__
 
@@ -63,9 +69,12 @@ class PersonaPluginClient:
         self.has_vrm_model: bool = True
         self.bound_vrm_instance_id: str | None = None
         self.bound_vrm_placement: dict[str, Any] | None = None
+        self.vrm_placement_valid: bool = False
+        self._last_placement_refresh_mono: float = 0.0
         self.camera_patches_sent: int = 0
         self._camera_inflight: bool = False
         self._pending_vrm_camera: dict[str, Any] | None = None
+        self._pending_camera_pose: tuple[CameraPoseFrame, bool] | None = None
         self._last_sent_vrm_camera: dict[str, Any] | None = None
         self.last_error: str = ""
 
@@ -123,6 +132,9 @@ class PersonaPluginClient:
                 ) as ws:
                     self._ws = ws
                     self._last_sent_vrm_camera = None
+                    self.bound_vrm_placement = None
+                    self.vrm_placement_valid = False
+                    self._last_placement_refresh_mono = 0.0
                     raw_hello = await asyncio.wait_for(ws.recv(), timeout=5.0)
                     msg = json.loads(raw_hello)
                     if msg.get("kind") == "hello":
@@ -173,6 +185,9 @@ class PersonaPluginClient:
                     fut.set_exception(
                         PersonaPluginError(str(msg.get("code", "UNKNOWN")), str(msg.get("message", "")))
                     )
+            elif kind == "event":
+                # Any server-pushed scene/instance event invalidates cached VRM placement immediately.
+                self._last_placement_refresh_mono = 0.0
 
     async def _send_request_async(self, method: str, params: dict[str, Any] | None = None) -> Any:
         if self._ws is None:
@@ -238,6 +253,8 @@ class PersonaPluginClient:
                 None,
             )
             self.has_vrm_model = vrm_inst is not None
+            self.bound_vrm_placement = None
+            self.vrm_placement_valid = False
             if vrm_inst is not None:
                 bound_instance_id = str(vrm_inst["instanceId"])
                 self.bound_vrm_instance_id = bound_instance_id
@@ -252,15 +269,99 @@ class PersonaPluginClient:
                 try:
                     inst_detail = self.call("instance.get", {"instanceId": bound_instance_id})
                     vrm_place = (inst_detail or {}).get("item", {}).get("vrm") if isinstance(inst_detail, dict) else None
-                    if isinstance(vrm_place, dict):
-                        self.bound_vrm_placement = vrm_place
-                except Exception:
-                    pass
+                    self.bound_vrm_placement = vrm_place if isinstance(vrm_place, dict) else {}
+                    self.vrm_placement_valid = True
+                    self._last_placement_refresh_mono = time.monotonic()
+                except Exception as exc:
+                    self.last_error = str(exc)
             else:
                 self.bound_vrm_instance_id = None
-                self.bound_vrm_placement = None
+                self.vrm_placement_valid = True
+                self._last_placement_refresh_mono = time.monotonic()
 
         return {"sourceId": source_id, "boundInstanceId": bound_instance_id}
+
+    async def _refresh_vrm_placement_async(self) -> bool:
+        """Query primary VRM instance placement asynchronously; returns `True` only when placement state is verified."""
+        self.bound_vrm_placement = None
+        self.vrm_placement_valid = False
+        try:
+            inst_res = await self._send_request_async("instance.list")
+            instances = inst_res.get("instances", []) if isinstance(inst_res, dict) else []
+            self.has_live2d_model = any(
+                it.get("kind") == "model" and it.get("format") == "live2d" for it in instances
+            )
+            vrm_inst = next(
+                (it for it in instances if it.get("kind") == "model" and it.get("format") == "vrm"),
+                None,
+            )
+            self.has_vrm_model = vrm_inst is not None
+            if vrm_inst is None:
+                self.bound_vrm_instance_id = None
+                self.vrm_placement_valid = True
+                self._last_placement_refresh_mono = time.monotonic()
+                return True
+            inst_id = str(vrm_inst["instanceId"])
+            self.bound_vrm_instance_id = inst_id
+            inst_detail = await self._send_request_async("instance.get", {"instanceId": inst_id})
+            vrm_place = (inst_detail or {}).get("item", {}).get("vrm") if isinstance(inst_detail, dict) else None
+            self.bound_vrm_placement = vrm_place if isinstance(vrm_place, dict) else {}
+            self.vrm_placement_valid = True
+            self._last_placement_refresh_mono = time.monotonic()
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
+    def refresh_vrm_placement(self, timeout_s: float = 5.0) -> bool:
+        """Synchronously refresh primary VRM stage placement (used even when VMC auto-configure is disabled)."""
+        if not self.is_connected or self._loop is None:
+            return False
+        fut = asyncio.run_coroutine_threadsafe(self._refresh_vrm_placement_async(), self._loop)
+        try:
+            return bool(fut.result(timeout=timeout_s))
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
+    def sync_camera_pose_fire_and_forget(self, cam_pose: CameraPoseFrame, *, mirror: bool = False) -> None:
+        """Refresh VRM stage placement when needed, transform `cam_pose`, and coalesce `scene.patch -> vrmCamera`."""
+        if not self.is_connected or self._loop is None:
+            return
+
+        async def _enqueue_pose() -> None:
+            self._pending_camera_pose = (cam_pose, bool(mirror))
+            if self._camera_inflight:
+                return
+            self._camera_inflight = True
+            try:
+                while self._pending_camera_pose is not None and self.is_connected and not self._stop.is_set():
+                    nxt_pose, nxt_mirror = self._pending_camera_pose
+                    self._pending_camera_pose = None
+                    now_m = time.monotonic()
+                    if not self.vrm_placement_valid or (now_m - self._last_placement_refresh_mono) >= 1.0:
+                        if not await self._refresh_vrm_placement_async():
+                            break
+                    if not self.has_vrm_model or not self.vrm_placement_valid:
+                        break
+                    nxt_cam = camera_to_persona_vrm_camera(
+                        nxt_pose,
+                        mirror=nxt_mirror,
+                        vrm_placement=self.bound_vrm_placement,
+                    )
+                    if nxt_cam == self._last_sent_vrm_camera:
+                        continue
+                    try:
+                        await self._send_request_async("scene.patch", {"vrmCamera": nxt_cam})
+                        self._last_sent_vrm_camera = nxt_cam
+                        self.camera_patches_sent += 1
+                    except Exception as exc:
+                        self.last_error = str(exc)
+                        break
+            finally:
+                self._camera_inflight = False
+
+        asyncio.run_coroutine_threadsafe(_enqueue_pose(), self._loop)
 
     def send_vrm_camera_fire_and_forget(self, vrm_camera: dict[str, Any]) -> None:
         """Stream `scene.patch -> vrmCamera` with single-slot in-flight coalescing (zero WS backlog)."""

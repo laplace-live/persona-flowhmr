@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -29,6 +30,22 @@ def default_camera_intrinsics(height: int, width: int) -> np.ndarray:
     from flowhmr.utils.runtime_video_processing import VideoProcessor
 
     return VideoProcessor.default_K_from_hw(height, width)
+
+
+def camera_intrinsics(height: int, width: int, *, fov_deg: float = 0.0) -> np.ndarray:
+    """Return `(3, 3)` pinhole intrinsics from calibrated vertical `fov_deg` (> 0) or diagonal default."""
+    if fov_deg > 0.0 and math.isfinite(fov_deg):
+        clamped_deg = min(175.0, max(5.0, float(fov_deg)))
+        fy = 0.5 * float(height) / math.tan(0.5 * math.radians(clamped_deg))
+        return np.array(
+            [
+                [fy, 0.0, float(width) * 0.5],
+                [0.0, fy, float(height) * 0.5],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+    return default_camera_intrinsics(height, width)
 
 
 def _empty_tokens() -> torch.Tensor:
@@ -301,7 +318,7 @@ class Sam3DStreamExtractor:
             hand_decoder_layers=hand_decoder_layers,
         )
         self._use_compile = bool(use_compile and self.device.type == "cuda")
-        self._warmed_signatures: set[tuple[int, str, int, int]] = set()
+        self._warmed_signatures: set[tuple[int, str, int, int, bool]] = set()
         self._neutral_hand_tokens: torch.Tensor | None = None
         self._extract_tokens = extract_tokens
 
@@ -351,11 +368,17 @@ class Sam3DStreamExtractor:
         return self._neutral_hand_tokens
 
     @torch.no_grad()
-    def warmup(self, hw: tuple[int, int] = (720, 1280)) -> None:
-        """Pre-compile static `B = chunk_size` body (and optional hand) shapes."""
+    def warmup(self, hw: tuple[int, int] = (720, 1280), *, include_camera: bool = False) -> None:
+        """Pre-compile static `B = chunk_size` body (and optional hand / camera-head) shapes."""
         if self.hand_mode == "off":
             self._ensure_neutral_hand_tokens(hw)
-        sig = (self.chunk_size, self.hand_mode, self.body_decoder_layers, self.hand_decoder_layers)
+        sig = (
+            self.chunk_size,
+            self.hand_mode,
+            self.body_decoder_layers,
+            self.hand_decoder_layers,
+            bool(include_camera),
+        )
         if sig in self._warmed_signatures:
             return
         h, w = hw
@@ -363,10 +386,110 @@ class Sam3DStreamExtractor:
         dummy_rgb = [np.zeros((h, w, 3), dtype=np.uint8) for _ in range(n)]
         dummy_box = np.repeat(_center_box(h, w), n, axis=0)
         dummy_k = np.repeat(default_camera_intrinsics(h, w)[None], n, axis=0)
-        self.extract_chunk_with_camera(dummy_rgb, dummy_box, dummy_k)
+        if include_camera:
+            self.extract_chunk_with_camera(dummy_rgb, dummy_box, dummy_k)
+        else:
+            self.extract_chunk(dummy_rgb, dummy_box, dummy_k)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         self._warmed_signatures.add(sig)
+
+    @torch.no_grad()
+    def _run_chunked_tokens(
+        self,
+        rgb_frames: Sequence[np.ndarray],
+        bboxes_xyxy: np.ndarray,
+        cameras_k: np.ndarray,
+        *,
+        capture_camera_heads: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """Shared static-shape batching loop for `extract_chunk` and `extract_chunk_with_camera`."""
+        if not rgb_frames:
+            return _empty_tokens(), None
+        neutral_hands = (
+            self._ensure_neutral_hand_tokens(rgb_frames[0].shape[:2])
+            if self.hand_mode == "off"
+            else None
+        )
+        effective_hand_stride = max(self.hand_stride, self.chunk_size) if self.hand_mode == "fast" else self.hand_stride
+
+        model = self.estimator.model
+        latest_j3d_70: list[torch.Tensor] = []
+        latest_pred_cam: list[torch.Tensor] = []
+        hooks = []
+        if capture_camera_heads:
+            # Capture paired `(pred_keypoints_3d, pred_cam)` evaluated on the SAME `pose_token` inside
+            # `model.decoder` so 3D joints and camera translation come from the exact same decoder step
+            # without paying a second TorchScript MHR forward-kinematics pass.
+            def _on_head_pose(_mod: object, _inp: object, out: dict[str, torch.Tensor]) -> None:
+                kp3d = out.get("pred_keypoints_3d")
+                if kp3d is not None:
+                    latest_j3d_70.clear()
+                    latest_j3d_70.append(kp3d[:, :70].detach())
+
+            def _on_head_camera(_mod: object, _inp: object, out: torch.Tensor) -> None:
+                latest_pred_cam.clear()
+                latest_pred_cam.append(out.detach())
+
+            hooks.append(model.head_pose.register_forward_hook(_on_head_pose))
+            hooks.append(model.head_camera.register_forward_hook(_on_head_camera))
+
+        pieces: list[torch.Tensor] = []
+        j3d_pieces: list[torch.Tensor] = []
+        cam_pieces: list[torch.Tensor] = []
+        have_paired = capture_camera_heads
+        n = len(rgb_frames)
+        cs = self.chunk_size
+        try:
+            for s in range(0, n, cs):
+                e = min(n, s + cs)
+                sub_rgb = list(rgb_frames[s:e])
+                sub_box = bboxes_xyxy[s:e]
+                sub_k = cameras_k[s:e]
+                actual = len(sub_rgb)
+                if self._use_compile and actual < cs:
+                    pad = cs - actual
+                    sub_rgb = sub_rgb + [sub_rgb[-1]] * pad
+                    sub_box = np.concatenate([sub_box, np.repeat(sub_box[-1:], pad, axis=0)], axis=0)
+                    sub_k = np.concatenate([sub_k, np.repeat(sub_k[-1:], pad, axis=0)], axis=0)
+                latest_j3d_70.clear()
+                latest_pred_cam.clear()
+                toks = self._extract_tokens(
+                    self.estimator,
+                    sub_rgb,
+                    sub_box,
+                    sub_k,
+                    gpu_preprocess=True,
+                    merge_hands=True,
+                    hand_stride=effective_hand_stride,
+                    hand_mode=self.hand_mode,
+                    neutral_hand_tokens=neutral_hands,
+                    body_decoder_layers=self.body_decoder_layers,
+                    hand_decoder_layers=self.hand_decoder_layers,
+                )
+                pieces.append(toks[:actual])
+                if have_paired:
+                    if (
+                        latest_j3d_70
+                        and latest_pred_cam
+                        and int(latest_j3d_70[0].shape[0]) >= actual
+                        and int(latest_pred_cam[0].shape[0]) >= actual
+                    ):
+                        j3d_pieces.append(latest_j3d_70[0][:actual])
+                        cam_pieces.append(latest_pred_cam[0][:actual])
+                    else:
+                        have_paired = False
+        finally:
+            for h in hooks:
+                h.remove()
+
+        toks_all = torch.cat(pieces, dim=0)
+        paired = (
+            (torch.cat(j3d_pieces, dim=0), torch.cat(cam_pieces, dim=0))
+            if (have_paired and len(j3d_pieces) == len(pieces))
+            else None
+        )
+        return toks_all, paired
 
     @torch.no_grad()
     def extract_chunk(
@@ -376,44 +499,8 @@ class Sam3DStreamExtractor:
         cameras_k: np.ndarray,
     ) -> torch.Tensor:
         """Extract `(N, SAM_TOKEN_DIM)` float32 conditioning tokens for `N` frames with static compiled batch shapes."""
-        if not rgb_frames:
-            return _empty_tokens()
-        neutral_hands = (
-            self._ensure_neutral_hand_tokens(rgb_frames[0].shape[:2])
-            if self.hand_mode == "off"
-            else None
-        )
-        effective_hand_stride = max(self.hand_stride, self.chunk_size) if self.hand_mode == "fast" else self.hand_stride
-
-        pieces: list[torch.Tensor] = []
-        n = len(rgb_frames)
-        cs = self.chunk_size
-        for s in range(0, n, cs):
-            e = min(n, s + cs)
-            sub_rgb = list(rgb_frames[s:e])
-            sub_box = bboxes_xyxy[s:e]
-            sub_k = cameras_k[s:e]
-            actual = len(sub_rgb)
-            if self._use_compile and actual < cs:
-                pad = cs - actual
-                sub_rgb = sub_rgb + [sub_rgb[-1]] * pad
-                sub_box = np.concatenate([sub_box, np.repeat(sub_box[-1:], pad, axis=0)], axis=0)
-                sub_k = np.concatenate([sub_k, np.repeat(sub_k[-1:], pad, axis=0)], axis=0)
-            toks = self._extract_tokens(
-                self.estimator,
-                sub_rgb,
-                sub_box,
-                sub_k,
-                gpu_preprocess=True,
-                merge_hands=True,
-                hand_stride=effective_hand_stride,
-                hand_mode=self.hand_mode,
-                neutral_hand_tokens=neutral_hands,
-                body_decoder_layers=self.body_decoder_layers,
-                hand_decoder_layers=self.hand_decoder_layers,
-            )
-            pieces.append(toks[:actual])
-        return torch.cat(pieces, dim=0)
+        toks, _ = self._run_chunked_tokens(rgb_frames, bboxes_xyxy, cameras_k, capture_camera_heads=False)
+        return toks
 
     @torch.no_grad()
     def _estimate_camera_and_joints(
@@ -423,15 +510,15 @@ class Sam3DStreamExtractor:
         cameras_k: np.ndarray,
         image_hw: tuple[int, int],
         *,
-        precomputed_j3d_70: torch.Tensor | None = None,
+        paired_j3d_and_cam: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Run SAM 3D Body's `head_camera` (reusing captured `head_pose` 3D joints when available) -> `(sam_cam_t, sam_j3d_14)`."""
+        """Project consistent `(j3d_70, pred_cam)` (or evaluate both heads when `body_decoder_layers == 1`) -> `(sam_cam_t, sam_j3d_14)`."""
         n = int(body_tokens_1024.shape[0])
         if n == 0:
             return np.empty((0, 3), dtype=np.float32), np.empty((0, 14, 3), dtype=np.float32)
 
         model = self.estimator.model
-        crop_ops = self.estimator.transform.transforms[:2]  # GetBBoxCenterScale + TopdownAffine
+        crop_ops = self.estimator.transform.transforms[:2]  # GetBBoxCenterScale + TopdownAffine (adjusts square bbox_scale)
         geoms = []
         for box in np.asarray(bboxes_xyxy, dtype=np.float32).reshape(n, 4):
             item: dict[str, object] = {"bbox": box.copy(), "bbox_format": "xyxy"}
@@ -440,16 +527,22 @@ class Sam3DStreamExtractor:
             geoms.append(item)
 
         h, w = int(image_hw[0]), int(image_hw[1])
-        head_dtype = next(model.head_pose.proj.parameters()).dtype
-        pt = body_tokens_1024.to(device=self.device, dtype=head_dtype, non_blocking=True)
-        bc = torch.as_tensor(np.stack([g["bbox_center"] for g in geoms]), dtype=torch.float32, device=self.device)
-        bs = torch.as_tensor(np.stack([g["bbox_scale"][0] for g in geoms]), dtype=torch.float32, device=self.device)
-        img_sz = torch.tensor([[float(w), float(h)]], dtype=torch.float32, device=self.device).expand(n, 2)
-        cam_k_t = torch.as_tensor(cameras_k, dtype=torch.float32, device=self.device).reshape(n, 3, 3)
+        proj_dev = (
+            torch.device("cpu")
+            if (paired_j3d_and_cam is not None and int(paired_j3d_and_cam[0].shape[0]) == n)
+            else self.device
+        )
+        bc = torch.as_tensor(np.stack([g["bbox_center"] for g in geoms]), dtype=torch.float32, device=proj_dev)
+        bs = torch.as_tensor(np.stack([g["bbox_scale"][0] for g in geoms]), dtype=torch.float32, device=proj_dev)
+        img_sz = torch.tensor([[float(w), float(h)]], dtype=torch.float32, device=proj_dev).expand(n, 2)
+        cam_k_t = torch.as_tensor(cameras_k, dtype=torch.float32, device=proj_dev).reshape(n, 3, 3)
 
-        if precomputed_j3d_70 is not None and int(precomputed_j3d_70.shape[0]) == n:
-            j3d_70_t = precomputed_j3d_70.to(device=self.device, dtype=torch.float32, non_blocking=True)
+        if proj_dev.type == "cpu" and paired_j3d_and_cam is not None:
+            j3d_70_t = paired_j3d_and_cam[0].to(device="cpu", dtype=torch.float32)
+            c_raw_t = paired_j3d_and_cam[1].to(device="cpu", dtype=torch.float32)
         else:
+            head_dtype = next(model.head_pose.proj.parameters()).dtype
+            pt = body_tokens_1024.to(device=self.device, dtype=head_dtype, non_blocking=True)
             prev_kp = getattr(model.head_pose, "_keypoints_only", None)
             try:
                 model.head_pose._keypoints_only = True
@@ -461,11 +554,11 @@ class Sam3DStreamExtractor:
                         delattr(model.head_pose, "_keypoints_only")
                 else:
                     model.head_pose._keypoints_only = prev_kp
+            c_raw_t = model.head_camera(pt, model.init_camera.weight.expand(n, -1).to(dtype=head_dtype)).float()
 
-        c_raw = model.head_camera(pt, model.init_camera.weight.expand(n, -1).to(dtype=head_dtype))
         c_out = model.head_camera.perspective_projection(
             j3d_70_t,
-            c_raw.float(),
+            c_raw_t,
             bc,
             bs,
             img_sz,
@@ -484,83 +577,22 @@ class Sam3DStreamExtractor:
         bboxes_xyxy: np.ndarray,
         cameras_k: np.ndarray,
     ) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
-        """Extract `(tokens_n_3072, sam_cam_t_n_3, sam_j3d_n_14_3)` in one pass without duplicate MHR FK."""
+        """Extract `(tokens_n_3072, sam_cam_t_n_3, sam_j3d_n_14_3)` reusing `_run_chunked_tokens`."""
         if not rgb_frames:
             return (
                 _empty_tokens(),
                 np.empty((0, 3), dtype=np.float32),
                 np.empty((0, 14, 3), dtype=np.float32),
             )
-        neutral_hands = (
-            self._ensure_neutral_hand_tokens(rgb_frames[0].shape[:2])
-            if self.hand_mode == "off"
-            else None
-        )
-        effective_hand_stride = max(self.hand_stride, self.chunk_size) if self.hand_mode == "fast" else self.hand_stride
-
-        model = self.estimator.model
-        latest_j3d_70: list[torch.Tensor] = []
-
-        def _capture_head_pose(_mod: object, _inp: object, out: dict[str, torch.Tensor]) -> None:
-            kp3d = out.get("pred_keypoints_3d")
-            if kp3d is not None:
-                latest_j3d_70.clear()
-                latest_j3d_70.append(kp3d[:, :70].detach())
-
-        pieces: list[torch.Tensor] = []
-        j3d_pieces: list[torch.Tensor] = []
-        have_all_j3d = True
-        n = len(rgb_frames)
-        cs = self.chunk_size
-        hook = model.head_pose.register_forward_hook(_capture_head_pose)
-        try:
-            for s in range(0, n, cs):
-                e = min(n, s + cs)
-                sub_rgb = list(rgb_frames[s:e])
-                sub_box = bboxes_xyxy[s:e]
-                sub_k = cameras_k[s:e]
-                actual = len(sub_rgb)
-                if self._use_compile and actual < cs:
-                    pad = cs - actual
-                    sub_rgb = sub_rgb + [sub_rgb[-1]] * pad
-                    sub_box = np.concatenate([sub_box, np.repeat(sub_box[-1:], pad, axis=0)], axis=0)
-                    sub_k = np.concatenate([sub_k, np.repeat(sub_k[-1:], pad, axis=0)], axis=0)
-                latest_j3d_70.clear()
-                toks = self._extract_tokens(
-                    self.estimator,
-                    sub_rgb,
-                    sub_box,
-                    sub_k,
-                    gpu_preprocess=True,
-                    merge_hands=True,
-                    hand_stride=effective_hand_stride,
-                    hand_mode=self.hand_mode,
-                    neutral_hand_tokens=neutral_hands,
-                    body_decoder_layers=self.body_decoder_layers,
-                    hand_decoder_layers=self.hand_decoder_layers,
-                )
-                pieces.append(toks[:actual])
-                if latest_j3d_70 and int(latest_j3d_70[0].shape[0]) >= actual:
-                    j3d_pieces.append(latest_j3d_70[0][:actual])
-                else:
-                    have_all_j3d = False
-        finally:
-            hook.remove()
-
-        toks_all = torch.cat(pieces, dim=0)
-        precomputed_j3d = (
-            torch.cat(j3d_pieces, dim=0)
-            if (have_all_j3d and len(j3d_pieces) == len(pieces))
-            else None
-        )
+        toks, paired = self._run_chunked_tokens(rgb_frames, bboxes_xyxy, cameras_k, capture_camera_heads=True)
         cam_t, j3d_14 = self._estimate_camera_and_joints(
-            toks_all[:, :1024],
+            toks[:, :1024],
             bboxes_xyxy,
             cameras_k,
             rgb_frames[0].shape[:2],
-            precomputed_j3d_70=precomputed_j3d,
+            paired_j3d_and_cam=paired,
         )
-        return toks_all, cam_t, j3d_14
+        return toks, cam_t, j3d_14
 
 
 class ReplayTokenExtractor:

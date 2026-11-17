@@ -7,8 +7,8 @@ Standalone external single-camera mocap app for **LAPLACE Persona**, running buf
 - **Dual Input Modes (Unified 30.0 Hz Sampler):**
   - **Live Camera (`--source camera`):** Low-latency webcam capture on a dedicated reader thread resampled onto FlowHMR's exact 30.0 Hz clock, with thread-safe hot-swapping across multiple live camera devices.
   - **Debug Video (`--source video`):** Plays any `.mp4`/`.mkv`/`.mov` (24/25/30/60 fps) resampled on the fly to 30.0 Hz without offline FFmpeg pre-transcoding, with seamless looping and side-by-side **Live (`t = now`)** vs **Latency-Synced (`t = now - Δ`)** preview feeds.
-- **Dynamic 6-DoF Camera Tracking (`--camera-tracking`):**
-  - Restores real/video camera distance, azimuth, elevation, roll, target, and vertical FOV in real time without `VGGT-Omega` by fusing `SAM 3D Body` `PerspectiveHead` metric depth + 3D joint Kabsch alignment with background optical-flow visual odometry (`camera_R`).
+- **Dynamic 6-DoF Camera Tracking (`--camera-tracking` / `--no-camera-tracking`):**
+  - Restores real/video camera distance, azimuth, elevation, roll, target, and vertical FOV (`--camera-fov` calibrated lens FOV or auto intrinsics with within-shot optical zoom tracking) in real time without `VGGT-Omega` by fusing `SAM 3D Body` `PerspectiveHead` metric depth + 3D joint Kabsch alignment with background optical-flow visual odometry (`camera_R`).
   - Automatically detects hard multi-camera shot cuts and live webcam device switches (<0.15 ms), clamping sliding-window context to the active shot, anchoring world avatar heading across cuts, and snapping 60 Hz camera playout cleanly without swooping.
 - **RTX PRO 6000 Blackwell Accelerated (`triton-windows` + `torch.compile`):**
   - Batched BF16 `YOLOX-L` (`416x416` stride-2 with linear bbox interpolation, ~1.3 ms/frame) + loop-aware online `ByteTrack` stabilizer.

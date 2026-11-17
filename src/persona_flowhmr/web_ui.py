@@ -350,7 +350,12 @@ _DASHBOARD_HTML = """<!doctype html>
       if (el.type === 'checkbox') return el.checked;
       if ('float' in el.dataset) {
         const v = parseFloat(el.value || el.defaultValue || '1.0');
-        return Number.isFinite(v) && v > 0 ? v : 1.0;
+        if (!Number.isFinite(v)) return parseFloat(el.defaultValue || '1.0');
+        const lo = el.min !== '' ? parseFloat(el.min) : -Infinity;
+        const hi = el.max !== '' ? parseFloat(el.max) : Infinity;
+        const clamped = Math.min(hi, Math.max(lo, v));
+        el.value = String(clamped);
+        return clamped;
       }
       if (el.type === 'number' || 'int' in el.dataset) return parseInt(el.value || el.defaultValue || '0', 10);
       return el.value;
@@ -473,10 +478,11 @@ _DASHBOARD_HTML = """<!doctype html>
       document.getElementById('m_yolo').textContent = t.yolox_ms_per_frame.toFixed(1) + ' ms';
       document.getElementById('m_sam').textContent = t.sam_ms_per_frame.toFixed(1) + ' ms';
       document.getElementById('m_mmdit').textContent = t.mmdit_ms_per_window.toFixed(1) + ' ms';
-      document.getElementById('m_cam_dist').textContent = t.camera_distance_m > 0
+      const showCam = Boolean(s.config.camera_tracking_enabled) && t.camera_distance_m > 0;
+      document.getElementById('m_cam_dist').textContent = showCam
         ? t.camera_distance_m.toFixed(2) + 'm · ' + t.camera_fov_deg.toFixed(0) + '°'
         : '—';
-      document.getElementById('m_cam_ang').textContent = t.camera_distance_m > 0
+      document.getElementById('m_cam_ang').textContent = showCam
         ? (t.camera_azimuth_deg >= 0 ? '+' : '') + t.camera_azimuth_deg.toFixed(1) + '° / ' +
           (t.camera_elevation_deg >= 0 ? '+' : '') + t.camera_elevation_deg.toFixed(1) + '°'
         : '—';
