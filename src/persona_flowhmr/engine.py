@@ -425,6 +425,8 @@ class StreamingMocapEngine:
         self._evicted_lock = threading.Lock()
         self._evicted_switch_min_frame: int | None = None
         self._evicted_reset_min_frame: int | None = None
+        self._last_emitted_shot_id: int | None = None
+        self._consumed_boundary_frame: int | None = None
 
     @property
     def is_running(self) -> bool:
@@ -565,6 +567,8 @@ class StreamingMocapEngine:
         self._latest_emitted_pose = None
         self._frame0_mono = 0.0
         self._peeked_frame = None
+        self._last_emitted_shot_id = None
+        self._consumed_boundary_frame = None
         with self._evicted_lock:
             self._evicted_switch_min_frame = None
             self._evicted_reset_min_frame = None
@@ -1112,7 +1116,24 @@ class StreamingMocapEngine:
 
             by_idx = {it.frame_index: it for it in history}
             first_item, last_item = history[0], history[-1]
-            emit_item = by_idx.get(next_emit_frame) or last_item
+            exact_emit = by_idx.get(next_emit_frame)
+            forward_gap_boundary = False
+            if exact_emit is not None:
+                emit_item = exact_emit
+            else:
+                prev_items = [it for it in history if it.frame_index < next_emit_frame]
+                if prev_items:
+                    # Keep dropped-frame gaps in the preceding shot until the surviving cut frame arrives.
+                    emit_item = prev_items[-1]
+                else:
+                    emit_item = first_item
+                    forward_gap_boundary = (
+                        (self._last_emitted_shot_id is not None and emit_item.shot_id != self._last_emitted_shot_id)
+                        or emit_item.is_cut
+                        or emit_item.is_stream_reset
+                    )
+                    if forward_gap_boundary:
+                        self._consumed_boundary_frame = emit_item.frame_index
             target_shot_id = emit_item.shot_id
 
             stride = preset.stride_frames
@@ -1130,6 +1151,11 @@ class StreamingMocapEngine:
                     stride = k
                     cut_within_stride = True
                     break
+
+            next_after = next((it for it in history if it.frame_index >= next_emit_frame + stride), None)
+            boundary_at_stride_end = next_after is not None and (
+                next_after.shot_id != target_shot_id or next_after.is_stream_reset
+            )
 
             shot_items = [it for it in history if it.shot_id == target_shot_id]
             shot_first = shot_items[0] if shot_items else first_item
@@ -1167,7 +1193,46 @@ class StreamingMocapEngine:
             self.telemetry.mmdit_ms_per_window = round(self._solver.last_solve_ms, 2)
             self.telemetry.windows_solved += 1
 
-            stride_items = [by_idx.get(next_emit_frame + i) or shot_last for i in range(stride)]
+            stride_items: list[FrameFeatureItem] = []
+            for i in range(stride):
+                f_idx = next_emit_frame + i
+                raw_it = by_idx.get(f_idx)
+                if raw_it is not None:
+                    if self._consumed_boundary_frame == f_idx:
+                        adj_cam = replace(raw_it.cam_obs, is_cut=False) if raw_it.cam_obs is not None else None
+                        stride_items.append(
+                            replace(raw_it, is_cut=False, is_stream_reset=False, cam_obs=adj_cam)
+                        )
+                    else:
+                        stride_items.append(raw_it)
+                else:
+                    prev_shot = [it for it in shot_items if it.frame_index < f_idx]
+                    ref_it = prev_shot[-1] if prev_shot else shot_first
+                    synth_cut = bool(
+                        i == 0
+                        and forward_gap_boundary
+                        and (
+                            emit_item.is_cut
+                            or (
+                                self._last_emitted_shot_id is not None
+                                and target_shot_id != self._last_emitted_shot_id
+                            )
+                        )
+                    )
+                    synth_rst = bool(i == 0 and forward_gap_boundary and emit_item.is_stream_reset)
+                    synth_mono = ref_it.capture_mono_s + (f_idx - ref_it.frame_index) / MODEL_FPS
+                    synth_cam = replace(ref_it.cam_obs, is_cut=synth_cut) if ref_it.cam_obs is not None else None
+                    stride_items.append(
+                        FrameFeatureItem(
+                            frame_index=f_idx,
+                            capture_mono_s=synth_mono,
+                            sam_token=ref_it.sam_token,
+                            is_stream_reset=synth_rst,
+                            shot_id=target_shot_id,
+                            is_cut=synth_cut,
+                            cam_obs=synth_cam,
+                        )
+                    )
             stride_cam_obs = [it.cam_obs for it in stride_items if it.cam_obs is not None]
             have_stride_cam = track_cam and camera_solver is not None and len(stride_cam_obs) == len(stride_items)
             if have_stride_cam and camera_solver is not None and stream_frame0_hips[0] is not None:
@@ -1187,8 +1252,9 @@ class StreamingMocapEngine:
                 camera_solver=camera_solver if have_stride_cam else None,
                 follow_movement=self.config.follow_movement,
                 anchor_world_yaw_across_cuts=have_stride_cam,
-                save_tail=not (eos or cut_within_stride),
+                save_tail=not (eos or cut_within_stride or boundary_at_stride_end),
             )
+            self._last_emitted_shot_id = target_shot_id
             for cf, it in zip(committed, stride_items):
                 if it.is_stream_reset or stream_frame0_hips[0] is None:
                     stream_frame0_hips[0] = cf.hips_pos_rh.copy()

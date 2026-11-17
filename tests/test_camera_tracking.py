@@ -1069,16 +1069,21 @@ def test_vo_optical_zoom_vs_wall_dolly_and_pre_cut_incoming_crossfade() -> None:
     assert yaw_accum_deg > 0.12
 
 
-def test_stalled_camera_reader_close_releases_device(monkeypatch) -> None:
-    """Verify `CameraSource.close()` releases active capture in bounded time even when `cap.read()` is stalled."""
+def test_stalled_camera_reader_hot_swap_and_close_release_devices(monkeypatch) -> None:
+    """Verify hot-swapping away from a stalled camera starts live reads on the new device immediately,
+    and `close()` releases stalled captures in bounded time.
+    """
     import time
 
     from persona_flowhmr import sources
 
-    released = threading.Event()
-    unblock_read = threading.Event()
+    entered_stall_0 = threading.Event()
+    released_0 = threading.Event()
+    released_1 = threading.Event()
+    live_reads_1 = threading.Event()
+    unblock_0 = threading.Event()
 
-    class StalledCap:
+    class StalledCap0:
         def __init__(self) -> None:
             self._primed = False
 
@@ -1092,20 +1097,137 @@ def test_stalled_camera_reader_close_releases_device(monkeypatch) -> None:
             if not self._primed:
                 self._primed = True
                 return True, np.zeros((64, 64, 3), dtype=np.uint8)
-            unblock_read.wait(timeout=5.0)
+            entered_stall_0.set()
+            unblock_0.wait(timeout=5.0)
             return False, None
 
         def release(self) -> None:
-            released.set()
+            released_0.set()
 
-    monkeypatch.setattr(sources.cv2, "VideoCapture", lambda *_a, **_kw: StalledCap())
-    cam = sources.CameraSource(0, width=64, height=64, target_fps=30.0)
-    time.sleep(0.05)  # ensure `_reader_loop` is blocked inside second `cap.read()`
-    t0 = time.perf_counter()
+    class HealthyCap1:
+        def __init__(self) -> None:
+            self._reads = 0
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, *_args) -> bool:
+            return True
+
+        def read(self):
+            self._reads += 1
+            if self._reads >= 2:
+                live_reads_1.set()
+            time.sleep(0.01)
+            return True, np.full((64, 64, 3), 200, dtype=np.uint8)
+
+        def release(self) -> None:
+            released_1.set()
+
+    monkeypatch.setattr(
+        sources.cv2,
+        "VideoCapture",
+        lambda idx, *_a, **_kw: StalledCap0() if int(idx) == 0 else HealthyCap1(),
+    )
+    cam = sources.CameraSource(0, width=64, height=64, target_fps=60.0)
     try:
+        assert entered_stall_0.wait(timeout=2.0), "Reader did not enter blocking read()"
+        cam.switch_device(1, width=64, height=64, target_fps=60.0)
+        assert live_reads_1.wait(timeout=1.5), "New camera reader did not resume live capture after hot-swap"
+        assert released_0.wait(timeout=2.0), "Retired stalled camera was not released independently"
+
+        t0 = time.perf_counter()
         cam.close()
         elapsed = time.perf_counter() - t0
-        assert released.is_set(), "Expected close() to release capture even while reader is stalled in read()"
+        assert released_1.is_set()
         assert elapsed < 2.0
     finally:
-        unblock_read.set()
+        unblock_0.set()
+
+
+def test_dropped_frame_gap_across_camera_cut_preserves_shot_boundary() -> None:
+    """Verify `_solve_ready_windows` keeps gap frames in the preceding shot and fires `is_cut` at the surviving cut."""
+    from collections import deque
+
+    import torch
+
+    from persona_flowhmr.config import EngineConfig
+    from persona_flowhmr.engine import FrameFeatureItem, StreamingMocapEngine
+
+    cfg = EngineConfig(preset="ultra_low", camera_tracking_enabled=True, vmc_enabled=False, plugin_api_enabled=False)
+    eng = StreamingMocapEngine(cfg)
+    decoder = MotionLatentDecoder(MOTION_STATS_PATH, motion_style="basic")
+    eng._decoder = decoder
+
+    class DummySolver:
+        last_solve_ms = 1.0
+
+        def solve_window(self, tokens, indices, *, ode_steps: int, camera_r_w_9=None):
+            return np.zeros((len(indices), 491), dtype=np.float32)
+
+    eng._solver = DummySolver()  # type: ignore[assignment]
+    preset = cfg.get_preset()
+    stitcher = StreamingStitcher(decoder, fps=30.0)
+    cam_solver = StreamingCameraSolver(avatar_scale=1.0)
+    h, w = 720, 1280
+    cam_k = default_camera_intrinsics(h, w)
+    dec0 = decoder.decode_window(np.zeros((1, 491), dtype=np.float32))
+    ljp_neutral = dec0["ljp_cam"][0]
+    hips0 = np.array([-float(ljp_neutral[0, 0]), float(dec0["srp_y_cam"][0]), -float(ljp_neutral[0, 2])], dtype=np.float32)
+    stage_j14 = extract_smplh_body14_stage(ljp_neutral, hips0)
+    cv_to_three = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+
+    def _make_item(f_idx: int, shot_id: int, dist_m: float, *, is_cut: bool = False) -> FrameFeatureItem:
+        c_pos = np.array([0.0, float(hips0[1]), dist_m], dtype=np.float32)
+        j14_cv = ((stage_j14 - c_pos[None, :]) @ cv_to_three.T).astype(np.float32)
+        obs = FrameCameraObservation(
+            sam_cam_t=np.array([0.0, 0.9, dist_m], dtype=np.float32),
+            sam_j3d_cam=j14_cv,
+            cam_k=cam_k,
+            image_hw=(h, w),
+            bbox_xyxy=np.array([450.0, 100.0, 830.0, 680.0], dtype=np.float32),
+            r_vo_yup=np.eye(3, dtype=np.float32),
+            vo_inliers=25,
+            is_cut=is_cut,
+            shot_id=shot_id,
+            trans_flow_px=0.05,
+        )
+        return FrameFeatureItem(
+            frame_index=f_idx,
+            capture_mono_s=100.0 + f_idx / 30.0,
+            sam_token=torch.zeros(3072, dtype=torch.float32),
+            is_stream_reset=False,
+            shot_id=shot_id,
+            is_cut=is_cut,
+            cam_obs=obs,
+        )
+
+    # Frames 0..7 in Shot 0 (dist=2.2m), frames 8..11 dropped, frames 12..25 in Shot 1 (dist=5.4m, cut at 12).
+    history: deque[FrameFeatureItem] = deque()
+    for f in range(0, 8):
+        history.append(_make_item(f, shot_id=0, dist_m=2.2, is_cut=(f == 0)))
+    for f in range(12, 26):
+        history.append(_make_item(f, shot_id=1, dist_m=5.4, is_cut=(f == 12)))
+
+    committed_all = []
+    eng._playout_buffer.push_many = lambda frames: committed_all.extend(frames)  # type: ignore[method-assign]
+    next_emit = eng._solve_ready_windows(
+        history,
+        0,
+        eos=True,
+        preset=preset,
+        stitcher=stitcher,
+        camera_solver=cam_solver,
+        stream_frame0_hips=[None],
+        first_commit_event=threading.Event(),
+    )
+    assert next_emit == 26
+    by_f = {p.frame_index: p for p in committed_all}
+    # Gap frames 8..11 MUST stay in Shot 0 (~2.2m, is_cut=False), and Shot 1 starts crisply at frame 12 (~5.4m, is_cut=True)!
+    for f in range(8, 12):
+        assert by_f[f].camera is not None
+        assert by_f[f].camera.is_cut is False
+        assert abs(by_f[f].camera.orbit_distance - 2.2) < 0.25
+    assert by_f[12].camera is not None
+    assert by_f[12].camera.is_cut is True
+    assert abs(by_f[12].camera.orbit_distance - 5.4) < 0.25

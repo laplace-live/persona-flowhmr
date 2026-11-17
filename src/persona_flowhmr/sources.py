@@ -11,6 +11,7 @@ import contextlib
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -244,6 +245,10 @@ def _open_and_prime_camera(
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
             cap.set(cv2.CAP_PROP_FPS, float(target_fps))
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(max(100.0, timeout_s * 1000.0)))
+            if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 500)
             ok, first_bgr = cap.read()
             if abandoned.is_set():
                 cap.release()
@@ -272,8 +277,83 @@ def _open_and_prime_camera(
     return box["cap"], box["bgr"]  # type: ignore[return-value]
 
 
+class _CameraDeviceReader:
+    """Single-device reader thread with exclusive capture ownership and bounded shutdown."""
+
+    def __init__(
+        self,
+        cap: cv2.VideoCapture,
+        on_frame: Callable[[np.ndarray], None],
+        *,
+        index: int,
+    ) -> None:
+        self._cap: cv2.VideoCapture | None = cap
+        self._on_frame = on_frame
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._loop, name=f"camera-reader-{index}", daemon=True)
+        self._thread.start()
+
+    def _take_cap(self) -> cv2.VideoCapture | None:
+        with self._lock:
+            cap = self._cap
+            self._cap = None
+            return cap
+
+    def _loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                with self._lock:
+                    cap = self._cap
+                if cap is None:
+                    break
+                ok, bgr = cap.read()
+                if not ok or bgr is None:
+                    if self._stop.is_set():
+                        break
+                    time.sleep(0.005)
+                    continue
+                if not self._stop.is_set():
+                    self._on_frame(bgr)
+        finally:
+            cap = self._take_cap()
+            if cap is not None:
+                with contextlib.suppress(Exception):
+                    cap.release()
+
+    def stop(self, *, join_timeout_s: float = 1.0) -> None:
+        self._stop.set()
+        with self._lock:
+            cap_ref = self._cap
+        if cap_ref is not None:
+            cancel_fn = getattr(cap_ref, "cancel", None)
+            if callable(cancel_fn):
+                with contextlib.suppress(Exception):
+                    cancel_fn()
+        if self._thread.is_alive():
+            self._thread.join(timeout=max(0.05, float(join_timeout_s)))
+        cap = self._take_cap()
+        if cap is None:
+            return
+        if not self._thread.is_alive():
+            with contextlib.suppress(Exception):
+                cap.release()
+            return
+
+        # Cooperating backends exit `read()` within `CAP_PROP_READ_TIMEOUT_MSEC` (500 ms) so `_loop` releases
+        # `cap` on the owning thread above. Only if a wedged driver/mock ignores read timeouts past `join_timeout_s`,
+        # detach ownership (`_take_cap`) and release on an isolated daemon thread so the OS handle is not leaked.
+        def _release_one() -> None:
+            with contextlib.suppress(Exception):
+                cap.release()
+
+        rel_t = threading.Thread(target=_release_one, name="camera-force-release", daemon=True)
+        rel_t.start()
+        rel_t.join(timeout=0.5)
+
+
 class CameraSource:
-    """Live webcam capture with a lock-free reader loop, bounded hot-swap, and steady 30.0 Hz clock."""
+    """Live webcam capture with per-device reader isolation, bounded hot-swap, and steady 30.0 Hz clock."""
 
     def __init__(
         self,
@@ -293,17 +373,33 @@ class CameraSource:
             timeout_s=open_timeout_s,
         )
 
-        self._cap: cv2.VideoCapture | None = cap
         self._device_gen = 0
-        self._retired_caps: list[cv2.VideoCapture] = []
         self._clock = _FrameClock(target_fps)
         self._lock = threading.Lock()
         # Raw BGR; converted to RGB only for frames actually emitted on the output clock.
         self._latest_bgr: np.ndarray = first_bgr
         self._pending_switch = False
         self._stop = threading.Event()
-        self._reader_thread = threading.Thread(target=self._reader_loop, name="camera-reader", daemon=True)
-        self._reader_thread.start()
+        self._retiring_readers: list[_CameraDeviceReader] = []
+        self._reader: _CameraDeviceReader | None = self._start_reader(cap, gen=0, index=self.camera_index)
+
+    def _start_reader(self, cap: cv2.VideoCapture, *, gen: int, index: int) -> _CameraDeviceReader:
+        def _publish(bgr: np.ndarray) -> None:
+            with self._lock:
+                if gen == self._device_gen and not self._stop.is_set():
+                    self._latest_bgr = bgr
+
+        return _CameraDeviceReader(cap, _publish, index=index)
+
+    def _retire_reader_async(self, reader: _CameraDeviceReader) -> None:
+        def _cleanup() -> None:
+            try:
+                reader.stop(join_timeout_s=0.6)
+            finally:
+                with self._lock, contextlib.suppress(ValueError):
+                    self._retiring_readers.remove(reader)
+
+        threading.Thread(target=_cleanup, name="camera-retire", daemon=True).start()
 
     def switch_device(
         self,
@@ -314,7 +410,7 @@ class CameraSource:
         target_fps: float = 30.0,
         timeout_s: float = 2.5,
     ) -> None:
-        """Hot-swap to another live webcam device with bounded timeout and generation-guarded frame publish."""
+        """Hot-swap to another live webcam device with independent reader startup and bounded old-device retirement."""
         new_idx = int(camera_index)
         if new_idx == self.camera_index:
             return
@@ -327,49 +423,22 @@ class CameraSource:
         )
 
         with self._lock:
-            if self._cap is not None:
-                self._retired_caps.append(self._cap)
-            self._cap = new_cap
+            if self._stop.is_set():
+                with contextlib.suppress(Exception):
+                    new_cap.release()
+                return
+            old_reader = self._reader
             self._device_gen += 1
+            new_gen = self._device_gen
             self.camera_index = new_idx
             self._latest_bgr = first_bgr
             self._pending_switch = True
+            self._reader = self._start_reader(new_cap, gen=new_gen, index=new_idx)
+            if old_reader is not None:
+                self._retiring_readers.append(old_reader)
 
-    def _drain_retired_caps(self) -> None:
-        with self._lock:
-            retired = list(self._retired_caps)
-            self._retired_caps.clear()
-        for old_cap in retired:
-            with contextlib.suppress(Exception):
-                old_cap.release()
-
-    def _reader_loop(self) -> None:
-        try:
-            while not self._stop.is_set():
-                self._drain_retired_caps()
-                with self._lock:
-                    cap = self._cap
-                    gen = self._device_gen
-                if cap is None:
-                    break
-                # Perform blocking driver read without holding `_lock` so `switch_device` and `close` never stall.
-                ok, bgr = cap.read()
-                if not ok or bgr is None:
-                    time.sleep(0.005)
-                    continue
-                with self._lock:
-                    # Discard stale frames captured from a superseded device before `switch_device` swapped `_cap`.
-                    if gen == self._device_gen and not self._stop.is_set():
-                        self._latest_bgr = bgr
-        finally:
-            self._drain_retired_caps()
-            if self._stop.is_set():
-                with self._lock:
-                    active_cap = self._cap
-                    self._cap = None
-                if active_cap is not None:
-                    with contextlib.suppress(Exception):
-                        active_cap.release()
+        if old_reader is not None:
+            self._retire_reader_async(old_reader)
 
     def read_next(self) -> SampledFrame | None:
         if self._stop.is_set():
@@ -383,26 +452,26 @@ class CameraSource:
 
     def close(self) -> None:
         self._stop.set()
-        if self._reader_thread.is_alive():
-            self._reader_thread.join(timeout=1.0)
         with self._lock:
-            pending_caps = list(self._retired_caps)
-            self._retired_caps.clear()
-            if self._cap is not None:
-                pending_caps.append(self._cap)
-                self._cap = None
-        if pending_caps:
-            def _release_all() -> None:
-                for c in pending_caps:
-                    with contextlib.suppress(Exception):
-                        c.release()
-
-            if self._reader_thread.is_alive():
-                rel_t = threading.Thread(target=_release_all, name="camera-force-release", daemon=True)
-                rel_t.start()
-                rel_t.join(timeout=0.5)
-            else:
-                _release_all()
+            readers = list(self._retiring_readers)
+            self._retiring_readers.clear()
+            if self._reader is not None:
+                readers.append(self._reader)
+                self._reader = None
+        if not readers:
+            return
+        if len(readers) == 1:
+            readers[0].stop(join_timeout_s=1.0)
+            return
+        stop_threads = [
+            threading.Thread(target=r.stop, kwargs={"join_timeout_s": 1.0}, name="camera-close", daemon=True)
+            for r in readers
+        ]
+        for st in stop_threads:
+            st.start()
+        deadline = time.perf_counter() + 1.6
+        for st in stop_threads:
+            st.join(timeout=max(0.0, deadline - time.perf_counter()))
 
 
 def list_available_cameras(max_probe: int = 4) -> list[dict[str, int | str]]:
