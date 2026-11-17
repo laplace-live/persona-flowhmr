@@ -427,6 +427,7 @@ class StreamingMocapEngine:
         self._evicted_reset_min_frame: int | None = None
         self._last_emitted_shot_id: int | None = None
         self._consumed_boundary_frame: int | None = None
+        self._prev_commit_cam: bool = False
 
     @property
     def is_running(self) -> bool:
@@ -569,6 +570,7 @@ class StreamingMocapEngine:
         self._peeked_frame = None
         self._last_emitted_shot_id = None
         self._consumed_boundary_frame = None
+        self._prev_commit_cam = False
         with self._evicted_lock:
             self._evicted_switch_min_frame = None
             self._evicted_reset_min_frame = None
@@ -1115,7 +1117,7 @@ class StreamingMocapEngine:
                 break
 
             by_idx = {it.frame_index: it for it in history}
-            first_item, last_item = history[0], history[-1]
+            first_item = history[0]
             exact_emit = by_idx.get(next_emit_frame)
             forward_gap_boundary = False
             if exact_emit is not None:
@@ -1159,45 +1161,24 @@ class StreamingMocapEngine:
 
             shot_items = [it for it in history if it.shot_id == target_shot_id]
             shot_first = shot_items[0] if shot_items else first_item
-            shot_last = shot_items[-1] if shot_items else last_item
+
+            def _resolve_shot_item(f_idx: int) -> FrameFeatureItem:
+                cand = by_idx.get(f_idx)
+                if cand is not None and cand.shot_id == target_shot_id:
+                    return cand
+                prev_shot = [it for it in shot_items if it.frame_index < f_idx]
+                return prev_shot[-1] if prev_shot else shot_first
 
             win_start = next_emit_frame - preset.history_frames
             win_indices = list(range(win_start, win_start + preset.window_frames))
-            win_items = [
-                by_idx[f]
-                if (f in by_idx and by_idx[f].shot_id == target_shot_id)
-                else (shot_first if f < shot_first.frame_index else shot_last)
-                for f in win_indices
-            ]
+            win_items = [_resolve_shot_item(f) for f in win_indices]
             win_tokens = [it.sam_token for it in win_items]
-
-            track_cam = bool(self.config.camera_tracking_enabled)
-            if track_cam and win_items[0].cam_obs is not None:
-                r_win0 = win_items[0].cam_obs.r_vo_yup
-                rel_yup = np.stack(
-                    [(it.cam_obs.r_vo_yup if it.cam_obs is not None else r_win0) @ r_win0.T for it in win_items],
-                    axis=0,
-                )
-                cam_r_w_9 = yup_rel_to_opencv_camera_r(rel_yup).reshape(-1, 9)
-                window_vo_yaw = math.atan2(float(r_win0[2, 0]), float(r_win0[2, 2]))
-            else:
-                cam_r_w_9 = None
-                window_vo_yaw = 0.0
-
-            latent_win = self._solver.solve_window(
-                torch.stack(win_tokens, dim=0),
-                win_indices,
-                ode_steps=preset.ode_steps,
-                camera_r_w_9=cam_r_w_9,
-            )
-            self.telemetry.mmdit_ms_per_window = round(self._solver.last_solve_ms, 2)
-            self.telemetry.windows_solved += 1
 
             stride_items: list[FrameFeatureItem] = []
             for i in range(stride):
                 f_idx = next_emit_frame + i
                 raw_it = by_idx.get(f_idx)
-                if raw_it is not None:
+                if raw_it is not None and raw_it.shot_id == target_shot_id:
                     if self._consumed_boundary_frame == f_idx:
                         adj_cam = replace(raw_it.cam_obs, is_cut=False) if raw_it.cam_obs is not None else None
                         stride_items.append(
@@ -1206,8 +1187,7 @@ class StreamingMocapEngine:
                     else:
                         stride_items.append(raw_it)
                 else:
-                    prev_shot = [it for it in shot_items if it.frame_index < f_idx]
-                    ref_it = prev_shot[-1] if prev_shot else shot_first
+                    ref_it = _resolve_shot_item(f_idx)
                     synth_cut = bool(
                         i == 0
                         and forward_gap_boundary
@@ -1233,8 +1213,45 @@ class StreamingMocapEngine:
                             cam_obs=synth_cam,
                         )
                     )
+
+            track_cam = bool(self.config.camera_tracking_enabled)
             stride_cam_obs = [it.cam_obs for it in stride_items if it.cam_obs is not None]
-            have_stride_cam = track_cam and camera_solver is not None and len(stride_cam_obs) == len(stride_items)
+            have_stride_cam = (
+                track_cam
+                and camera_solver is not None
+                and win_items[0].cam_obs is not None
+                and len(stride_cam_obs) == len(stride_items)
+            )
+            if have_stride_cam and not self._prev_commit_cam and camera_solver is not None:
+                camera_solver.reset(keep_origin=True)
+            self._prev_commit_cam = have_stride_cam
+
+            if have_stride_cam and camera_solver is not None and win_items[0].cam_obs is not None:
+                r_win0 = win_items[0].cam_obs.r_vo_yup
+                rel_yup = np.stack(
+                    [(it.cam_obs.r_vo_yup if it.cam_obs is not None else r_win0) @ r_win0.T for it in win_items],
+                    axis=0,
+                )
+                cam_r_w_9 = yup_rel_to_opencv_camera_r(rel_yup).reshape(-1, 9)
+                r_cut_fb = shot_first.cam_obs.r_vo_yup if shot_first.cam_obs is not None else r_win0
+                window_vo_yaw = camera_solver.window_vo_yaw_rad(
+                    target_shot_id,
+                    r_win0,
+                    r_cut_fallback=r_cut_fb,
+                )
+            else:
+                cam_r_w_9 = None
+                window_vo_yaw = 0.0
+
+            latent_win = self._solver.solve_window(
+                torch.stack(win_tokens, dim=0),
+                win_indices,
+                ode_steps=preset.ode_steps,
+                camera_r_w_9=cam_r_w_9,
+            )
+            self.telemetry.mmdit_ms_per_window = round(self._solver.last_solve_ms, 2)
+            self.telemetry.windows_solved += 1
+
             if have_stride_cam and camera_solver is not None and stream_frame0_hips[0] is not None:
                 camera_solver.anchor_stream_origin(stream_frame0_hips[0])
 

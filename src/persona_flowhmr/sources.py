@@ -218,6 +218,130 @@ def _open_camera(index: int) -> cv2.VideoCapture:
     return cap
 
 
+class _PendingCameraOpen:
+    """Tracked helper thread for opening + priming a camera with bounded abort and handle cleanup."""
+
+    def __init__(
+        self,
+        index: int,
+        *,
+        width: int,
+        height: int,
+        target_fps: float,
+        timeout_s: float,
+    ) -> None:
+        self.index = int(index)
+        self._width = int(width)
+        self._height = int(height)
+        self._target_fps = float(target_fps)
+        self._timeout_s = float(timeout_s)
+        self._lock = threading.Lock()
+        self._abandoned = threading.Event()
+        self._cap: cv2.VideoCapture | None = None
+        self._first_bgr: np.ndarray | None = None
+        self._error: BaseException | None = None
+        self._release_thread: threading.Thread | None = None
+        self._thread = threading.Thread(target=self._worker, name=f"camera-open-{self.index}", daemon=True)
+        self._thread.start()
+
+    def _take_cap(self) -> cv2.VideoCapture | None:
+        with self._lock:
+            cap = self._cap
+            self._cap = None
+            return cap
+
+    def _worker(self) -> None:
+        cap: cv2.VideoCapture | None = None
+        try:
+            cap = _open_camera(self.index)
+            with self._lock:
+                if self._abandoned.is_set():
+                    with contextlib.suppress(Exception):
+                        cap.release()
+                    return
+                self._cap = cap
+            if not cap.isOpened():
+                owned = self._take_cap()
+                if owned is not None:
+                    with contextlib.suppress(Exception):
+                        owned.release()
+                self._error = RuntimeError(f"Cannot open camera index {self.index}")
+                return
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
+            cap.set(cv2.CAP_PROP_FPS, self._target_fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(max(100.0, self._timeout_s * 1000.0)))
+            if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 500)
+            ok, first_bgr = cap.read()
+            with self._lock:
+                if self._abandoned.is_set() or self._cap is None:
+                    owned = self._cap
+                    self._cap = None
+                elif not ok or first_bgr is None:
+                    owned = self._cap
+                    self._cap = None
+                    self._error = RuntimeError(f"Camera {self.index} opened but returned no frames")
+                else:
+                    owned = None
+                    self._first_bgr = first_bgr
+            if owned is not None:
+                with contextlib.suppress(Exception):
+                    owned.release()
+        except Exception as exc:
+            owned = self._take_cap()
+            if owned is not None:
+                with contextlib.suppress(Exception):
+                    owned.release()
+            self._error = exc
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive() or (self._release_thread is not None and self._release_thread.is_alive())
+
+    def abort(self, *, join_timeout_s: float = 0.25) -> None:
+        """Cancel and release any held `VideoCapture` within bounded wall time."""
+        self._abandoned.set()
+        with self._lock:
+            cap_ref = self._cap
+        if cap_ref is not None:
+            cancel_fn = getattr(cap_ref, "cancel", None)
+            if callable(cancel_fn):
+                with contextlib.suppress(Exception):
+                    cancel_fn()
+        if self._thread.is_alive():
+            self._thread.join(timeout=max(0.02, float(join_timeout_s)))
+        cap_owned = self._take_cap()
+        if cap_owned is not None:
+            if not self._thread.is_alive():
+                with contextlib.suppress(Exception):
+                    cap_owned.release()
+            else:
+                def _release_one() -> None:
+                    with contextlib.suppress(Exception):
+                        cap_owned.release()
+
+                rel_t = threading.Thread(target=_release_one, name="camera-open-force-release", daemon=True)
+                self._release_thread = rel_t
+                rel_t.start()
+                rel_t.join(timeout=0.35)
+        elif self._release_thread is not None and self._release_thread.is_alive():
+            self._release_thread.join(timeout=max(0.02, float(join_timeout_s)))
+
+    def wait_and_take(self) -> tuple[cv2.VideoCapture, np.ndarray]:
+        self._thread.join(timeout=max(0.1, self._timeout_s))
+        if self._thread.is_alive():
+            self.abort(join_timeout_s=0.15)
+            raise TimeoutError(f"Timed out opening camera index {self.index} after {self._timeout_s:.1f}s")
+        if self._error is not None:
+            raise self._error
+        cap = self._take_cap()
+        if cap is None or self._first_bgr is None:
+            raise RuntimeError(f"Camera {self.index} open completed without a capture handle")
+        return cap, self._first_bgr
+
+
 def _open_and_prime_camera(
     index: int,
     *,
@@ -226,55 +350,15 @@ def _open_and_prime_camera(
     target_fps: float,
     timeout_s: float = 2.5,
 ) -> tuple[cv2.VideoCapture, np.ndarray]:
-    """Open `index` and read its first BGR frame on a helper thread with a bounded `timeout_s` wait."""
-    box: dict[str, object] = {}
-    abandoned = threading.Event()
-
-    def _init_worker() -> None:
-        cap: cv2.VideoCapture | None = None
-        try:
-            cap = _open_camera(index)
-            if abandoned.is_set():
-                cap.release()
-                return
-            if not cap.isOpened():
-                cap.release()
-                box["error"] = RuntimeError(f"Cannot open camera index {index}")
-                return
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
-            cap.set(cv2.CAP_PROP_FPS, float(target_fps))
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(max(100.0, timeout_s * 1000.0)))
-            if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
-                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 500)
-            ok, first_bgr = cap.read()
-            if abandoned.is_set():
-                cap.release()
-                return
-            if not ok or first_bgr is None:
-                cap.release()
-                box["error"] = RuntimeError(f"Camera {index} opened but returned no frames")
-                return
-            box["cap"] = cap
-            box["bgr"] = first_bgr
-        except Exception as exc:
-            if cap is not None:
-                with contextlib.suppress(Exception):
-                    cap.release()
-            box["error"] = exc
-
-    t = threading.Thread(target=_init_worker, name=f"camera-open-{index}", daemon=True)
-    t.start()
-    t.join(timeout=max(0.1, float(timeout_s)))
-    if t.is_alive():
-        abandoned.set()
-        raise TimeoutError(f"Timed out opening camera index {index} after {timeout_s:.1f}s")
-    if "error" in box:
-        err = box["error"]
-        raise err if isinstance(err, BaseException) else RuntimeError(str(err))
-    return box["cap"], box["bgr"]  # type: ignore[return-value]
+    """Open `index` and read its first BGR frame on a helper thread with bounded wait and cleanup."""
+    pending = _PendingCameraOpen(
+        index,
+        width=width,
+        height=height,
+        target_fps=target_fps,
+        timeout_s=timeout_s,
+    )
+    return pending.wait_and_take()
 
 
 class _CameraDeviceReader:
@@ -381,6 +465,7 @@ class CameraSource:
         self._pending_switch = False
         self._stop = threading.Event()
         self._retiring_readers: list[_CameraDeviceReader] = []
+        self._timed_out_opens: dict[int, _PendingCameraOpen] = {}
         self._reader: _CameraDeviceReader | None = self._start_reader(cap, gen=0, index=self.camera_index)
 
     def _start_reader(self, cap: cv2.VideoCapture, *, gen: int, index: int) -> _CameraDeviceReader:
@@ -414,13 +499,40 @@ class CameraSource:
         new_idx = int(camera_index)
         if new_idx == self.camera_index:
             return
-        new_cap, first_bgr = _open_and_prime_camera(
+
+        with self._lock:
+            prev_open = self._timed_out_opens.get(new_idx)
+            if prev_open is not None and not prev_open.is_alive():
+                del self._timed_out_opens[new_idx]
+                prev_open = None
+        if prev_open is not None:
+            prev_open.abort(join_timeout_s=0.1)
+            if prev_open.is_alive():
+                raise TimeoutError(f"Camera index {new_idx} is still releasing from a previous timed-out open")
+            with self._lock:
+                if self._timed_out_opens.get(new_idx) is prev_open:
+                    del self._timed_out_opens[new_idx]
+
+        pending = _PendingCameraOpen(
             new_idx,
             width=width,
             height=height,
             target_fps=target_fps,
             timeout_s=timeout_s,
         )
+        try:
+            new_cap, first_bgr = pending.wait_and_take()
+        except TimeoutError:
+            if pending.is_alive():
+                should_abort_again = False
+                with self._lock:
+                    if self._stop.is_set():
+                        should_abort_again = True
+                    else:
+                        self._timed_out_opens[new_idx] = pending
+                if should_abort_again:
+                    pending.abort(join_timeout_s=0.25)
+            raise
 
         with self._lock:
             if self._stop.is_set():
@@ -455,9 +567,13 @@ class CameraSource:
         with self._lock:
             readers = list(self._retiring_readers)
             self._retiring_readers.clear()
+            pending_opens = list(self._timed_out_opens.values())
+            self._timed_out_opens.clear()
             if self._reader is not None:
                 readers.append(self._reader)
                 self._reader = None
+        for pending in pending_opens:
+            pending.abort(join_timeout_s=0.2)
         if not readers:
             return
         if len(readers) == 1:

@@ -273,6 +273,10 @@ _DASHBOARD_HTML = """<!doctype html>
             <label>Camera Scale</label>
             <input type="number" id="camera_avatar_scale" data-cfg data-float step="0.05" min="0.4" max="2.5" value="1.0" />
           </div>
+          <div class="field">
+            <label>Camera FOV° (0=Auto)</label>
+            <input type="number" id="camera_fov_deg" data-cfg data-float step="1" min="0" max="120" value="0" />
+          </div>
         </div>
         <label class="check"><input type="checkbox" id="mirror" data-cfg /> Mirror Avatar (Webcam Selfie Mode)</label>
         <label class="check"><input type="checkbox" id="follow_movement" data-cfg checked /> Follow Root Movement (XZ Travel)</label>
@@ -349,8 +353,9 @@ _DASHBOARD_HTML = """<!doctype html>
     function readField(el) {
       if (el.type === 'checkbox') return el.checked;
       if ('float' in el.dataset) {
-        const v = parseFloat(el.value || el.defaultValue || '1.0');
-        if (!Number.isFinite(v)) return parseFloat(el.defaultValue || '1.0');
+        const raw = el.value !== '' ? el.value : (el.defaultValue || '0');
+        const v = parseFloat(raw);
+        if (!Number.isFinite(v)) return parseFloat(el.defaultValue || '0');
         const lo = el.min !== '' ? parseFloat(el.min) : -Infinity;
         const hi = el.max !== '' ? parseFloat(el.max) : Infinity;
         const clamped = Math.min(hi, Math.max(lo, v));

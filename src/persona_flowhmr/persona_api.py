@@ -70,6 +70,7 @@ class PersonaPluginClient:
         self.bound_vrm_instance_id: str | None = None
         self.bound_vrm_placement: dict[str, Any] | None = None
         self.vrm_placement_valid: bool = False
+        self._placement_gen: int = 0
         self._last_placement_refresh_mono: float = 0.0
         self.camera_patches_sent: int = 0
         self._camera_inflight: bool = False
@@ -132,6 +133,7 @@ class PersonaPluginClient:
                 ) as ws:
                     self._ws = ws
                     self._last_sent_vrm_camera = None
+                    self._placement_gen += 1
                     self.bound_vrm_placement = None
                     self.vrm_placement_valid = False
                     self._last_placement_refresh_mono = 0.0
@@ -154,10 +156,18 @@ class PersonaPluginClient:
                         )
                         self.last_error = ""
                         self._connected.set()
+                        if self._pending_camera_pose is not None or self._pending_vrm_camera is not None:
+                            asyncio.create_task(self._drain_camera_queue())
                         await reader_task
                     finally:
                         reader_task.cancel()
                         self._connected.clear()
+                        self._ws = None
+                        disc_err = ConnectionError("Plugin API WebSocket disconnected")
+                        for fut in list(self._pending.values()):
+                            if not fut.done():
+                                fut.set_exception(disc_err)
+                        self._pending.clear()
             except Exception as exc:
                 self.last_error = str(exc)
                 self._connected.clear()
@@ -186,10 +196,19 @@ class PersonaPluginClient:
                         PersonaPluginError(str(msg.get("code", "UNKNOWN")), str(msg.get("message", "")))
                     )
             elif kind == "event":
-                # Any server-pushed scene/instance event invalidates cached VRM placement immediately.
+                # Any server-pushed scene/instance event invalidates cached and in-flight VRM placement immediately.
+                self._placement_gen += 1
+                self.bound_vrm_placement = None
+                self.vrm_placement_valid = False
                 self._last_placement_refresh_mono = 0.0
 
-    async def _send_request_async(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    async def _send_request_async(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout_s: float = 10.0,
+    ) -> Any:
         if self._ws is None:
             raise RuntimeError("Plugin API socket is not connected")
         self._req_counter += 1
@@ -199,16 +218,23 @@ class PersonaPluginClient:
         frame: dict[str, Any] = {"kind": "request", "id": req_id, "method": method}
         if params is not None:
             frame["params"] = params
-        await self._ws.send(json.dumps(frame))
-        return await asyncio.wait_for(fut, timeout=10.0)
+        try:
+            await self._ws.send(json.dumps(frame))
+            return await asyncio.wait_for(fut, timeout=max(0.05, float(timeout_s)))
+        finally:
+            self._pending.pop(req_id, None)
 
     def call(self, method: str, params: dict[str, Any] | None = None, timeout_s: float = 10.0) -> Any:
         """Synchronously invoke a Plugin API RPC method from any thread."""
         if not self.is_connected or self._loop is None:
             raise RuntimeError("PersonaPluginClient is not connected")
-        coro = self._send_request_async(method, params)
+        coro = self._send_request_async(method, params, timeout_s=timeout_s)
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result(timeout=timeout_s)
+        try:
+            return fut.result(timeout=max(0.1, float(timeout_s) + 0.5))
+        except BaseException:
+            fut.cancel()
+            raise
 
     def ensure_vmc_receiver(
         self,
@@ -243,6 +269,7 @@ class PersonaPluginClient:
 
         bound_instance_id: str | None = None
         if bind_primary_avatar:
+            start_gen = self._placement_gen
             inst_res = self.call("instance.list")
             instances = inst_res.get("instances", []) if isinstance(inst_res, dict) else []
             self.has_live2d_model = any(
@@ -269,49 +296,60 @@ class PersonaPluginClient:
                 try:
                     inst_detail = self.call("instance.get", {"instanceId": bound_instance_id})
                     vrm_place = (inst_detail or {}).get("item", {}).get("vrm") if isinstance(inst_detail, dict) else None
-                    self.bound_vrm_placement = vrm_place if isinstance(vrm_place, dict) else {}
-                    self.vrm_placement_valid = True
-                    self._last_placement_refresh_mono = time.monotonic()
+                    if self._placement_gen == start_gen:
+                        self.bound_vrm_placement = vrm_place if isinstance(vrm_place, dict) else {}
+                        self.vrm_placement_valid = True
+                        self._last_placement_refresh_mono = time.monotonic()
                 except Exception as exc:
                     self.last_error = str(exc)
             else:
                 self.bound_vrm_instance_id = None
-                self.vrm_placement_valid = True
-                self._last_placement_refresh_mono = time.monotonic()
+                if self._placement_gen == start_gen:
+                    self.vrm_placement_valid = True
+                    self._last_placement_refresh_mono = time.monotonic()
 
         return {"sourceId": source_id, "boundInstanceId": bound_instance_id}
 
     async def _refresh_vrm_placement_async(self) -> bool:
-        """Query primary VRM instance placement asynchronously; returns `True` only when placement state is verified."""
-        self.bound_vrm_placement = None
-        self.vrm_placement_valid = False
-        try:
-            inst_res = await self._send_request_async("instance.list")
-            instances = inst_res.get("instances", []) if isinstance(inst_res, dict) else []
-            self.has_live2d_model = any(
-                it.get("kind") == "model" and it.get("format") == "live2d" for it in instances
-            )
-            vrm_inst = next(
-                (it for it in instances if it.get("kind") == "model" and it.get("format") == "vrm"),
-                None,
-            )
-            self.has_vrm_model = vrm_inst is not None
-            if vrm_inst is None:
-                self.bound_vrm_instance_id = None
+        """Query primary VRM instance placement asynchronously; discards stale results invalidated by mid-RPC events."""
+        for _attempt in range(2):
+            start_gen = self._placement_gen
+            self.bound_vrm_placement = None
+            self.vrm_placement_valid = False
+            try:
+                inst_res = await self._send_request_async("instance.list")
+                if self._placement_gen != start_gen:
+                    continue
+                instances = inst_res.get("instances", []) if isinstance(inst_res, dict) else []
+                self.has_live2d_model = any(
+                    it.get("kind") == "model" and it.get("format") == "live2d" for it in instances
+                )
+                vrm_inst = next(
+                    (it for it in instances if it.get("kind") == "model" and it.get("format") == "vrm"),
+                    None,
+                )
+                self.has_vrm_model = vrm_inst is not None
+                if vrm_inst is None:
+                    if self._placement_gen != start_gen:
+                        continue
+                    self.bound_vrm_instance_id = None
+                    self.vrm_placement_valid = True
+                    self._last_placement_refresh_mono = time.monotonic()
+                    return True
+                inst_id = str(vrm_inst["instanceId"])
+                self.bound_vrm_instance_id = inst_id
+                inst_detail = await self._send_request_async("instance.get", {"instanceId": inst_id})
+                if self._placement_gen != start_gen:
+                    continue
+                vrm_place = (inst_detail or {}).get("item", {}).get("vrm") if isinstance(inst_detail, dict) else None
+                self.bound_vrm_placement = vrm_place if isinstance(vrm_place, dict) else {}
                 self.vrm_placement_valid = True
                 self._last_placement_refresh_mono = time.monotonic()
                 return True
-            inst_id = str(vrm_inst["instanceId"])
-            self.bound_vrm_instance_id = inst_id
-            inst_detail = await self._send_request_async("instance.get", {"instanceId": inst_id})
-            vrm_place = (inst_detail or {}).get("item", {}).get("vrm") if isinstance(inst_detail, dict) else None
-            self.bound_vrm_placement = vrm_place if isinstance(vrm_place, dict) else {}
-            self.vrm_placement_valid = True
-            self._last_placement_refresh_mono = time.monotonic()
-            return True
-        except Exception as exc:
-            self.last_error = str(exc)
-            return False
+            except Exception as exc:
+                self.last_error = str(exc)
+                return False
+        return False
 
     def refresh_vrm_placement(self, timeout_s: float = 5.0) -> bool:
         """Synchronously refresh primary VRM stage placement (used even when VMC auto-configure is disabled)."""
@@ -334,23 +372,45 @@ class PersonaPluginClient:
                 if self._pending_camera_pose is not None:
                     nxt_pose, nxt_mirror = self._pending_camera_pose
                     self._pending_camera_pose = None
-                    now_m = time.monotonic()
-                    if not self.vrm_placement_valid or (now_m - self._last_placement_refresh_mono) >= 1.0:
-                        if not await self._refresh_vrm_placement_async():
+                    placement_snapshot: dict[str, Any] | None = None
+                    placement_ready = False
+                    for _attempt in range(2):
+                        snap_gen = self._placement_gen
+                        now_m = time.monotonic()
+                        if not self.vrm_placement_valid or (now_m - self._last_placement_refresh_mono) >= 1.0:
+                            if not await self._refresh_vrm_placement_async():
+                                break
+                            snap_gen = self._placement_gen
+                        if not self.has_vrm_model or not self.vrm_placement_valid:
                             break
-                    if not self.has_vrm_model or not self.vrm_placement_valid:
+                        if self._placement_gen != snap_gen:
+                            continue
+                        placement_snapshot = (
+                            dict(self.bound_vrm_placement) if isinstance(self.bound_vrm_placement, dict) else None
+                        )
+                        if self._placement_gen == snap_gen and self.vrm_placement_valid:
+                            placement_ready = True
+                            break
+                    if not placement_ready:
                         break
                     nxt_cam: dict[str, Any] | None = camera_to_persona_vrm_camera(
                         nxt_pose,
                         mirror=nxt_mirror,
-                        vrm_placement=self.bound_vrm_placement,
+                        vrm_placement=placement_snapshot,
                     )
+                    used_placement_gen: int | None = snap_gen
                 elif self._pending_vrm_camera is not None:
                     nxt_cam = self._pending_vrm_camera
                     self._pending_vrm_camera = None
+                    used_placement_gen = None
                 else:
                     break
 
+                if used_placement_gen is not None and self._placement_gen != used_placement_gen:
+                    # Placement was invalidated before sending; re-queue the latest pose for fresh conversion.
+                    if self._pending_camera_pose is None and self._pending_vrm_camera is None:
+                        self._pending_camera_pose = (nxt_pose, nxt_mirror)
+                    continue
                 if not nxt_cam or nxt_cam == self._last_sent_vrm_camera:
                     continue
                 try:

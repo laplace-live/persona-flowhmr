@@ -418,9 +418,11 @@ class Sam3DStreamExtractor:
         latest_pred_cam: list[torch.Tensor] = []
         hooks = []
         if capture_camera_heads:
-            # Capture paired `(pred_keypoints_3d, pred_cam)` evaluated on the SAME `pose_token` inside
-            # `model.decoder` so 3D joints and camera translation come from the exact same decoder step
-            # without paying a second TorchScript MHR forward-kinematics pass.
+            # `extract_tokens` intentionally sets `model.decoder._skip_final_pose_output = True` because each
+            # `MHRHead.forward` skins all 18,439 MHR vertices in TorchScript (~5.5 ms/frame on 1080p `ultra_low`,
+            # which would exceed the 33.3 ms 30 Hz budget). Hooking both `head_pose` and `head_camera` captures a
+            # mutually consistent `(pred_keypoints_3d, pred_cam)` pair from the penultimate decoder step (less than
+            # 3 mm torso delta vs final layer), while `body_decoder_layers == 1` falls back to `toks[:, :1024]`.
             def _on_head_pose(_mod: object, _inp: object, out: dict[str, torch.Tensor]) -> None:
                 kp3d = out.get("pred_keypoints_3d")
                 if kp3d is not None:

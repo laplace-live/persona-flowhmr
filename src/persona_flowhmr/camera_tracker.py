@@ -833,6 +833,8 @@ class StreamingCameraSolver:
     def __init__(self, *, avatar_scale: float = 1.0, calibrated_fov_deg: float = 0.0) -> None:
         self.avatar_scale = max(0.1, float(avatar_scale)) if math.isfinite(float(avatar_scale)) else 1.0
         self.calibrated_fov_deg = float(calibrated_fov_deg) if math.isfinite(float(calibrated_fov_deg)) else 0.0
+        self._shot_id: int | None = None
+        self._shot_tilt_roll_rot: np.ndarray | None = None
         self._shot_base_rot: np.ndarray | None = None
         self._shot_cut_vo_yup: np.ndarray | None = None
         self._r_world_from_cam: np.ndarray | None = None
@@ -854,6 +856,8 @@ class StreamingCameraSolver:
             self._frame0_hips_rh = np.asarray(hips_pos_rh, dtype=np.float32).copy()
 
     def reset(self, *, keep_origin: bool = False) -> None:
+        self._shot_id = None
+        self._shot_tilt_roll_rot = None
         self._shot_base_rot = None
         self._shot_cut_vo_yup = None
         self._r_world_from_cam = None
@@ -867,6 +871,36 @@ class StreamingCameraSolver:
         self._accum_pos_path = 0.0
         if not keep_origin:
             self._frame0_hips_rh = None
+
+    def window_vo_yaw_rad(
+        self,
+        shot_id: int,
+        r_win0_yup: np.ndarray,
+        *,
+        r_cut_fallback: np.ndarray | None = None,
+    ) -> float:
+        """Compute horizontal stage heading delta for `r_win0_yup` in the shot's level stage frame.
+
+        Includes the shot's starting elevation and roll (`_shot_tilt_roll_rot`) so panning a rolled or
+        tilted camera yields the true horizontal stage azimuth delta rather than camera-local yaw.
+        """
+        r_win0 = np.asarray(r_win0_yup, dtype=np.float32)
+        if (
+            self._shot_id == int(shot_id)
+            and self._shot_tilt_roll_rot is not None
+            and self._shot_cut_vo_yup is not None
+        ):
+            rel_vo_yup = r_win0 @ self._shot_cut_vo_yup.T
+            r_shot_stage = self._shot_tilt_roll_rot @ rel_vo_yup.T
+        elif r_cut_fallback is not None:
+            rel_vo_yup = r_win0 @ np.asarray(r_cut_fallback, dtype=np.float32).T
+            r_shot_stage = rel_vo_yup.T
+        else:
+            r_shot_stage = r_win0.T
+        horiz = math.hypot(float(r_shot_stage[0, 2]), float(r_shot_stage[2, 2]))
+        if horiz > 1e-4:
+            return math.atan2(float(r_shot_stage[0, 2]), float(r_shot_stage[2, 2]))
+        return math.atan2(-float(r_shot_stage[2, 0]), float(r_shot_stage[0, 0]))
 
     def solve_frame(
         self,
@@ -894,15 +928,16 @@ class StreamingCameraSolver:
         self._last_calibrated_fov_deg = cal_fov
 
         # Match Persona's `VrmPoseDriver.applyTranslation` (`hipsRest + (hips_t - hips_0)`):
-        # At stream start, the avatar stands at `(0, hips_0_y * scale, 0)`, and travels by `(hips_t - hips_0)`.
+        # Rest pelvis height scales with VRM proportions (`hips_0_y * scale`), while VMC floor/vertical
+        # travel `(hips_t - hips_0)` is applied 1:1 in stage meters (`pose_to_vmc_bones` is unscaled).
         delta_hips = np.asarray(hips_pos_rh, dtype=np.float32) - self._frame0_hips_rh
         fx_travel = float(delta_hips[0]) if follow_flag else 0.0
         fz_travel = float(delta_hips[2]) if follow_flag else 0.0
         stage_hips = np.array(
             [
-                fx_travel * self.avatar_scale,
-                (float(self._frame0_hips_rh[1]) + float(delta_hips[1])) * self.avatar_scale,
-                fz_travel * self.avatar_scale,
+                fx_travel,
+                float(self._frame0_hips_rh[1]) * self.avatar_scale + float(delta_hips[1]),
+                fz_travel,
             ],
             dtype=np.float32,
         )
@@ -924,6 +959,7 @@ class StreamingCameraSolver:
             or self._shot_base_rot is None
             or self._shot_cut_vo_yup is None
             or self._pos_rh is None
+            or (self._shot_id is not None and int(obs.shot_id) != self._shot_id)
         )
         if is_cut:
             # Initialize new shot orientation ONCE at the cut boundary:
@@ -973,7 +1009,10 @@ class StreamingCameraSolver:
             cr, sr = math.cos(roll_cut), math.sin(roll_cut)
             rx_neg_el = np.array([[1.0, 0.0, 0.0], [0.0, ce, -se], [0.0, se, ce]], dtype=np.float32)
             rz_roll = np.array([[cr, -sr, 0.0], [sr, cr, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
-            self._shot_base_rot = (_rot_y_matrix(float(world_yaw_rad)) @ rx_neg_el @ rz_roll).astype(np.float32)
+            tilt_roll_rot = (rx_neg_el @ rz_roll).astype(np.float32)
+            self._shot_id = int(obs.shot_id)
+            self._shot_tilt_roll_rot = tilt_roll_rot
+            self._shot_base_rot = (_rot_y_matrix(float(world_yaw_rad)) @ tilt_roll_rot).astype(np.float32)
             self._shot_cut_vo_yup = obs.r_vo_yup.copy()
             r_fused = self._shot_base_rot.copy()
         else:

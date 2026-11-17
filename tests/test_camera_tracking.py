@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import socket
 import threading
+import time
 
 import cv2
 import numpy as np
+import torch
 import websockets
 
 from persona_flowhmr.camera_tracker import (
@@ -298,13 +299,12 @@ def test_multi_camera_cut_preserves_avatar_heading_and_jumps_3d_stage_camera() -
 
 
 def test_persona_plugin_client_coalesces_vrm_camera_patches() -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-
     patched_cameras: list[dict] = []
+    inflight = 0
+    max_inflight = 0
 
     async def handler(ws):
+        nonlocal inflight, max_inflight
         await ws.send(
             json.dumps(
                 {
@@ -319,18 +319,27 @@ def test_persona_plugin_client_coalesces_vrm_camera_patches() -> None:
             m = msg["method"]
             params = msg.get("params") or {}
             if m == "scene.patch" and "vrmCamera" in params:
-                patched_cameras.append(params["vrmCamera"])
-                await asyncio.sleep(0.015)
+                inflight += 1
+                max_inflight = max(max_inflight, inflight)
+                try:
+                    patched_cameras.append(params["vrmCamera"])
+                    await asyncio.sleep(0.025)
+                finally:
+                    inflight -= 1
             await ws.send(json.dumps({"kind": "response", "id": msg["id"], "result": {}}))
 
     stop_srv = threading.Event()
+    ready_srv = threading.Event()
+    port_box: list[int] = []
 
     def _run_srv() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
         async def _main() -> None:
-            async with websockets.serve(handler, "127.0.0.1", port):
+            async with websockets.serve(handler, "127.0.0.1", 0) as srv:
+                port_box.append(int(srv.sockets[0].getsockname()[1]))
+                ready_srv.set()
                 while not stop_srv.is_set():
                     await asyncio.sleep(0.02)
 
@@ -338,21 +347,22 @@ def test_persona_plugin_client_coalesces_vrm_camera_patches() -> None:
 
     t = threading.Thread(target=_run_srv, daemon=True)
     t.start()
+    assert ready_srv.wait(timeout=5.0)
+    port = port_box[0]
 
     client = PersonaPluginClient(url=f"ws://127.0.0.1:{port}", token="tok")
     try:
         assert client.start(timeout_s=5.0) is True
-        # Fire a rapid burst of 20 camera poses; coalescing keeps WS backlog <= 2 and lands the final pose.
+        # Fire a rapid burst of 20 camera poses; coalescing keeps WS in-flight == 1 and sends <= 4 patches.
         for idx in range(20):
             client.send_vrm_camera_fire_and_forget({"orbit": {"distance": 2.0 + idx * 0.1}, "fov": 30.0})
-        deadline = asyncio.new_event_loop()
-        deadline.close()
         for _ in range(40):
             if patched_cameras and abs(patched_cameras[-1]["orbit"]["distance"] - 3.9) < 1e-6:
                 break
             threading.Event().wait(0.02)
         assert patched_cameras
-        assert len(patched_cameras) < 20  # coalesced burst
+        assert max_inflight == 1
+        assert len(patched_cameras) <= 5
         assert abs(patched_cameras[-1]["orbit"]["distance"] - 3.9) < 1e-6
     finally:
         client.stop()
@@ -841,10 +851,6 @@ def test_persona_sync_camera_pose_refreshes_placement_and_fails_closed() -> None
     """Verify `sync_camera_pose_fire_and_forget` loads placement even without `ensure_vmc_receiver`,
     skips sending when `instance.get` fails, and picks up updated placement after an event.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-
     state = {"fail_get": True, "offset_x": 2.5}
     patched: list[dict] = []
     server_ws_holder: list[object] = []
@@ -880,6 +886,8 @@ def test_persona_sync_camera_pose_refreshes_placement_and_fails_closed() -> None
                 await ws.send(json.dumps({"kind": "response", "id": req_id, "result": {}}))
 
     stop_srv = threading.Event()
+    ready_srv = threading.Event()
+    port_box: list[int] = []
     srv_loop_holder: list[asyncio.AbstractEventLoop] = []
 
     def _run_srv() -> None:
@@ -888,7 +896,9 @@ def test_persona_sync_camera_pose_refreshes_placement_and_fails_closed() -> None
         asyncio.set_event_loop(loop)
 
         async def _main() -> None:
-            async with websockets.serve(handler, "127.0.0.1", port):
+            async with websockets.serve(handler, "127.0.0.1", 0) as srv:
+                port_box.append(int(srv.sockets[0].getsockname()[1]))
+                ready_srv.set()
                 while not stop_srv.is_set():
                     await asyncio.sleep(0.02)
 
@@ -896,6 +906,8 @@ def test_persona_sync_camera_pose_refreshes_placement_and_fails_closed() -> None
 
     t = threading.Thread(target=_run_srv, daemon=True)
     t.start()
+    assert ready_srv.wait(timeout=5.0)
+    port = port_box[0]
 
     cam_pose = decompose_three_camera_pose(
         np.array([0.0, 1.0, 3.0], dtype=np.float32),
@@ -1341,3 +1353,449 @@ def test_dropped_frame_gap_across_camera_cut_preserves_shot_boundary() -> None:
     )
     cut_frames = [p.frame_index for p in fwd_committed if p.camera is not None and p.camera.is_cut]
     assert cut_frames == [8]
+
+
+def test_tracking_toggle_and_rolled_shot_pan_preserve_stage_heading() -> None:
+    """Regression test:
+    1. Disabling/re-enabling camera tracking after a camera pan must preserve avatar stage heading & travel.
+    2. A shot starting with 45 deg camera roll followed by a 30 deg horizontal stage pan must yield 30 deg
+       `window_vo_yaw_rad` (not ~22 deg camera-local yaw).
+    """
+    from persona_flowhmr.stitcher import _root_heading_rad
+
+    decoder = MotionLatentDecoder(MOTION_STATS_PATH, motion_style="basic")
+    stitcher = StreamingStitcher(decoder, fps=30.0)
+    lat = np.zeros((16, 491), dtype=np.float32)
+
+    # Window 0: tracking ON after a +35 deg camera pan (`window_vo_yaw_rad = +35 deg`), body facing camera.
+    pan_rad = math.radians(35.0)
+    w0 = stitcher.commit_window(
+        lat,
+        emit_offset_in_window=4,
+        stride_frames=4,
+        overlap_frames=2,
+        first_emit_frame_index=0,
+        capture_mono_times=[100.0 + i / 30.0 for i in range(4)],
+        reset_flags=[False] * 4,
+        cut_flags=[False] * 4,
+        window_vo_yaw_rad=pan_rad,
+        anchor_world_yaw_across_cuts=True,
+        save_tail=True,
+    )
+    heading_before_off = _root_heading_rad(w0[-1].quats_rh_xyzw[0])
+
+    # Window 1: tracking toggled OFF (`window_vo_yaw_rad = 0`, `anchor_world_yaw_across_cuts = False`)
+    # while camera is stopped and body inputs are unchanged -> heading must NOT jump back by -35 deg!
+    w1 = stitcher.commit_window(
+        lat,
+        emit_offset_in_window=4,
+        stride_frames=4,
+        overlap_frames=2,
+        first_emit_frame_index=4,
+        capture_mono_times=[100.0 + (4 + i) / 30.0 for i in range(4)],
+        reset_flags=[False] * 4,
+        cut_flags=[False] * 4,
+        window_vo_yaw_rad=0.0,
+        anchor_world_yaw_across_cuts=False,
+        save_tail=True,
+    )
+    heading_after_off = _root_heading_rad(w1[0].quats_rh_xyzw[0])
+    assert abs(heading_after_off - heading_before_off) < 1e-4
+
+    # Window 2: tracking toggled back ON with residual VO yaw -> heading still continuous!
+    w2 = stitcher.commit_window(
+        lat,
+        emit_offset_in_window=4,
+        stride_frames=4,
+        overlap_frames=2,
+        first_emit_frame_index=8,
+        capture_mono_times=[100.0 + (8 + i) / 30.0 for i in range(4)],
+        reset_flags=[False] * 4,
+        cut_flags=[False] * 4,
+        window_vo_yaw_rad=math.radians(20.0),
+        anchor_world_yaw_across_cuts=True,
+        save_tail=True,
+    )
+    assert abs(_root_heading_rad(w2[0].quats_rh_xyzw[0]) - heading_before_off) < 1e-4
+
+    # Rolled shot: starts with +45 deg camera roll, then pans horizontally +30 deg in level stage space.
+    cam_solver = StreamingCameraSolver(avatar_scale=1.0)
+    h, w = 720, 1280
+    cam_k = default_camera_intrinsics(h, w)
+    dec0 = decoder.decode_window(np.zeros((1, 491), dtype=np.float32))
+    ljp_neutral = dec0["ljp_cam"][0]
+    hips0 = np.array([-float(ljp_neutral[0, 0]), float(dec0["srp_y_cam"][0]), -float(ljp_neutral[0, 2])], dtype=np.float32)
+    stage_j14 = extract_smplh_body14_stage(ljp_neutral, hips0)
+    cv_to_three = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+
+    roll45 = math.radians(45.0)
+    cr, sr = math.cos(roll45), math.sin(roll45)
+    rz_45 = np.array([[cr, -sr, 0.0], [sr, cr, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    c_pos = np.array([0.0, float(hips0[1]), 3.5], dtype=np.float32)
+    j14_cv_cut = ((rz_45.T @ (stage_j14 - c_pos[None, :]).T).T @ cv_to_three.T).astype(np.float32)
+    cut_obs = FrameCameraObservation(
+        sam_cam_t=np.array([0.0, 0.9, 3.5], dtype=np.float32),
+        sam_j3d_cam=j14_cv_cut,
+        cam_k=cam_k,
+        image_hw=(h, w),
+        bbox_xyxy=np.array([400.0, 80.0, 880.0, 690.0], dtype=np.float32),
+        r_vo_yup=np.eye(3, dtype=np.float32),
+        vo_inliers=30,
+        is_cut=True,
+        shot_id=7,
+        trans_flow_px=0.05,
+    )
+    cam_solver.solve_frame(cut_obs, ljp_cam_52=ljp_neutral, hips_pos_rh=hips0, world_yaw_rad=0.0)
+    assert abs(cam_solver.window_vo_yaw_rad(7, np.eye(3, dtype=np.float32))) < 1e-6
+
+    pan30 = math.radians(30.0)
+    cp, sp = math.cos(pan30), math.sin(pan30)
+    ry_30 = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float32)
+    # Camera rotated from `rz_45` to `ry_30 @ rz_45`, so `r_vo_yup = R_cam1^T @ R_cam0 = rz_45.T @ ry_30.T @ rz_45`.
+    r_vo_panned = (rz_45.T @ ry_30.T @ rz_45).astype(np.float32)
+    vo_yaw = cam_solver.window_vo_yaw_rad(7, r_vo_panned)
+    assert abs(math.degrees(vo_yaw) - 30.0) < 0.05
+
+
+def test_internal_dropped_gap_pairs_matching_body_and_camera_observations() -> None:
+    """Regression test: internal dropped frames (8..11 missing while 0..7 and 12..25 exist in the same shot)
+    must use frame 7's observation for BOTH `win_items` (`sam_token`) and `stride_items` (`cam_obs`).
+    """
+    from collections import deque
+
+    from persona_flowhmr.config import LATENCY_PRESETS, EngineConfig
+    from persona_flowhmr.engine import FrameFeatureItem, StreamingMocapEngine
+
+    preset = LATENCY_PRESETS["ultra_low"]
+    eng = StreamingMocapEngine(EngineConfig(preset="ultra_low", camera_tracking_enabled=True))
+    decoder = MotionLatentDecoder(MOTION_STATS_PATH, motion_style="basic")
+    stitcher = StreamingStitcher(decoder, fps=30.0)
+    cam_solver = StreamingCameraSolver(avatar_scale=1.0)
+    h, w = 720, 1280
+    cam_k = default_camera_intrinsics(h, w)
+    dec0 = decoder.decode_window(np.zeros((1, 491), dtype=np.float32))
+    ljp_neutral = dec0["ljp_cam"][0]
+    hips0 = np.array([-float(ljp_neutral[0, 0]), float(dec0["srp_y_cam"][0]), -float(ljp_neutral[0, 2])], dtype=np.float32)
+    stage_j14 = extract_smplh_body14_stage(ljp_neutral, hips0)
+    cv_to_three = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+
+    seen_windows: list[tuple[list[int], torch.Tensor]] = []
+
+    class _RecordingSolver:
+        last_solve_ms = 1.0
+
+        def solve_window(self, tokens, win_indices, *, ode_steps, camera_r_w_9=None):
+            seen_windows.append((list(win_indices), tokens.detach().clone()))
+            return np.zeros((len(win_indices), 491), dtype=np.float32)
+
+    eng._solver = _RecordingSolver()  # type: ignore[assignment]
+
+    def _item(f_idx: int, dist_m: float) -> FrameFeatureItem:
+        c_pos = np.array([0.0, float(hips0[1]), dist_m], dtype=np.float32)
+        j14_cv = ((stage_j14 - c_pos[None, :]) @ cv_to_three.T).astype(np.float32)
+        obs = FrameCameraObservation(
+            sam_cam_t=np.array([0.0, 0.9, dist_m], dtype=np.float32),
+            sam_j3d_cam=j14_cv,
+            cam_k=cam_k,
+            image_hw=(h, w),
+            bbox_xyxy=np.array([450.0, 100.0, 830.0, 680.0], dtype=np.float32),
+            r_vo_yup=np.eye(3, dtype=np.float32),
+            vo_inliers=20,
+            is_cut=(f_idx == 0),
+            shot_id=0,
+            trans_flow_px=2.0,
+        )
+        tok = torch.full((3072,), float(f_idx), dtype=torch.float32)
+        return FrameFeatureItem(
+            frame_index=f_idx,
+            capture_mono_s=100.0 + f_idx / 30.0,
+            sam_token=tok,
+            is_stream_reset=False,
+            shot_id=0,
+            is_cut=(f_idx == 0),
+            cam_obs=obs,
+        )
+
+    history: deque[FrameFeatureItem] = deque()
+    for f in range(0, 8):
+        history.append(_item(f, dist_m=2.4))
+    for f in range(12, 26):
+        history.append(_item(f, dist_m=5.2))
+
+    committed = []
+    eng._playout_buffer.push_many = lambda frames: committed.extend(frames)  # type: ignore[method-assign]
+    eng._solve_ready_windows(
+        history,
+        6,
+        eos=True,
+        preset=preset,
+        stitcher=stitcher,
+        camera_solver=cam_solver,
+        stream_frame0_hips=[None],
+        first_commit_event=threading.Event(),
+    )
+    win_indices0, win_tokens0 = seen_windows[0]
+    for gap_f in (8, 9, 10, 11):
+        pos = win_indices0.index(gap_f)
+        # Must hold frame 7's token (7.0), never jump ahead to `shot_last` frame 25 (25.0)!
+        assert float(win_tokens0[pos, 0].item()) == 7.0
+
+
+def test_camera_avatar_scale_keeps_floor_travel_unscaled_and_webui_exposes_fov() -> None:
+    """Regression test:
+    1. With `camera_avatar_scale=2.0` and `follow_movement=True`, 1.0 m of avatar XZ floor travel moves
+       the camera orbit target by 1.0 m (matching `pose_to_vmc_bones`), not 2.0 m.
+    2. WebUI HTML exposes `camera_fov_deg` with `data-cfg` and `data-float`.
+    """
+    from persona_flowhmr.web_ui import _DASHBOARD_HTML
+
+    assert 'id="camera_fov_deg" data-cfg data-float' in _DASHBOARD_HTML
+
+    decoder = MotionLatentDecoder(MOTION_STATS_PATH, motion_style="basic")
+    cam_solver = StreamingCameraSolver(avatar_scale=2.0)
+    h, w = 720, 1280
+    cam_k = default_camera_intrinsics(h, w)
+    dec0 = decoder.decode_window(np.zeros((1, 491), dtype=np.float32))
+    ljp_neutral = dec0["ljp_cam"][0]
+    hips0 = np.array([-float(ljp_neutral[0, 0]), float(dec0["srp_y_cam"][0]), -float(ljp_neutral[0, 2])], dtype=np.float32)
+    cv_to_three = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+
+    stage0 = extract_smplh_body14_stage(
+        ljp_neutral,
+        np.array([0.0, float(hips0[1]) * 2.0, 0.0], dtype=np.float32),
+        avatar_scale=2.0,
+    )
+    # Unscaled SAM joints at 3.0 m -> scaled by `avatar_scale=2.0` inside `solve_frame` -> 6.0 m distance.
+    c0 = np.array([0.0, float(hips0[1]), 3.0], dtype=np.float32)
+    stage0_1x = extract_smplh_body14_stage(ljp_neutral, hips0, avatar_scale=1.0)
+    j14_cv = ((stage0_1x - c0[None, :]) @ cv_to_three.T).astype(np.float32)
+
+    obs0 = FrameCameraObservation(
+        sam_cam_t=np.array([0.0, 0.9, 3.0], dtype=np.float32),
+        sam_j3d_cam=j14_cv,
+        cam_k=cam_k,
+        image_hw=(h, w),
+        bbox_xyxy=np.array([400.0, 80.0, 880.0, 690.0], dtype=np.float32),
+        r_vo_yup=np.eye(3, dtype=np.float32),
+        vo_inliers=25,
+        is_cut=True,
+        shot_id=0,
+        trans_flow_px=0.05,
+    )
+    pose0 = cam_solver.solve_frame(obs0, ljp_cam_52=ljp_neutral, hips_pos_rh=hips0, follow_movement=True)
+
+    # Avatar walks +1.0 m along +X before Shot 1 hard cut, centered in Shot 1's camera.
+    hips1 = hips0 + np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    obs1 = FrameCameraObservation(
+        sam_cam_t=np.array([0.0, 0.9, 3.0], dtype=np.float32),
+        sam_j3d_cam=j14_cv,
+        cam_k=cam_k,
+        image_hw=(h, w),
+        bbox_xyxy=np.array([400.0, 80.0, 880.0, 690.0], dtype=np.float32),
+        r_vo_yup=np.eye(3, dtype=np.float32),
+        vo_inliers=25,
+        is_cut=True,
+        shot_id=1,
+        trans_flow_px=0.05,
+    )
+    pose1 = cam_solver.solve_frame(obs1, ljp_cam_52=ljp_neutral, hips_pos_rh=hips1, follow_movement=True)
+    dx = float(pose1.orbit_target_rh[0] - pose0.orbit_target_rh[0])
+    assert abs(dx - 1.0) < 1e-3
+    assert stage0.shape == (14, 3)
+
+
+def test_timed_out_camera_switch_cleans_up_and_prevents_wedged_stacking(monkeypatch) -> None:
+    """Regression test: if a camera driver hangs in its priming `read()` during `switch_device`,
+    the timed-out open is tracked, `cancel()`/`release()` cleanup runs within bounded time, repeated
+    retries do not stack new blocked handles while wedged, and `close()` cleans up pending opens.
+    """
+    import persona_flowhmr.sources as sources_mod
+    from persona_flowhmr.sources import CameraSource
+
+    unblock_wedged = threading.Event()
+    stats = {"wedged_opens": 0, "wedged_cancels": 0, "wedged_releases": 0}
+
+    class _HealthyCap:
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, *_a) -> bool:
+            return True
+
+        def read(self):
+            time.sleep(0.005)
+            return True, np.zeros((64, 64, 3), dtype=np.uint8)
+
+        def release(self) -> None:
+            pass
+
+    class _WedgedFirstReadCap:
+        def __init__(self, *, honor_cancel: bool) -> None:
+            self._honor_cancel = honor_cancel
+            self._cancelled = threading.Event()
+            stats["wedged_opens"] += 1
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, *_a) -> bool:
+            return True
+
+        def cancel(self) -> None:
+            stats["wedged_cancels"] += 1
+            self._cancelled.set()
+
+        def read(self):
+            if self._honor_cancel:
+                self._cancelled.wait(timeout=2.0)
+            else:
+                unblock_wedged.wait(timeout=3.0)
+            return False, None
+
+        def release(self) -> None:
+            stats["wedged_releases"] += 1
+
+    mode = {"honor_cancel": False}
+
+    def _fake_open(idx: int):
+        if idx == 0:
+            return _HealthyCap()
+        return _WedgedFirstReadCap(honor_cancel=mode["honor_cancel"])
+
+    monkeypatch.setattr(sources_mod, "_open_camera", _fake_open)
+    src = CameraSource(0, width=64, height=64, open_timeout_s=0.5)
+    try:
+        try:
+            src.switch_device(1, width=64, height=64, timeout_s=0.12)
+            raise AssertionError("Expected TimeoutError on wedged camera 1")
+        except TimeoutError:
+            pass
+        assert stats["wedged_opens"] == 1
+        assert stats["wedged_cancels"] >= 1
+        assert stats["wedged_releases"] >= 1
+        assert 1 in src._timed_out_opens
+
+        # Immediate retry while kernel thread is still wedged must NOT open a second handle on index 1!
+        try:
+            src.switch_device(1, width=64, height=64, timeout_s=0.12)
+            raise AssertionError("Expected busy TimeoutError on still-wedged camera 1")
+        except TimeoutError:
+            pass
+        assert stats["wedged_opens"] == 1
+    finally:
+        unblock_wedged.set()
+        src.close()
+        assert src._timed_out_opens == {}
+
+
+def test_persona_plugin_invalidation_generation_timeout_cleanup_and_disconnect_recovery() -> None:
+    """Regression test:
+    1. Event arriving while `instance.get` is in flight invalidates that stale placement result and retries.
+    2. Timed-out RPC removes its future from `_pending` (`len(_pending) == 0`).
+    3. Normal server WS close clears `_camera_inflight` immediately and resumes queued camera updates on reconnect.
+    """
+    state = {"phase": "stale_race", "offset_x": 1.0, "get_calls": 0, "hang_patch": False, "close_on_patch": False}
+    patched: list[dict] = []
+
+    async def handler(ws):
+        await ws.send(
+            json.dumps(
+                {
+                    "kind": "hello",
+                    "protocol": 4,
+                    "app": {"name": "LAPLACE Persona", "version": "0.91.0", "platform": "win32", "capabilities": []},
+                }
+            )
+        )
+        async for raw in ws:
+            msg = json.loads(raw)
+            m = msg["method"]
+            req_id = msg["id"]
+            if m == "instance.list":
+                res = {"instances": [{"instanceId": "vrm-1", "kind": "model", "format": "vrm"}]}
+                await ws.send(json.dumps({"kind": "response", "id": req_id, "result": res}))
+            elif m == "instance.get":
+                state["get_calls"] += 1
+                captured_x = state["offset_x"]
+                if state["phase"] == "stale_race" and state["get_calls"] == 1:
+                    # Push an invalidation event BEFORE returning stale `offset_x=1.0`, updating actual to `4.5`!
+                    state["offset_x"] = 4.5
+                    await ws.send(json.dumps({"kind": "event", "event": "instance.updated"}))
+                res = {"item": {"vrm": {"x": captured_x, "y": 0.0, "z": 0.0, "scale": 1.0, "rotY": 0.0}}}
+                await ws.send(json.dumps({"kind": "response", "id": req_id, "result": res}))
+            elif m == "scene.patch":
+                if state["close_on_patch"]:
+                    state["close_on_patch"] = False
+                    await ws.close()
+                    return
+                if state["hang_patch"]:
+                    continue
+                patched.append(msg["params"]["vrmCamera"])
+                await ws.send(json.dumps({"kind": "response", "id": req_id, "result": {}}))
+            else:
+                await ws.send(json.dumps({"kind": "response", "id": req_id, "result": {}}))
+
+    stop_srv = threading.Event()
+    ready_srv = threading.Event()
+    port_box: list[int] = []
+
+    def _run_srv() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def _main() -> None:
+            async with websockets.serve(handler, "127.0.0.1", 0) as srv:
+                port_box.append(int(srv.sockets[0].getsockname()[1]))
+                ready_srv.set()
+                while not stop_srv.is_set():
+                    await asyncio.sleep(0.02)
+
+        loop.run_until_complete(_main())
+
+    t = threading.Thread(target=_run_srv, daemon=True)
+    t.start()
+    assert ready_srv.wait(timeout=5.0)
+    port = port_box[0]
+
+    cam_pose = decompose_three_camera_pose(
+        np.array([0.0, 1.0, 3.0], dtype=np.float32),
+        np.eye(3, dtype=np.float32),
+        3.0,
+        30.0,
+    )
+    client = PersonaPluginClient(url=f"ws://127.0.0.1:{port}", token="tok")
+    try:
+        assert client.start(timeout_s=5.0) is True
+        # 1. Mid-RPC event invalidates `1.0` and retries -> first patch lands with `4.5`, never `1.0`!
+        client.sync_camera_pose_fire_and_forget(cam_pose)
+        for _ in range(50):
+            if patched:
+                break
+            threading.Event().wait(0.02)
+        assert len(patched) == 1
+        assert abs(float(patched[0]["orbit"]["targetX"]) - 4.5) < 1e-4
+
+        # 2. Timed-out `call()` removes its future from `client._pending` (`len == 0`).
+        state["hang_patch"] = True
+        try:
+            client.call("scene.patch", {"vrmCamera": {"fov": 31.0}}, timeout_s=0.12)
+            raise AssertionError("Expected TimeoutError")
+        except Exception:
+            pass
+        threading.Event().wait(0.05)
+        assert len(client._pending) == 0
+        state["hang_patch"] = False
+
+        # 3. Normal WS disconnect during `scene.patch` clears `_camera_inflight` immediately (< 0.3s, not 10s)!
+        state["close_on_patch"] = True
+        client.send_vrm_camera_fire_and_forget({"orbit": {"distance": 5.1}, "fov": 32.0})
+        for _ in range(25):
+            if not client.is_connected and not client._camera_inflight:
+                break
+            threading.Event().wait(0.02)
+        assert client._camera_inflight is False
+        assert len(client._pending) == 0
+    finally:
+        client.stop()
+        stop_srv.set()
+        t.join(timeout=2.0)

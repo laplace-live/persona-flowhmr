@@ -126,6 +126,7 @@ class StreamingStitcher:
         self._has_started = False
         self._shot_world_yaw_rad = 0.0
         self._last_world_heading_rad: float | None = None
+        self._prev_vo_tracking = False
 
     def commit_window(
         self,
@@ -170,13 +171,33 @@ class StreamingStitcher:
         starts_with_cut_or_reset = bool(
             (reset_flags and reset_flags[0]) or (cut_flags and cut_flags[0])
         )
-        # Blend first `O` frames of this stride against the previous window's overlap tail (within the same shot).
+        vo_tracking = bool(anchor_world_yaw_across_cuts)
+        toggled_vo = self._has_started and (vo_tracking != self._prev_vo_tracking)
+        self._prev_vo_tracking = vo_tracking
+
         tail = self._tail
+        toggle_ref_heading: float | None = None
+        if toggled_vo and not starts_with_cut_or_reset:
+            if (
+                tail is not None
+                and self._tail_start_frame == first_emit_frame_index
+                and tail["quats_rh_xyzw"].shape[0] > 0
+            ):
+                toggle_ref_heading = (
+                    self._shot_world_yaw_rad
+                    + self._tail_vo_yaw_rad
+                    + _root_heading_rad(tail["quats_rh_xyzw"][0, 0])
+                )
+            else:
+                toggle_ref_heading = self._last_world_heading_rad
+
+        # Blend first `O` frames of this stride against the previous window's overlap tail (within the same shot/mode).
         if (
             tail is not None
             and overlap_frames > 0
             and self._tail_start_frame == first_emit_frame_index
             and not starts_with_cut_or_reset
+            and not toggled_vo
         ):
             n_blend = min(overlap_frames, stride_frames, tail["quats_rh_xyzw"].shape[0])
             tail_srv = tail["srv_xz_cam"][:n_blend].copy()
@@ -235,6 +256,13 @@ class StreamingStitcher:
                 self._shot_world_yaw_rad = 0.0
                 self._last_world_heading_rad = None
                 self._has_started = False
+                self._prev_vo_tracking = vo_tracking
+            elif i == 0 and toggle_ref_heading is not None:
+                raw_heading = _root_heading_rad(quats[0, 0])
+                self._shot_world_yaw_rad = _unwrap_rad(
+                    self._shot_world_yaw_rad,
+                    toggle_ref_heading - raw_heading - float(window_vo_yaw_rad),
+                )
             elif is_cut and anchor_world_yaw_across_cuts and self._last_world_heading_rad is not None:
                 raw_heading = _root_heading_rad(quats[i, 0])
                 # Subtract `window_vo_yaw_rad` (0 on cut frame) so `total_yaw` makes root heading C0-continuous.
