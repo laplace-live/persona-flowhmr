@@ -134,6 +134,7 @@ class FlowHMRWindowSolver:
         frame_indices: list[int],
         *,
         ode_steps: int | None = None,
+        camera_r_w_9: np.ndarray | torch.Tensor | None = None,
     ) -> np.ndarray:
         """Solve a `(W, 3072)` conditioning window into `(W, 491)` float32 normalized motion latents."""
         w_len = int(sam_tokens_w_3072.shape[0])
@@ -145,8 +146,13 @@ class FlowHMRWindowSolver:
 
         t_start = time.perf_counter()
         feature = sam_tokens_w_3072.unsqueeze(0).to(self.device, dtype=torch.float32, non_blocking=True)
-        eye9 = torch.eye(3, device=self.device, dtype=torch.float32).reshape(1, 1, 9).expand(1, w_len, 9).contiguous()
-        ctxt_input = {"feature": feature, "camera_R": eye9}
+        if camera_r_w_9 is None:
+            cam_r = torch.eye(3, device=self.device, dtype=torch.float32).reshape(1, 1, 9).expand(1, w_len, 9).contiguous()
+        else:
+            cam_r = torch.as_tensor(camera_r_w_9, dtype=torch.float32).reshape(1, w_len, 9).to(
+                self.device, dtype=torch.float32, non_blocking=True
+            )
+        ctxt_input = {"feature": feature, "camera_R": cam_r}
         vtxt_input = torch.zeros((1, 1, self.vtxt_dim), device=self.device, dtype=torch.float32)
         mask = torch.ones((1, w_len), device=self.device, dtype=torch.bool)
 

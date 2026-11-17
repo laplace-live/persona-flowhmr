@@ -31,7 +31,8 @@ class SampledFrame:
     media_time_s: float
     capture_mono_s: float
     rgb: np.ndarray  # HxWx3 uint8 RGB
-    is_stream_reset: bool = False  # first frame after a video loop rewind
+    is_stream_reset: bool = False   # first frame after a video loop rewind
+    is_camera_switch: bool = False  # first frame after hot-swapping live camera device
 
 
 class _FrameClock:
@@ -47,17 +48,28 @@ class _FrameClock:
         now = time.perf_counter()
         if self._start_mono is None:
             self._start_mono = now
-        sleep_s = self._start_mono + (self.frame_index / self.fps) - time.perf_counter()
+        sleep_s = self._start_mono + (self.frame_index / self.fps) - now
         if sleep_s > 0.001:
             time.sleep(sleep_s)
+        elif sleep_s < -0.10:
+            # Re-anchor after queue backpressure so video pacing resumes smoothly at 30.0 Hz
+            # instead of bursting stale backlog frames.
+            self._start_mono = now - (self.frame_index / self.fps)
 
-    def emit(self, rgb: np.ndarray, *, is_stream_reset: bool = False) -> SampledFrame:
+    def emit(
+        self,
+        rgb: np.ndarray,
+        *,
+        is_stream_reset: bool = False,
+        is_camera_switch: bool = False,
+    ) -> SampledFrame:
         sample = SampledFrame(
             frame_index=self.frame_index,
             media_time_s=self.frame_index / self.fps,
             capture_mono_s=time.perf_counter(),
             rgb=rgb,
             is_stream_reset=is_stream_reset,
+            is_camera_switch=is_camera_switch,
         )
         self.frame_index += 1
         return sample
@@ -81,13 +93,12 @@ class PreviewRingBuffer:
 
     def record_frame(self, frame_index: int, rgb: np.ndarray) -> None:
         h, w = rgb.shape[:2]
-        if w > self._max_width:
-            scale = self._max_width / float(w)
-            rgb = cv2.resize(
-                rgb,
-                (self._max_width, max(1, int(round(h * scale)))),
-                interpolation=cv2.INTER_LINEAR,
-            )
+        if w > self._max_width or h > self._max_width * 2:
+            scale = min(self._max_width / float(max(1, w)), (self._max_width * 1.5) / float(max(1, h)))
+            tw, th = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+            if scale < 0.5:
+                rgb = cv2.resize(rgb, (tw * 2, th * 2), interpolation=cv2.INTER_NEAREST)
+            rgb = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_LINEAR)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         with self._lock:
             self._orig_hw = (h, w)
@@ -232,17 +243,53 @@ class CameraSource:
             raise RuntimeError(f"Camera {self.camera_index} opened but returned no frames")
 
         self._cap = cap
+        self._cap_lock = threading.Lock()
         self._clock = _FrameClock(target_fps)
         self._lock = threading.Lock()
         # Raw BGR; converted to RGB only for frames actually emitted on the output clock.
         self._latest_bgr: np.ndarray = first_bgr
+        self._pending_switch = False
         self._stop = threading.Event()
         self._reader_thread = threading.Thread(target=self._reader_loop, name="camera-reader", daemon=True)
         self._reader_thread.start()
 
+    def switch_device(
+        self,
+        camera_index: int,
+        *,
+        width: int = 1280,
+        height: int = 720,
+        target_fps: float = 30.0,
+    ) -> None:
+        """Hot-swap to another live webcam device without interrupting the 30.0 Hz capture clock."""
+        new_idx = int(camera_index)
+        if new_idx == self.camera_index:
+            return
+        new_cap = _open_camera(new_idx)
+        if not new_cap.isOpened():
+            new_cap.release()
+            raise RuntimeError(f"Cannot open camera index {new_idx}")
+        new_cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+        new_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+        new_cap.set(cv2.CAP_PROP_FPS, float(target_fps))
+        new_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        ok, first_bgr = new_cap.read()
+        if not ok or first_bgr is None:
+            new_cap.release()
+            raise RuntimeError(f"Camera {new_idx} opened but returned no frames")
+
+        with self._cap_lock, self._lock:
+            old_cap = self._cap
+            self._cap = new_cap
+            self.camera_index = new_idx
+            self._latest_bgr = first_bgr
+            self._pending_switch = True
+        old_cap.release()
+
     def _reader_loop(self) -> None:
         while not self._stop.is_set():
-            ok, bgr = self._cap.read()
+            with self._cap_lock:
+                ok, bgr = self._cap.read()
             if not ok or bgr is None:
                 time.sleep(0.005)
                 continue
@@ -255,13 +302,16 @@ class CameraSource:
         self._clock.wait_next()
         with self._lock:
             bgr = self._latest_bgr
-        return self._clock.emit(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            switched = self._pending_switch
+            self._pending_switch = False
+        return self._clock.emit(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), is_camera_switch=switched)
 
     def close(self) -> None:
         self._stop.set()
         if self._reader_thread.is_alive():
             self._reader_thread.join(timeout=1.0)
-        self._cap.release()
+        with self._cap_lock:
+            self._cap.release()
 
 
 def list_available_cameras(max_probe: int = 4) -> list[dict[str, int | str]]:

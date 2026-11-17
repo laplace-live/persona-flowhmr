@@ -66,6 +66,26 @@ def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
         help="Lock horizontal XZ root travel at origin",
     )
     p.add_argument(
+        "--camera-track",
+        dest="camera_tracking_enabled",
+        action="store_const",
+        const=True,
+        help="Enable dynamic 6-DoF camera tracking",
+    )
+    p.add_argument(
+        "--no-camera-track",
+        dest="camera_tracking_enabled",
+        action="store_const",
+        const=False,
+        help="Disable dynamic 6-DoF camera tracking",
+    )
+    p.add_argument(
+        "--camera-scale",
+        dest="camera_avatar_scale",
+        type=float,
+        help="Avatar-to-performer camera framing scale (default: 1.0)",
+    )
+    p.add_argument(
         "--backend",
         dest="perception_backend",
         choices=get_args(PerceptionBackend),
@@ -111,6 +131,13 @@ def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--vmc-port", type=int, help="Target VMC receiver UDP port")
     p.add_argument("--no-vmc", dest="vmc_enabled", action="store_const", const=False, help="Disable UDP VMC output")
     p.add_argument(
+        "--no-vmc-camera",
+        dest="vmc_send_camera",
+        action="store_const",
+        const=False,
+        help="Omit `/VMC/Ext/Cam` from UDP VMC bundles",
+    )
+    p.add_argument(
         "--plugin-api",
         dest="plugin_api_enabled",
         action="store_const",
@@ -131,6 +158,13 @@ def _add_common_engine_args(p: argparse.ArgumentParser) -> None:
         action="store_const",
         const=True,
         help="Also inject Live2D angles via `param.inject`",
+    )
+    p.add_argument(
+        "--no-plugin-camera",
+        dest="plugin_api_sync_camera",
+        action="store_const",
+        const=False,
+        help="Disable syncing stage `vrmCamera` over Persona Plugin API",
     )
 
 
@@ -202,7 +236,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                 f"play={tel.playout_fps:.1f}fps lat={tel.measured_latency_ms:.0f}ms "
                 f"lead={tel.buffer_lead_ms:.0f}ms yolo={tel.yolox_ms_per_frame:.1f}ms "
                 f"sam={tel.sam_ms_per_frame:.1f}ms mmdit={tel.mmdit_ms_per_window:.1f}ms "
-                f"vmc_pkts={tel.vmc_packets_sent} underruns={tel.underruns}"
+                f"cam={tel.camera_distance_m:.2f}m/{tel.camera_azimuth_deg:+.1f}deg "
+                f"cuts={tel.camera_cuts_detected} vmc_pkts={tel.vmc_packets_sent} underruns={tel.underruns}"
             )
             if tel.state == "error":
                 print(f"[ERROR] {tel.error}", file=sys.stderr)

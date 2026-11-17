@@ -269,14 +269,20 @@ _DASHBOARD_HTML = """<!doctype html>
               <option value="30">30 FPS (Native)</option>
             </select>
           </div>
+          <div class="field">
+            <label>Camera Scale</label>
+            <input type="number" id="camera_avatar_scale" data-cfg data-float step="0.05" min="0.4" max="2.5" value="1.0" />
+          </div>
         </div>
         <label class="check"><input type="checkbox" id="mirror" data-cfg /> Mirror Avatar (Webcam Selfie Mode)</label>
         <label class="check"><input type="checkbox" id="follow_movement" data-cfg checked /> Follow Root Movement (XZ Travel)</label>
+        <label class="check"><input type="checkbox" id="camera_tracking_enabled" data-cfg checked /> Dynamic 6-DoF Camera Tracking</label>
       </section>
 
       <section class="card">
         <h2>Persona Output (VMC + Plugin API)</h2>
         <label class="check"><input type="checkbox" id="vmc_enabled" data-cfg checked /> Send VMC OSC Bundle over UDP</label>
+        <label class="check"><input type="checkbox" id="vmc_send_camera" data-cfg checked /> Include VMC Camera (`/VMC/Ext/Cam`)</label>
         <div class="row">
           <div class="field"><label>VMC Host</label><input type="text" id="vmc_host" data-cfg value="127.0.0.1" /></div>
           <div class="field"><label>VMC Port</label><input type="number" id="vmc_port" data-cfg value="39539" /></div>
@@ -285,6 +291,7 @@ _DASHBOARD_HTML = """<!doctype html>
         <label class="check"><input type="checkbox" id="plugin_api_enabled" data-cfg /> Connect Persona Plugin API (WS)</label>
         <div class="field"><label>Plugin API WebSocket URL</label><input type="text" id="plugin_api_url" data-cfg value="ws://127.0.0.1:25034" /></div>
         <div class="field"><label>Bearer Token (Settings → Developer)</label><input type="password" id="plugin_api_token" data-cfg placeholder="Paste token if enabled" /></div>
+        <label class="check"><input type="checkbox" id="plugin_api_sync_camera" data-cfg checked /> Sync Stage Camera (`scene.patch -> vrmCamera`)</label>
         <label class="check"><input type="checkbox" id="plugin_api_inject_params" data-cfg /> Also Inject Live2D Angles (`param.inject`)</label>
         <button class="primary" style="width:100%;margin-top:6px;" onclick="applyConfig()">Apply Settings</button>
       </section>
@@ -323,6 +330,9 @@ _DASHBOARD_HTML = """<!doctype html>
           <div class="metric"><div class="k">YOLOX-L / Frame</div><div class="v" id="m_yolo">0.0 ms</div></div>
           <div class="metric"><div class="k">SAM 3D / Frame</div><div class="v" id="m_sam">0.0 ms</div></div>
           <div class="metric"><div class="k">MMDiT / Window</div><div class="v" id="m_mmdit">0.0 ms</div></div>
+          <div class="metric"><div class="k">Cam Dist / FOV</div><div class="v" id="m_cam_dist">—</div></div>
+          <div class="metric"><div class="k">Cam Az / El</div><div class="v" id="m_cam_ang">—</div></div>
+          <div class="metric"><div class="k">Shot Cuts / Syncs</div><div class="v" id="m_cam_cuts">0 / 0</div></div>
           <div class="metric"><div class="k">VMC Packets Sent</div><div class="v" id="m_vmc">0</div></div>
           <div class="metric"><div class="k">Underruns</div><div class="v" id="m_under">0</div></div>
           <div class="metric"><div class="k">Backend</div><div class="v" id="m_back">—</div></div>
@@ -334,10 +344,14 @@ _DASHBOARD_HTML = """<!doctype html>
   <script>
     let initialized = false;
     let saveTimer = null;
-    // Config controls carry `data-cfg` (id == EngineConfig field); `data-int` marks integer-valued selects.
+    // Config controls carry `data-cfg` (id == EngineConfig field); `data-int` / `data-float` mark numeric fields.
     const cfgFields = () => document.querySelectorAll('[data-cfg]');
     function readField(el) {
       if (el.type === 'checkbox') return el.checked;
+      if ('float' in el.dataset) {
+        const v = parseFloat(el.value || el.defaultValue || '1.0');
+        return Number.isFinite(v) && v > 0 ? v : 1.0;
+      }
       if (el.type === 'number' || 'int' in el.dataset) return parseInt(el.value || el.defaultValue || '0', 10);
       return el.value;
     }
@@ -459,6 +473,14 @@ _DASHBOARD_HTML = """<!doctype html>
       document.getElementById('m_yolo').textContent = t.yolox_ms_per_frame.toFixed(1) + ' ms';
       document.getElementById('m_sam').textContent = t.sam_ms_per_frame.toFixed(1) + ' ms';
       document.getElementById('m_mmdit').textContent = t.mmdit_ms_per_window.toFixed(1) + ' ms';
+      document.getElementById('m_cam_dist').textContent = t.camera_distance_m > 0
+        ? t.camera_distance_m.toFixed(2) + 'm · ' + t.camera_fov_deg.toFixed(0) + '°'
+        : '—';
+      document.getElementById('m_cam_ang').textContent = t.camera_distance_m > 0
+        ? (t.camera_azimuth_deg >= 0 ? '+' : '') + t.camera_azimuth_deg.toFixed(1) + '° / ' +
+          (t.camera_elevation_deg >= 0 ? '+' : '') + t.camera_elevation_deg.toFixed(1) + '°'
+        : '—';
+      document.getElementById('m_cam_cuts').textContent = t.camera_cuts_detected + ' / ' + t.plugin_api_camera_syncs;
       document.getElementById('m_vmc').textContent = t.vmc_packets_sent.toLocaleString();
       document.getElementById('m_under').textContent = t.underruns;
       document.getElementById('m_back').textContent = t.active_backend;

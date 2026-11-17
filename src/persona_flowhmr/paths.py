@@ -51,6 +51,8 @@ MODELS_DIR = resolve_models_dir()
 VENDOR_DIR = PROJECT_ROOT / "vendor"
 CACHE_DIR = PROJECT_ROOT / "cache"
 SETTINGS_FILE = CACHE_DIR / "settings.json"
+# In a git worktree (`MODELS_DIR == <main>/models`), allow seeding default settings from `<main>/cache/settings.json`.
+SHARED_SETTINGS_SEED_FILE = MODELS_DIR.parent / "cache" / "settings.json"
 DEFAULT_DEMO_VIDEO = Path(r"D:\Git\persona\references\dancing girl [2E2okJyQyZI].mp4")
 
 YOLOX_CKPT_PATH = MODELS_DIR / "yolox" / "yolox_l.pth"

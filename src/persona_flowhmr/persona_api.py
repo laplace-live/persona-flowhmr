@@ -60,6 +60,13 @@ class PersonaPluginClient:
 
         self.server_hello: dict[str, Any] | None = None
         self.has_live2d_model: bool = True
+        self.has_vrm_model: bool = True
+        self.bound_vrm_instance_id: str | None = None
+        self.bound_vrm_placement: dict[str, Any] | None = None
+        self.camera_patches_sent: int = 0
+        self._camera_inflight: bool = False
+        self._pending_vrm_camera: dict[str, Any] | None = None
+        self._last_sent_vrm_camera: dict[str, Any] | None = None
         self.last_error: str = ""
 
     @property
@@ -98,6 +105,11 @@ class PersonaPluginClient:
         try:
             loop.run_until_complete(self._connection_supervisor())
         finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
 
     async def _connection_supervisor(self) -> None:
@@ -110,6 +122,7 @@ class PersonaPluginClient:
                     max_size=16 * 1024 * 1024,
                 ) as ws:
                     self._ws = ws
+                    self._last_sent_vrm_camera = None
                     raw_hello = await asyncio.wait_for(ws.recv(), timeout=5.0)
                     msg = json.loads(raw_hello)
                     if msg.get("kind") == "hello":
@@ -224,8 +237,10 @@ class PersonaPluginClient:
                 (it for it in instances if it.get("kind") == "model" and it.get("format") == "vrm"),
                 None,
             )
+            self.has_vrm_model = vrm_inst is not None
             if vrm_inst is not None:
                 bound_instance_id = str(vrm_inst["instanceId"])
+                self.bound_vrm_instance_id = bound_instance_id
                 caps = set((self.server_hello or {}).get("app", {}).get("capabilities", []))
                 bind_req: dict[str, Any] = {
                     "instanceId": bound_instance_id,
@@ -234,8 +249,48 @@ class PersonaPluginClient:
                 if "pose-movement-options" in caps:
                     bind_req["poseFollowMovement"] = bool(follow_movement)
                 self.call("instance.setTrackingSources", bind_req)
+                try:
+                    inst_detail = self.call("instance.get", {"instanceId": bound_instance_id})
+                    vrm_place = (inst_detail or {}).get("item", {}).get("vrm") if isinstance(inst_detail, dict) else None
+                    if isinstance(vrm_place, dict):
+                        self.bound_vrm_placement = vrm_place
+                except Exception:
+                    pass
+            else:
+                self.bound_vrm_instance_id = None
+                self.bound_vrm_placement = None
 
         return {"sourceId": source_id, "boundInstanceId": bound_instance_id}
+
+    def send_vrm_camera_fire_and_forget(self, vrm_camera: dict[str, Any]) -> None:
+        """Stream `scene.patch -> vrmCamera` with single-slot in-flight coalescing (zero WS backlog)."""
+        if not self.is_connected or not self.has_vrm_model or self._loop is None or not vrm_camera:
+            return
+
+        async def _enqueue() -> None:
+            if not self._camera_inflight and vrm_camera == self._last_sent_vrm_camera:
+                return
+            self._pending_vrm_camera = vrm_camera
+            if self._camera_inflight:
+                return
+            self._camera_inflight = True
+            try:
+                while self._pending_vrm_camera is not None and self.is_connected and not self._stop.is_set():
+                    nxt = self._pending_vrm_camera
+                    self._pending_vrm_camera = None
+                    if nxt == self._last_sent_vrm_camera:
+                        continue
+                    try:
+                        await self._send_request_async("scene.patch", {"vrmCamera": nxt})
+                        self._last_sent_vrm_camera = nxt
+                        self.camera_patches_sent += 1
+                    except Exception as exc:
+                        self.last_error = str(exc)
+                        break
+            finally:
+                self._camera_inflight = False
+
+        asyncio.run_coroutine_threadsafe(_enqueue(), self._loop)
 
     def inject_params_fire_and_forget(self, entries: list[dict[str, Any]]) -> None:
         """Asynchronously inject `InjectEntry[]` (`param.inject`) without blocking the playout clock."""

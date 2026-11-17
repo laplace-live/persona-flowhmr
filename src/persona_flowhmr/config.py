@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Literal, get_args
 
-from .paths import DEFAULT_DEMO_VIDEO
+from .paths import DEFAULT_DEMO_VIDEO, SETTINGS_FILE, SHARED_SETTINGS_SEED_FILE
 
 # FlowHMR's native motion rate: sources resample to it and windows/stitching run on its frame grid.
 MODEL_FPS = 30.0
@@ -166,15 +166,20 @@ class EngineConfig:
     perception_backend: PerceptionBackend = "auto"
     replay_tokens_path: str = ""
 
+    camera_tracking_enabled: bool = True
+    camera_avatar_scale: float = 1.0
+
     vmc_enabled: bool = True
     vmc_host: str = "127.0.0.1"
     vmc_port: int = 39539
+    vmc_send_camera: bool = True
 
     plugin_api_enabled: bool = False
     plugin_api_url: str = "ws://127.0.0.1:25034"
     plugin_api_token: str = ""
     plugin_api_inject_params: bool = False
     plugin_api_auto_configure_vmc: bool = True
+    plugin_api_sync_camera: bool = True
 
     def get_preset(self) -> LatencyPreset:
         return LATENCY_PRESETS[self.preset]
@@ -214,6 +219,8 @@ class EngineConfig:
         """Load persisted configuration from JSON if present, falling back to defaults."""
         src = Path(path)
         cfg = cls()
+        if not src.is_file() and src.resolve() == SETTINGS_FILE.resolve() and SHARED_SETTINGS_SEED_FILE.is_file():
+            src = SHARED_SETTINGS_SEED_FILE
         if not src.is_file():
             return cfg
         try:

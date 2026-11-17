@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import math
 import queue
 import sys
 import threading
@@ -18,6 +19,14 @@ import cv2
 import numpy as np
 import torch
 
+from .camera_tracker import (
+    BackgroundVisualOdometry,
+    FrameCameraObservation,
+    ShotCutDetector,
+    StreamingCameraSolver,
+    camera_to_persona_vrm_camera,
+    camera_to_vmc_transform,
+)
 from .config import CONFIG_FIELDS, LATENCY_PRESETS, MODEL_FPS, EngineConfig, LatencyPreset
 from .paths import FLOWHMR_CFG_PATH, FLOWHMR_CKPT_PATH, MOTION_STATS_PATH, YOLOX_CKPT_PATH, is_sam3d_available
 from .perception import (
@@ -56,22 +65,33 @@ class EngineTelemetry:
     underruns: int = 0
     plugin_api_connected: bool = False
     plugin_api_vmc_source_id: str = ""
+    camera_distance_m: float = 0.0
+    camera_azimuth_deg: float = 0.0
+    camera_elevation_deg: float = 0.0
+    camera_fov_deg: float = 0.0
+    camera_cuts_detected: int = 0
+    plugin_api_camera_syncs: int = 0
 
 
 # Settings applied on the fly; changing any other config field restarts a running stream.
 _LIVE_FIELDS = frozenset(
     {
+        "camera_index",
         "playout_fps",
         "mirror",
         "follow_movement",
+        "camera_tracking_enabled",
+        "camera_avatar_scale",
         "vmc_enabled",
         "vmc_host",
         "vmc_port",
+        "vmc_send_camera",
         "plugin_api_enabled",
         "plugin_api_url",
         "plugin_api_token",
         "plugin_api_inject_params",
         "plugin_api_auto_configure_vmc",
+        "plugin_api_sync_camera",
     }
 )
 # Changing these reconnects the Persona Plugin API client.
@@ -106,16 +126,67 @@ def _enable_windows_high_res_timer() -> None:
 
 
 @dataclass
+class _PendingFrameMeta:
+    """Per-frame tracking & optional VO metadata awaiting keyframe token/camera interpolation."""
+
+    sample: SampledFrame
+    bbox_xyxy: np.ndarray | None = None
+    cam_k: np.ndarray | None = None
+    image_hw: tuple[int, int] = (0, 0)
+    r_vo_yup: np.ndarray | None = None
+    vo_inliers: int = 0
+    trans_flow_px: float = 0.0
+    is_cut: bool = False
+    shot_id: int = 0
+
+    def to_feature_item(
+        self,
+        sam_token: torch.Tensor,
+        sam_cam_t: np.ndarray | None = None,
+        sam_j3d_cam: np.ndarray | None = None,
+    ) -> FrameFeatureItem:
+        cam_obs = None
+        if (
+            sam_cam_t is not None
+            and sam_j3d_cam is not None
+            and self.bbox_xyxy is not None
+            and self.cam_k is not None
+            and self.r_vo_yup is not None
+        ):
+            cam_obs = FrameCameraObservation(
+                sam_cam_t=sam_cam_t,
+                sam_j3d_cam=sam_j3d_cam,
+                cam_k=self.cam_k,
+                image_hw=self.image_hw,
+                bbox_xyxy=self.bbox_xyxy,
+                r_vo_yup=self.r_vo_yup,
+                vo_inliers=self.vo_inliers,
+                is_cut=self.is_cut,
+                shot_id=self.shot_id,
+                trans_flow_px=self.trans_flow_px,
+            )
+        return FrameFeatureItem(
+            frame_index=self.sample.frame_index,
+            capture_mono_s=self.sample.capture_mono_s,
+            sam_token=sam_token,
+            is_stream_reset=self.sample.is_stream_reset,
+            shot_id=self.shot_id,
+            is_cut=self.is_cut,
+            cam_obs=cam_obs,
+        )
+
+
+@dataclass
 class FrameFeatureItem:
-    """Per-frame SAM conditioning token kept in the GPU worker's sliding-window history."""
+    """Per-frame SAM conditioning token + optional camera cues kept in the GPU worker's sliding-window history."""
 
     frame_index: int
     capture_mono_s: float
     sam_token: torch.Tensor  # (SAM_TOKEN_DIM,) CPU float32
-
-    @classmethod
-    def from_sample(cls, sample: SampledFrame, token: torch.Tensor) -> FrameFeatureItem:
-        return cls(frame_index=sample.frame_index, capture_mono_s=sample.capture_mono_s, sam_token=token)
+    is_stream_reset: bool
+    shot_id: int = 0
+    is_cut: bool = False
+    cam_obs: FrameCameraObservation | None = None
 
 
 def _plan_keyframes(
@@ -124,7 +195,7 @@ def _plan_keyframes(
     prev_kf_idx: int | None,
     stride: int,
 ) -> list[int]:
-    """Batch positions that get a SAM keyframe: every `stride` frames, at resets, and the batch's last frame."""
+    """Batch positions that get a SAM keyframe: every `stride` frames, at resets/cuts, and the batch's last frame."""
     positions: list[int] = []
     last_kf = prev_kf_idx
     for pos, (f_idx, is_reset) in enumerate(zip(frame_indices, reset_flags)):
@@ -134,7 +205,7 @@ def _plan_keyframes(
 
     last_pos = len(frame_indices) - 1
     if last_pos >= 0 and last_pos not in positions:
-        # Keep batch boundary phase-locked across video loop resets without adding padding.
+        # Keep batch boundary phase-locked across video loop resets/cuts without adding padding.
         if positions and not reset_flags[positions[-1]]:
             positions[-1] = last_pos
         else:
@@ -143,42 +214,66 @@ def _plan_keyframes(
 
 
 class _KeyframeInterpolator:
-    """Fills frames between sparse SAM keyframes by lerping keyframe tokens, emitting history items in order."""
+    """Fills frames between sparse SAM keyframes by lerping tokens (and optional 3D camera joints) within each shot."""
 
     def __init__(self) -> None:
         self.prev_kf_idx: int | None = None
-        self._prev_kf_tok: torch.Tensor | None = None
-        self._pending: list[SampledFrame] = []
+        self._prev_kf: tuple[torch.Tensor, np.ndarray | None, np.ndarray | None] | None = None
+        self._pending: list[_PendingFrameMeta] = []
 
-    def push(self, sample: SampledFrame, token: torch.Tensor | None, *, is_reset: bool) -> list[FrameFeatureItem]:
-        """Add one frame (`token` set for keyframes); returns the history items it completes."""
+    def push(
+        self,
+        meta: _PendingFrameMeta,
+        kf_data: tuple[torch.Tensor, np.ndarray | None, np.ndarray | None] | None,
+        *,
+        is_reset: bool,
+    ) -> list[FrameFeatureItem]:
+        """Add one frame (`kf_data` set for keyframes); returns the history items it completes."""
         out: list[FrameFeatureItem] = []
         if is_reset:
-            # Flush pre-cut intermediate frames without blending across a loop rewind.
+            # Flush pre-cut intermediate frames without blending across a loop rewind or shot cut.
             out += self.flush()
             self.prev_kf_idx = None
-            self._prev_kf_tok = None
+            self._prev_kf = None
 
-        if token is None:
-            self._pending.append(sample)
+        if kf_data is None:
+            self._pending.append(meta)
             return out
 
-        if self._prev_kf_tok is not None and self.prev_kf_idx is not None and self._pending:
-            span = max(1, sample.frame_index - self.prev_kf_idx)
+        tok, cam_t, j3d = kf_data
+        if self._prev_kf is not None and self.prev_kf_idx is not None and self._pending:
+            p_tok, p_cam_t, p_j3d = self._prev_kf
+            have_cam = (
+                p_cam_t is not None
+                and cam_t is not None
+                and p_j3d is not None
+                and j3d is not None
+            )
+            span = max(1, meta.sample.frame_index - self.prev_kf_idx)
             for p in self._pending:
-                alpha = float(p.frame_index - self.prev_kf_idx) / float(span)
-                out.append(FrameFeatureItem.from_sample(p, torch.lerp(self._prev_kf_tok, token, alpha)))
+                alpha = float(p.sample.frame_index - self.prev_kf_idx) / float(span)
+                lerp_cam_t = ((1.0 - alpha) * p_cam_t + alpha * cam_t).astype(np.float32) if have_cam else None
+                lerp_j3d = ((1.0 - alpha) * p_j3d + alpha * j3d).astype(np.float32) if have_cam else None
+                out.append(p.to_feature_item(torch.lerp(p_tok, tok, alpha), lerp_cam_t, lerp_j3d))
             self._pending.clear()
-        out.append(FrameFeatureItem.from_sample(sample, token))
-        self.prev_kf_idx = sample.frame_index
-        self._prev_kf_tok = token
+        out.append(meta.to_feature_item(tok, cam_t, j3d))
+        self.prev_kf_idx = meta.sample.frame_index
+        self._prev_kf = (tok, cam_t, j3d)
         return out
 
     def flush(self) -> list[FrameFeatureItem]:
-        """Emit pending frames holding the last keyframe token (at stream resets and end of stream)."""
-        if not self._pending or self._prev_kf_tok is None:
+        """Emit pending frames holding the last keyframe token/camera (at cuts/resets and end of stream)."""
+        if not self._pending or self._prev_kf is None:
             return []
-        out = [FrameFeatureItem.from_sample(p, self._prev_kf_tok.clone()) for p in self._pending]
+        p_tok, p_cam_t, p_j3d = self._prev_kf
+        out = [
+            p.to_feature_item(
+                p_tok.clone(),
+                p_cam_t.copy() if p_cam_t is not None else None,
+                p_j3d.copy() if p_j3d is not None else None,
+            )
+            for p in self._pending
+        ]
         self._pending.clear()
         return out
 
@@ -188,14 +283,14 @@ def _extract_dense(
     rgb_list: list[np.ndarray],
     bboxes: np.ndarray,
     cam_k: np.ndarray,
-    reset_flags: list[bool],
+    stream_resets: list[bool],
 ) -> torch.Tensor:
-    """Tokens for every frame of a batch; replay extractors restart their token cursor at stream resets."""
-    if not isinstance(extractor, ReplayTokenExtractor) or not any(reset_flags):
+    """Tokens for every frame of a batch; replay extractors restart cursor at stream resets."""
+    if not isinstance(extractor, ReplayTokenExtractor) or not any(stream_resets):
         return extractor.extract_chunk(rgb_list, bboxes, cam_k)
     pieces: list[torch.Tensor] = []
     seg_start = 0
-    for i, is_reset in enumerate(reset_flags):
+    for i, is_reset in enumerate(stream_resets):
         if not is_reset:
             continue
         if i > seg_start:
@@ -204,6 +299,37 @@ def _extract_dense(
         extractor.reset()
     pieces.append(extractor.extract_chunk(rgb_list[seg_start:], bboxes[seg_start:], cam_k[seg_start:]))
     return torch.cat(pieces, dim=0)
+
+
+def _extract_dense_with_camera(
+    extractor: Sam3DStreamExtractor | ReplayTokenExtractor,
+    rgb_list: list[np.ndarray],
+    bboxes: np.ndarray,
+    cam_k: np.ndarray,
+    stream_resets: list[bool],
+) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+    """Tokens + camera cues for every frame of a batch; replay extractors restart cursor at stream resets."""
+    if not isinstance(extractor, ReplayTokenExtractor) or not any(stream_resets):
+        return extractor.extract_chunk_with_camera(rgb_list, bboxes, cam_k)
+    tok_pieces: list[torch.Tensor] = []
+    ct_pieces: list[np.ndarray] = []
+    j3_pieces: list[np.ndarray] = []
+    seg_start = 0
+    for i, is_reset in enumerate(stream_resets):
+        if not is_reset:
+            continue
+        if i > seg_start:
+            t_p, c_p, j_p = extractor.extract_chunk_with_camera(rgb_list[seg_start:i], bboxes[seg_start:i], cam_k[seg_start:i])
+            tok_pieces.append(t_p)
+            ct_pieces.append(c_p)
+            j3_pieces.append(j_p)
+            seg_start = i
+        extractor.reset()
+    t_p, c_p, j_p = extractor.extract_chunk_with_camera(rgb_list[seg_start:], bboxes[seg_start:], cam_k[seg_start:])
+    tok_pieces.append(t_p)
+    ct_pieces.append(c_p)
+    j3_pieces.append(j_p)
+    return torch.cat(tok_pieces, dim=0), np.concatenate(ct_pieces, axis=0), np.concatenate(j3_pieces, axis=0)
 
 
 class _RateMeter:
@@ -284,6 +410,7 @@ class StreamingMocapEngine:
 
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._peeked_frame: SampledFrame | None = None
 
     @property
     def is_running(self) -> bool:
@@ -410,6 +537,7 @@ class StreamingMocapEngine:
         self._playout_buffer.clear()
         self._latest_emitted_pose = None
         self._frame0_mono = 0.0
+        self._peeked_frame = None
         self._live_jpeg.clear()
         self._synced_jpeg.clear()
         self.telemetry = EngineTelemetry(
@@ -424,7 +552,10 @@ class StreamingMocapEngine:
 
         self._sync_plugin_client()
 
-        frame_queue: queue.Queue[SampledFrame | None] = queue.Queue(maxsize=96)
+        preset = self.config.get_preset()
+        sam_stride = max(1, self.config.effective_sam_stride())
+        queue_cap = max(24, min(42, preset.sam_chunk_size * sam_stride + 18))
+        frame_queue: queue.Queue[SampledFrame | None] = queue.Queue(maxsize=queue_cap)
         warmup_done_event = threading.Event()
         first_commit_event = threading.Event()
         self._threads = [
@@ -514,6 +645,21 @@ class StreamingMocapEngine:
             drop_oldest = self.config.source_mode == "camera"
             capture_rate = _RateMeter()
             while not self._stop_event.is_set():
+                if not drop_oldest:
+                    # Wait for bounded queue headroom BEFORE reading/stamping the next video frame
+                    # so `capture_mono_s` never ages inside a stalled queue.
+                    while frame_queue.full() and not self._stop_event.is_set():
+                        time.sleep(0.004)
+                    if self._stop_event.is_set():
+                        break
+
+                if isinstance(source, CameraSource) and source.camera_index != int(self.config.camera_index):
+                    source.switch_device(
+                        self.config.camera_index,
+                        width=self.config.camera_width,
+                        height=self.config.camera_height,
+                        target_fps=MODEL_FPS,
+                    )
                 sample = source.read_next()
                 if sample is None:
                     break
@@ -541,8 +687,11 @@ class StreamingMocapEngine:
         frame_queue: queue.Queue[SampledFrame | None],
         goal: int,
     ) -> tuple[list[SampledFrame], bool]:
-        """Collect up to `goal` frames; the flag reports whether the end-of-stream sentinel arrived."""
+        """Collect up to `goal` same-resolution frames; the flag reports whether the end-of-stream sentinel arrived."""
         batch: list[SampledFrame] = []
+        if self._peeked_frame is not None:
+            batch.append(self._peeked_frame)
+            self._peeked_frame = None
         while len(batch) < goal and not self._stop_event.is_set():
             try:
                 item = frame_queue.get(timeout=0.05)
@@ -550,6 +699,10 @@ class StreamingMocapEngine:
                 continue
             if item is None:
                 return batch, True
+            if batch and item.rgb.shape != batch[0].rgb.shape:
+                # Split batch cleanly at a live camera resolution change so stacked tensors stay homogeneous.
+                self._peeked_frame = item
+                return batch, False
             batch.append(item)
         return batch, False
 
@@ -585,6 +738,11 @@ class StreamingMocapEngine:
             self.telemetry.state = "buffering"
             warmup_done_event.set()
             stitcher = StreamingStitcher(self._decoder, fps=MODEL_FPS)
+            cut_detector = ShotCutDetector()
+            vo_tracker = BackgroundVisualOdometry()
+            camera_solver = StreamingCameraSolver(avatar_scale=float(self.config.camera_avatar_scale))
+            shot_id = 0
+            prev_track_cam = bool(self.config.camera_tracking_enabled)
             history: deque[FrameFeatureItem] = deque(maxlen=preset.window_frames + 128)
             keyframes = _KeyframeInterpolator()
             next_emit_frame = 0
@@ -600,34 +758,141 @@ class StreamingMocapEngine:
 
                 batch, eos_reached = self._take_batch(frame_queue, batch_goal)
                 if batch:
+                    track_cam = bool(self.config.camera_tracking_enabled)
+                    toggled_cam_on = track_cam and not prev_track_cam
+                    prev_track_cam = track_cam
+
                     rgb_list = [s.rgb for s in batch]
-                    reset_flags = [s.is_stream_reset for s in batch]
+                    stream_resets = [s.is_stream_reset for s in batch]
                     h, w = rgb_list[0].shape[:2]
-                    cam_k = np.repeat(default_camera_intrinsics(h, w)[None], len(batch), axis=0)
+                    cam_k0 = default_camera_intrinsics(h, w)
+                    cam_k = np.repeat(cam_k0[None], len(batch), axis=0)
+
+                    cut_flags: list[bool] = []
+                    shot_ids: list[int] = []
+                    if track_cam:
+                        if toggled_cam_on:
+                            cut_detector.reset()
+                            vo_tracker.reset()
+                            camera_solver.reset()
+                        for idx_in_b, s in enumerate(batch):
+                            if s.is_stream_reset:
+                                cut_detector.reset()
+                                is_cut = False
+                                shot_id += 1
+                            else:
+                                force = s.is_camera_switch or (toggled_cam_on and idx_in_b == 0)
+                                is_cut = cut_detector.step(s.rgb, force_cut=force)
+                                if is_cut:
+                                    shot_id += 1
+                                    if not (toggled_cam_on and idx_in_b == 0):
+                                        self.telemetry.camera_cuts_detected += 1
+                            cut_flags.append(is_cut)
+                            shot_ids.append(shot_id)
+                        cut_or_reset = [r or c for r, c in zip(stream_resets, cut_flags)]
+                    else:
+                        for s in batch:
+                            if s.is_stream_reset or s.is_camera_switch:
+                                cut_detector.reset()
+                                vo_tracker.reset()
+                                shot_id += 1
+                            cut_flags.append(False)
+                            shot_ids.append(shot_id)
+                        cut_or_reset = [s.is_stream_reset or s.is_camera_switch for s in batch]
 
                     t0 = time.perf_counter()
-                    bboxes = yolox.detect_and_track_batch(rgb_list, reset_flags=reset_flags)
+                    bboxes = yolox.detect_and_track_batch(rgb_list, reset_flags=cut_or_reset)
                     if sync_cuda:
                         torch.cuda.synchronize()
                     t1 = time.perf_counter()
 
-                    if keyframe_mode:
-                        kf_pos = _plan_keyframes([s.frame_index for s in batch], reset_flags, keyframes.prev_kf_idx, sam_stride)
-                        kf_tokens = extractor.extract_chunk([rgb_list[i] for i in kf_pos], bboxes[kf_pos], cam_k[kf_pos])
+                    if track_cam:
+                        vo_rots: list[np.ndarray] = []
+                        vo_inliers: list[int] = []
+                        vo_flows: list[float] = []
+                        for s, bbox, is_boundary in zip(batch, bboxes, cut_or_reset):
+                            r_vo, n_inl = vo_tracker.step(s.rgb, bbox, cam_k0, is_cut=is_boundary)
+                            vo_rots.append(r_vo)
+                            vo_inliers.append(n_inl)
+                            vo_flows.append(float(vo_tracker.last_trans_flow_px))
+
+                        if keyframe_mode:
+                            kf_pos = _plan_keyframes(
+                                [s.frame_index for s in batch],
+                                cut_or_reset,
+                                keyframes.prev_kf_idx,
+                                sam_stride,
+                            )
+                            kf_tokens, kf_cam_t, kf_j3d = extractor.extract_chunk_with_camera(
+                                [rgb_list[i] for i in kf_pos],
+                                bboxes[kf_pos],
+                                cam_k[kf_pos],
+                            )
+                        else:
+                            tokens, cam_ts, j3ds = _extract_dense_with_camera(
+                                extractor,
+                                rgb_list,
+                                bboxes,
+                                cam_k,
+                                stream_resets,
+                            )
                     else:
-                        tokens = _extract_dense(extractor, rgb_list, bboxes, cam_k, reset_flags)
+                        if keyframe_mode:
+                            kf_pos = _plan_keyframes(
+                                [s.frame_index for s in batch],
+                                cut_or_reset,
+                                keyframes.prev_kf_idx,
+                                sam_stride,
+                            )
+                            kf_tokens = extractor.extract_chunk(
+                                [rgb_list[i] for i in kf_pos],
+                                bboxes[kf_pos],
+                                cam_k[kf_pos],
+                            )
+                        else:
+                            tokens = _extract_dense(extractor, rgb_list, bboxes, cam_k, stream_resets)
+
                     if sync_cuda:
                         torch.cuda.synchronize()
                     t2 = time.perf_counter()
 
-                    for s, bbox in zip(batch, bboxes):
+                    metas: list[_PendingFrameMeta] = []
+                    for i, (s, bbox) in enumerate(zip(batch, bboxes)):
                         self._preview.record_bbox(s.frame_index, bbox)
+                        if track_cam:
+                            metas.append(
+                                _PendingFrameMeta(
+                                    sample=s,
+                                    bbox_xyxy=bbox.copy(),
+                                    cam_k=cam_k[i].copy(),
+                                    image_hw=(h, w),
+                                    r_vo_yup=vo_rots[i],
+                                    vo_inliers=vo_inliers[i],
+                                    trans_flow_px=vo_flows[i],
+                                    is_cut=cut_flags[i],
+                                    shot_id=shot_ids[i],
+                                )
+                            )
+                        else:
+                            metas.append(_PendingFrameMeta(sample=s, shot_id=shot_ids[i]))
+
                     if keyframe_mode:
-                        kf_token_at = dict(zip(kf_pos, kf_tokens))
-                        for i, s in enumerate(batch):
-                            history.extend(keyframes.push(s, kf_token_at.get(i), is_reset=reset_flags[i]))
+                        if track_cam:
+                            kf_at: dict[int, tuple[torch.Tensor, np.ndarray | None, np.ndarray | None]] = {
+                                pos: (kf_tokens[k], kf_cam_t[k], kf_j3d[k])
+                                for k, pos in enumerate(kf_pos)
+                            }
+                        else:
+                            kf_at = {pos: (kf_tokens[k], None, None) for k, pos in enumerate(kf_pos)}
+                        for i, meta in enumerate(metas):
+                            history.extend(keyframes.push(meta, kf_at.get(i), is_reset=cut_or_reset[i]))
                     else:
-                        history.extend(FrameFeatureItem.from_sample(s, tok) for s, tok in zip(batch, tokens))
+                        if track_cam:
+                            for i, meta in enumerate(metas):
+                                history.extend([meta.to_feature_item(tokens[i], cam_ts[i], j3ds[i])])
+                        else:
+                            for i, meta in enumerate(metas):
+                                history.extend([meta.to_feature_item(tokens[i])])
 
                     self.telemetry.yolox_ms_per_frame = round((t1 - t0) * 1000.0 / len(batch), 2)
                     self.telemetry.sam_ms_per_frame = round((t2 - t1) * 1000.0 / len(batch), 2)
@@ -637,12 +902,15 @@ class StreamingMocapEngine:
                 if history:
                     self.telemetry.frames_perceived = history[-1].frame_index + 1
 
+                raw_scale = float(self.config.camera_avatar_scale)
+                camera_solver.avatar_scale = max(0.1, raw_scale) if math.isfinite(raw_scale) else 1.0
                 next_emit_frame = self._solve_ready_windows(
                     history,
                     next_emit_frame,
                     eos=eos_reached,
                     preset=preset,
                     stitcher=stitcher,
+                    camera_solver=camera_solver,
                     first_commit_event=first_commit_event,
                 )
         except Exception as exc:
@@ -660,6 +928,7 @@ class StreamingMocapEngine:
         eos: bool,
         preset: LatencyPreset,
         stitcher: StreamingStitcher,
+        camera_solver: StreamingCameraSolver,
         first_commit_event: threading.Event,
     ) -> int:
         """Solve and commit every stride window whose frames are available; returns the next frame to emit."""
@@ -671,19 +940,10 @@ class StreamingMocapEngine:
             if eos and latest_available < next_emit_frame:
                 break
 
-            # Window `[next_emit_frame - H .. next_emit_frame + S + O + L - 1]`, clamped to the oldest/newest
-            # history item so window 0 (`frame < 0`) and the EOS tail keep a fixed `preset.window_frames` length.
             by_idx = {it.frame_index: it for it in history}
             first_item, last_item = history[0], history[-1]
-            win_start = next_emit_frame - preset.history_frames
-            win_indices = list(range(win_start, win_start + preset.window_frames))
-            win_tokens = [
-                by_idx[f].sam_token if f in by_idx else (first_item if f < first_item.frame_index else last_item).sam_token
-                for f in win_indices
-            ]
-            latent_win = self._solver.solve_window(torch.stack(win_tokens, dim=0), win_indices, ode_steps=preset.ode_steps)
-            self.telemetry.mmdit_ms_per_window = round(self._solver.last_solve_ms, 2)
-            self.telemetry.windows_solved += 1
+            emit_item = by_idx.get(next_emit_frame) or last_item
+            target_shot_id = emit_item.shot_id
 
             stride = preset.stride_frames
             if eos:
@@ -691,13 +951,68 @@ class StreamingMocapEngine:
                 if stride == 0:
                     break
 
+            # End the current stride cleanly right before any hard shot cut or loop reset so
+            # neither MMDiT window nor overlap crossfade smears across two camera angles.
+            cut_within_stride = False
+            for k in range(1, stride):
+                cand = by_idx.get(next_emit_frame + k)
+                if cand is not None and (cand.shot_id != target_shot_id or cand.is_stream_reset):
+                    stride = k
+                    cut_within_stride = True
+                    break
+
+            shot_items = [it for it in history if it.shot_id == target_shot_id]
+            shot_first = shot_items[0] if shot_items else first_item
+            shot_last = shot_items[-1] if shot_items else last_item
+
+            win_start = next_emit_frame - preset.history_frames
+            win_indices = list(range(win_start, win_start + preset.window_frames))
+            win_items = [
+                by_idx[f]
+                if (f in by_idx and by_idx[f].shot_id == target_shot_id)
+                else (shot_first if f < shot_first.frame_index else shot_last)
+                for f in win_indices
+            ]
+            win_tokens = [it.sam_token for it in win_items]
+
+            track_cam = bool(self.config.camera_tracking_enabled)
+            if track_cam and win_items[0].cam_obs is not None:
+                r_win0 = win_items[0].cam_obs.r_vo_yup
+                cam_r_w_9 = np.stack(
+                    [(it.cam_obs.r_vo_yup if it.cam_obs is not None else r_win0) @ r_win0.T for it in win_items],
+                    axis=0,
+                ).reshape(-1, 9)
+                window_vo_yaw = math.atan2(float(r_win0[2, 0]), float(r_win0[2, 2]))
+            else:
+                cam_r_w_9 = None
+                window_vo_yaw = 0.0
+
+            latent_win = self._solver.solve_window(
+                torch.stack(win_tokens, dim=0),
+                win_indices,
+                ode_steps=preset.ode_steps,
+                camera_r_w_9=cam_r_w_9,
+            )
+            self.telemetry.mmdit_ms_per_window = round(self._solver.last_solve_ms, 2)
+            self.telemetry.windows_solved += 1
+
+            stride_items = [by_idx.get(next_emit_frame + i) or shot_last for i in range(stride)]
+            stride_cam_obs = [it.cam_obs for it in stride_items if it.cam_obs is not None]
+            have_stride_cam = track_cam and len(stride_cam_obs) == len(stride_items)
             committed = stitcher.commit_window(
                 latent_win,
                 emit_offset_in_window=preset.history_frames,
                 stride_frames=stride,
-                overlap_frames=0 if eos else preset.overlap_frames,
+                overlap_frames=0 if (eos or cut_within_stride) else preset.overlap_frames,
                 first_emit_frame_index=next_emit_frame,
-                capture_mono_times=[(by_idx.get(next_emit_frame + i) or last_item).capture_mono_s for i in range(stride)],
+                capture_mono_times=[it.capture_mono_s for it in stride_items],
+                reset_flags=[it.is_stream_reset for it in stride_items],
+                cut_flags=[it.is_cut for it in stride_items],
+                window_vo_yaw_rad=window_vo_yaw if have_stride_cam else 0.0,
+                camera_observations=stride_cam_obs if have_stride_cam else None,
+                camera_solver=camera_solver if have_stride_cam else None,
+                follow_movement=self.config.follow_movement,
+                anchor_world_yaw_across_cuts=have_stride_cam,
             )
             self._playout_buffer.push_many(committed)
             next_emit_frame += stride
@@ -752,6 +1067,21 @@ class StreamingMocapEngine:
                 slip_s = min(dt_out, max(0.0, target_media_s - sample.pose.media_time_s))
                 playout_origin_mono += slip_s
                 next_tick_mono += slip_s
+            elif was_started and realtime_source and sample.pose.capture_mono_s > 0.0:
+                # Keep real-time playout latency locked onto `delay_s`:
+                # - If slipped above `delay_s` with healthy buffer lead, smoothly catch up (<= 20% rate).
+                # - If capture clock re-anchored forward so latency fell below `delay_s`, gently restore
+                #   the full `delay_s` pipeline budget before lead runs dry.
+                excess_s = (now_mono - sample.pose.capture_mono_s) - delay_s
+                if excess_s > 0.05 and sample.buffer_lead_ms > 200.0:
+                    lead_headroom_s = max(0.0, (sample.buffer_lead_ms / 1000.0) - 0.18)
+                    max_rate = 0.20 if excess_s > 0.25 else 0.10
+                    catchup_s = min(dt_out * max_rate, excess_s - 0.025, lead_headroom_s * 0.25)
+                    if catchup_s > 0.0:
+                        playout_origin_mono -= catchup_s
+                elif excess_s < -0.04 and sample.buffer_lead_ms < 160.0:
+                    relax_s = min(dt_out * 0.15, -excess_s)
+                    playout_origin_mono += relax_s
 
             pose = sample.pose
             self._latest_emitted_pose = pose
@@ -762,26 +1092,44 @@ class StreamingMocapEngine:
             else:
                 self.telemetry.measured_latency_ms = round(delay_s * 1000.0, 1)
 
+            cam_pose = pose.camera if self.config.camera_tracking_enabled else None
+            if cam_pose is not None:
+                self.telemetry.camera_distance_m = round(cam_pose.orbit_distance, 2)
+                self.telemetry.camera_azimuth_deg = round(math.degrees(cam_pose.orbit_azimuth), 1)
+                self.telemetry.camera_elevation_deg = round(math.degrees(cam_pose.orbit_elevation), 1)
+                self.telemetry.camera_fov_deg = round(cam_pose.fov_deg, 1)
+
             if self.config.vmc_enabled and self._vmc_sender is not None:
                 bones = pose_to_vmc_bones(
                     pose,
                     mirror=self.config.mirror,
                     follow_movement=self.config.follow_movement,
                 )
-                self._vmc_sender.send_pose(bones)
+                if cam_pose is not None and self.config.vmc_send_camera:
+                    vmc_cam = camera_to_vmc_transform(cam_pose, mirror=self.config.mirror)
+                    self._vmc_sender.send_pose(bones, camera=vmc_cam)
+                else:
+                    self._vmc_sender.send_pose(bones)
                 self.telemetry.vmc_packets_sent = self._vmc_sender.packets_sent
 
             client = self._plugin_client
-            if (
-                self.config.plugin_api_enabled
-                and self.config.plugin_api_inject_params
-                and client is not None
-                and client.is_connected
-                and client.has_live2d_model
-                and (now_mono - last_param_inject_mono) >= 0.05
-            ):
-                client.inject_params_fire_and_forget(pose_to_live2d_params(pose, mirror=self.config.mirror))
-                last_param_inject_mono = now_mono
+            if client is not None and client.is_connected and self.config.plugin_api_enabled:
+                if cam_pose is not None and self.config.plugin_api_sync_camera:
+                    vrm_cam = camera_to_persona_vrm_camera(
+                        cam_pose,
+                        mirror=self.config.mirror,
+                        vrm_placement=client.bound_vrm_placement,
+                    )
+                    client.send_vrm_camera_fire_and_forget(vrm_cam)
+                    self.telemetry.plugin_api_camera_syncs = client.camera_patches_sent
+
+                if (
+                    self.config.plugin_api_inject_params
+                    and client.has_live2d_model
+                    and (now_mono - last_param_inject_mono) >= 0.05
+                ):
+                    client.inject_params_fire_and_forget(pose_to_live2d_params(pose, mirror=self.config.mirror))
+                    last_param_inject_mono = now_mono
 
             fps = playout_rate.tick(now_mono)
             if fps is not None:
@@ -798,6 +1146,7 @@ class StreamingMocapEngine:
             return self._render_latest_frame(self._synced_jpeg, "BUFFERING")
 
         mirror = self.config.mirror
+        cam_enabled = self.config.camera_tracking_enabled
 
         def draw() -> np.ndarray | None:
             got = self._preview.get_synced_bgr(pose.frame_index)
@@ -806,9 +1155,12 @@ class StreamingMocapEngine:
             f_idx, bgr, bbox, orig_hw = got
             self._draw_bbox_overlay(bgr, bbox, orig_hw, label=f"SYNCED PLAYOUT #{f_idx}")
             self._draw_skeleton_hud(bgr, pose)
-            return cv2.flip(bgr, 1) if mirror else bgr
+            out = cv2.flip(bgr, 1) if mirror else bgr
+            if cam_enabled and pose.camera is not None:
+                self._draw_camera_hud(out, pose.camera, mirror=mirror)
+            return out
 
-        return self._synced_jpeg.get(("play", pose.frame_index, round(pose.media_time_s, 4), mirror), draw)
+        return self._synced_jpeg.get(("play", pose.frame_index, round(pose.media_time_s, 4), mirror, cam_enabled), draw)
 
     def _render_latest_frame(self, cache: _JpegCache, label: str) -> bytes | None:
         got = self._preview.get_latest_bgr()
@@ -874,6 +1226,26 @@ class StreamingMocapEngine:
             cv2.line(bgr, tuple(pts2[parent]), tuple(pts2[child]), color, 2, cv2.LINE_AA)
         for j in range(22):
             cv2.circle(bgr, tuple(pts2[j]), 3, (255, 255, 255), -1, cv2.LINE_AA)
+
+    @staticmethod
+    def _draw_camera_hud(bgr: np.ndarray, cam: Any, *, mirror: bool = False) -> None:
+        """Render the dynamic 6-DoF stage camera badge in the bottom-left corner of the synced preview."""
+        h, w = bgr.shape[:2]
+        sign = -1.0 if mirror else 1.0
+        az_deg = sign * math.degrees(float(cam.orbit_azimuth))
+        el_deg = math.degrees(float(cam.orbit_elevation))
+        text = f"CAM d={cam.orbit_distance:.2f}m  az={az_deg:+.1f}d  el={el_deg:+.1f}d  fov={cam.fov_deg:.1f}d"
+        if cam.is_cut:
+            text += " [CUT]"
+        pad_x, box_h = 10, 28
+        y0, y1 = max(0, h - box_h - 10), h - 10
+        x1 = min(w - 10, pad_x + len(text) * 8 + 14)
+        sub = bgr[y0:y1, pad_x:x1]
+        if sub.size > 0:
+            sub[:] = (sub.astype(np.uint16) * 32 // 100).astype(np.uint8)
+        border = (90, 200, 255) if cam.is_cut else (90, 110, 140)
+        cv2.rectangle(bgr, (pad_x, y0), (x1, y1), border, 1)
+        cv2.putText(bgr, text, (pad_x + 8, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 240, 255), 1, cv2.LINE_AA)
 
     def get_status(self) -> dict[str, Any]:
         client = self._plugin_client
