@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from .vmc_sender import BoneTransform, Pos3
+
+if TYPE_CHECKING:
+    from .camera_tracker import CameraPoseFrame
 
 # Exact 52 SMPL-H joint order (`SMPLH_JOINT2NUM` in FlowHMR) -> Unity HumanBodyBones name.
 # Persona's `unityToVrmBone` (`protocol.ts`) maps `LeftThumbProximal/Intermediate/Distal`
@@ -216,6 +220,7 @@ class CanonicalPoseFrame:
     quats_rh_xyzw: np.ndarray  # (52, 4) local right-handed SMPL-H quaternions, root already R_y(180)-aligned
     hips_pos_rh: np.ndarray    # (3,) pelvis world position in +X-left, +Y-up, +Z-forward meters
     joints_cam_3d: np.ndarray | None = None  # optional (22, 3) body joints in camera frame for 2D HUD
+    camera: CameraPoseFrame | None = None    # optional dynamic 6-DoF stage camera pose & FOV
 
 
 def canonicalize_smplh_rotations(local_rot_mats: np.ndarray) -> np.ndarray:

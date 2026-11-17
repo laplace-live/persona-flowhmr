@@ -18,9 +18,11 @@ from collections.abc import Iterable
 Pos3 = tuple[float, float, float]
 Quat4 = tuple[float, float, float, float]  # (x, y, z, w)
 BoneTransform = tuple[str, Pos3, Quat4]
+CameraTransform = tuple[str, Pos3, Quat4, float]  # (name, pos, quat, fov_deg)
 
 _SIZE = struct.Struct(">I")
 _POS7 = struct.Struct(">7f")  # (px, py, pz, qx, qy, qz, qw)
+_CAM8 = struct.Struct(">8f")  # (px, py, pz, qx, qy, qz, qw, fov)
 _BUNDLE_HEADER = b"#bundle\x00" + struct.pack(">Q", 1)  # immediate timetag = 1
 _RESOLVE_TTL_S = 5.0  # how long a resolved target address is reused before looking the host up again
 _log = logging.getLogger(__name__)
@@ -34,6 +36,7 @@ def encode_osc_string(value: str) -> bytes:
 
 
 _TAGS_POS7 = encode_osc_string(",sfffffff")
+_TAGS_CAM8 = encode_osc_string(",sffffffff")
 
 
 def _bundle_element(msg: bytes) -> bytes:
@@ -48,6 +51,13 @@ def _bone_element_head(name: str) -> bytes:
     return _SIZE.pack(len(head) + _POS7.size) + head
 
 
+@functools.cache
+def _cam_element_head(name: str) -> bytes:
+    """Size prefix + `/VMC/Ext/Cam ,sffffffff <name>`: everything before a camera's 8 floats."""
+    head = encode_osc_string("/VMC/Ext/Cam") + _TAGS_CAM8 + encode_osc_string(name)
+    return _SIZE.pack(len(head) + _CAM8.size) + head
+
+
 # Identity root transform and `/VMC/Ext/OK` status (`loaded=1, calibrated=3, tracking=1`) never change.
 _ROOT_ELEMENT = _bundle_element(
     encode_osc_string("/VMC/Ext/Root/Pos")
@@ -58,12 +68,20 @@ _ROOT_ELEMENT = _bundle_element(
 _OK_ELEMENT = _bundle_element(encode_osc_string("/VMC/Ext/OK") + encode_osc_string(",iii") + struct.pack(">3i", 1, 3, 1))
 
 
-def encode_vmc_bundle(bones: Iterable[BoneTransform]) -> bytes:
-    """Pack the identity root transform, all humanoid bone transforms, and `/VMC/Ext/OK` into one OSC `#bundle`."""
+def encode_vmc_bundle(
+    bones: Iterable[BoneTransform],
+    *,
+    camera: CameraTransform | None = None,
+) -> bytes:
+    """Pack root, all humanoid bones, optional `/VMC/Ext/Cam`, and `/VMC/Ext/OK` into one OSC `#bundle`."""
     parts = [_BUNDLE_HEADER, _ROOT_ELEMENT]
     for name, pos, quat in bones:
         parts.append(_bone_element_head(name))
         parts.append(_POS7.pack(*pos, *quat))
+    if camera is not None:
+        cam_name, cam_pos, cam_quat, cam_fov = camera
+        parts.append(_cam_element_head(cam_name))
+        parts.append(_CAM8.pack(*cam_pos, *cam_quat, cam_fov))
     parts.append(_OK_ELEMENT)
     return b"".join(parts)
 
@@ -84,7 +102,12 @@ class VmcUdpSender:
         self.host = host
         self.port = int(port)
 
-    def send_pose(self, bones: Iterable[BoneTransform]) -> int:
+    def send_pose(
+        self,
+        bones: Iterable[BoneTransform],
+        *,
+        camera: CameraTransform | None = None,
+    ) -> int:
         target = (self.host, self.port)
         now = time.monotonic()
         resolved = self._resolved
@@ -100,7 +123,7 @@ class VmcUdpSender:
                 addr = resolved[1]
             resolved = (target, addr, now + _RESOLVE_TTL_S)
             self._resolved = resolved
-        sent = self._sock.sendto(encode_vmc_bundle(bones), resolved[1])
+        sent = self._sock.sendto(encode_vmc_bundle(bones, camera=camera), resolved[1])
         self.packets_sent += 1
         return sent
 

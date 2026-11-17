@@ -7,9 +7,11 @@ control UI can display both the live frame and the latency-synced playout frame 
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,7 +33,8 @@ class SampledFrame:
     media_time_s: float
     capture_mono_s: float
     rgb: np.ndarray  # HxWx3 uint8 RGB
-    is_stream_reset: bool = False  # first frame after a video loop rewind
+    is_stream_reset: bool = False   # first frame after a video loop rewind
+    is_camera_switch: bool = False  # first frame after hot-swapping live camera device
 
 
 class _FrameClock:
@@ -47,32 +50,42 @@ class _FrameClock:
         now = time.perf_counter()
         if self._start_mono is None:
             self._start_mono = now
-        sleep_s = self._start_mono + (self.frame_index / self.fps) - time.perf_counter()
+        sleep_s = self._start_mono + (self.frame_index / self.fps) - now
         if sleep_s > 0.001:
             time.sleep(sleep_s)
+        elif sleep_s < -0.10:
+            # Re-anchor after queue backpressure so video pacing resumes smoothly at 30.0 Hz
+            # instead of bursting stale backlog frames.
+            self._start_mono = now - (self.frame_index / self.fps)
 
-    def emit(self, rgb: np.ndarray, *, is_stream_reset: bool = False) -> SampledFrame:
+    def emit(
+        self,
+        rgb: np.ndarray,
+        *,
+        is_stream_reset: bool = False,
+        is_camera_switch: bool = False,
+    ) -> SampledFrame:
         sample = SampledFrame(
             frame_index=self.frame_index,
             media_time_s=self.frame_index / self.fps,
             capture_mono_s=time.perf_counter(),
             rgb=rgb,
             is_stream_reset=is_stream_reset,
+            is_camera_switch=is_camera_switch,
         )
         self.frame_index += 1
         return sample
 
 
 class PreviewRingBuffer:
-    """Bounded history of downscaled BGR frames + detected bboxes keyed by `frame_index`."""
+    """Bounded history of downscaled BGR frames + per-frame source dims + bboxes keyed by `frame_index`."""
 
     def __init__(self, max_items: int = 240, max_width: int = 640) -> None:
         self._lock = threading.Lock()
         self._max_items = int(max_items)
         self._max_width = max_width
-        self._frames: dict[int, np.ndarray] = {}  # insertion-ordered: oldest first
+        self._frames: dict[int, tuple[np.ndarray, tuple[int, int]]] = {}  # insertion-ordered: oldest first
         self._bboxes: dict[int, BBox] = {}
-        self._orig_hw: tuple[int, int] = (720, 1280)
 
     def clear(self) -> None:
         with self._lock:
@@ -81,17 +94,16 @@ class PreviewRingBuffer:
 
     def record_frame(self, frame_index: int, rgb: np.ndarray) -> None:
         h, w = rgb.shape[:2]
-        if w > self._max_width:
-            scale = self._max_width / float(w)
-            rgb = cv2.resize(
-                rgb,
-                (self._max_width, max(1, int(round(h * scale)))),
-                interpolation=cv2.INTER_LINEAR,
-            )
+        orig_hw = (int(h), int(w))
+        if w > self._max_width or h > self._max_width * 2:
+            scale = min(self._max_width / float(max(1, w)), (self._max_width * 1.5) / float(max(1, h)))
+            tw, th = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+            if scale < 0.5:
+                rgb = cv2.resize(rgb, (tw * 2, th * 2), interpolation=cv2.INTER_NEAREST)
+            rgb = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_LINEAR)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         with self._lock:
-            self._orig_hw = (h, w)
-            self._frames[int(frame_index)] = bgr
+            self._frames[int(frame_index)] = (bgr, orig_hw)
             while len(self._frames) > self._max_items:
                 evicted = next(iter(self._frames))
                 del self._frames[evicted]
@@ -107,7 +119,8 @@ class PreviewRingBuffer:
             )
 
     def _snapshot(self, f_idx: int) -> PreviewFrame:
-        return f_idx, self._frames[f_idx].copy(), self._bboxes.get(f_idx), self._orig_hw
+        bgr, orig_hw = self._frames[f_idx]
+        return f_idx, bgr.copy(), self._bboxes.get(f_idx), orig_hw
 
     def get_latest_bgr(self) -> PreviewFrame | None:
         with self._lock:
@@ -205,8 +218,230 @@ def _open_camera(index: int) -> cv2.VideoCapture:
     return cap
 
 
+class _PendingCameraOpen:
+    """Tracked helper thread for opening + priming a camera with bounded abort and handle cleanup."""
+
+    def __init__(
+        self,
+        index: int,
+        *,
+        width: int,
+        height: int,
+        target_fps: float,
+        timeout_s: float,
+    ) -> None:
+        self.index = int(index)
+        self._width = int(width)
+        self._height = int(height)
+        self._target_fps = float(target_fps)
+        self._timeout_s = float(timeout_s)
+        self._lock = threading.Lock()
+        self._abandoned = threading.Event()
+        self._cap: cv2.VideoCapture | None = None
+        self._first_bgr: np.ndarray | None = None
+        self._error: BaseException | None = None
+        self._release_thread: threading.Thread | None = None
+        self._thread = threading.Thread(target=self._worker, name=f"camera-open-{self.index}", daemon=True)
+        self._thread.start()
+
+    def _take_cap(self) -> cv2.VideoCapture | None:
+        with self._lock:
+            cap = self._cap
+            self._cap = None
+            return cap
+
+    def _worker(self) -> None:
+        cap: cv2.VideoCapture | None = None
+        try:
+            cap = _open_camera(self.index)
+            abandon_now = False
+            with self._lock:
+                if self._abandoned.is_set():
+                    abandon_now = True
+                else:
+                    self._cap = cap
+            if abandon_now:
+                with contextlib.suppress(Exception):
+                    cap.release()
+                return
+            if not cap.isOpened():
+                owned = self._take_cap()
+                if owned is not None:
+                    with contextlib.suppress(Exception):
+                        owned.release()
+                self._error = RuntimeError(f"Cannot open camera index {self.index}")
+                return
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
+            cap.set(cv2.CAP_PROP_FPS, self._target_fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(max(100.0, self._timeout_s * 1000.0)))
+            if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 500)
+            ok, first_bgr = cap.read()
+            with self._lock:
+                if self._abandoned.is_set() or self._cap is None:
+                    owned = self._cap
+                    self._cap = None
+                elif not ok or first_bgr is None:
+                    owned = self._cap
+                    self._cap = None
+                    self._error = RuntimeError(f"Camera {self.index} opened but returned no frames")
+                else:
+                    owned = None
+                    self._first_bgr = first_bgr
+            if owned is not None:
+                with contextlib.suppress(Exception):
+                    owned.release()
+        except Exception as exc:
+            owned = self._take_cap()
+            if owned is not None:
+                with contextlib.suppress(Exception):
+                    owned.release()
+            self._error = exc
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive() or (self._release_thread is not None and self._release_thread.is_alive())
+
+    def abort(self, *, join_timeout_s: float = 0.25) -> None:
+        """Cancel and release any held `VideoCapture` within bounded wall time."""
+        self._abandoned.set()
+        with self._lock:
+            cap_ref = self._cap
+        if cap_ref is not None:
+            cancel_fn = getattr(cap_ref, "cancel", None)
+            if callable(cancel_fn):
+                with contextlib.suppress(Exception):
+                    cancel_fn()
+        if self._thread.is_alive():
+            self._thread.join(timeout=max(0.02, float(join_timeout_s)))
+        cap_owned = self._take_cap()
+        if cap_owned is not None:
+            if not self._thread.is_alive():
+                with contextlib.suppress(Exception):
+                    cap_owned.release()
+            else:
+                def _release_one() -> None:
+                    with contextlib.suppress(Exception):
+                        cap_owned.release()
+
+                rel_t = threading.Thread(target=_release_one, name="camera-open-force-release", daemon=True)
+                self._release_thread = rel_t
+                rel_t.start()
+                rel_t.join(timeout=0.35)
+        elif self._release_thread is not None and self._release_thread.is_alive():
+            self._release_thread.join(timeout=max(0.02, float(join_timeout_s)))
+
+    def wait_and_take(self) -> tuple[cv2.VideoCapture, np.ndarray]:
+        self._thread.join(timeout=max(0.1, self._timeout_s))
+        if self._thread.is_alive():
+            self.abort(join_timeout_s=0.15)
+            raise TimeoutError(f"Timed out opening camera index {self.index} after {self._timeout_s:.1f}s")
+        if self._error is not None:
+            raise self._error
+        cap = self._take_cap()
+        if cap is None or self._first_bgr is None:
+            raise RuntimeError(f"Camera {self.index} open completed without a capture handle")
+        return cap, self._first_bgr
+
+
+def _open_and_prime_camera(
+    index: int,
+    *,
+    width: int,
+    height: int,
+    target_fps: float,
+    timeout_s: float = 2.5,
+) -> tuple[cv2.VideoCapture, np.ndarray]:
+    """Open `index` and read its first BGR frame on a helper thread with bounded wait and cleanup."""
+    pending = _PendingCameraOpen(
+        index,
+        width=width,
+        height=height,
+        target_fps=target_fps,
+        timeout_s=timeout_s,
+    )
+    return pending.wait_and_take()
+
+
+class _CameraDeviceReader:
+    """Single-device reader thread with exclusive capture ownership and bounded shutdown."""
+
+    def __init__(
+        self,
+        cap: cv2.VideoCapture,
+        on_frame: Callable[[np.ndarray], None],
+        *,
+        index: int,
+    ) -> None:
+        self._cap: cv2.VideoCapture | None = cap
+        self._on_frame = on_frame
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._loop, name=f"camera-reader-{index}", daemon=True)
+        self._thread.start()
+
+    def _take_cap(self) -> cv2.VideoCapture | None:
+        with self._lock:
+            cap = self._cap
+            self._cap = None
+            return cap
+
+    def _loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                with self._lock:
+                    cap = self._cap
+                if cap is None:
+                    break
+                ok, bgr = cap.read()
+                if not ok or bgr is None:
+                    if self._stop.is_set():
+                        break
+                    time.sleep(0.005)
+                    continue
+                if not self._stop.is_set():
+                    self._on_frame(bgr)
+        finally:
+            cap = self._take_cap()
+            if cap is not None:
+                with contextlib.suppress(Exception):
+                    cap.release()
+
+    def stop(self, *, join_timeout_s: float = 1.0) -> None:
+        self._stop.set()
+        with self._lock:
+            cap_ref = self._cap
+        if cap_ref is not None:
+            cancel_fn = getattr(cap_ref, "cancel", None)
+            if callable(cancel_fn):
+                with contextlib.suppress(Exception):
+                    cancel_fn()
+        if self._thread.is_alive():
+            self._thread.join(timeout=max(0.05, float(join_timeout_s)))
+        cap = self._take_cap()
+        if cap is None:
+            return
+        if not self._thread.is_alive():
+            with contextlib.suppress(Exception):
+                cap.release()
+            return
+
+        # Cooperating backends exit `read()` within `CAP_PROP_READ_TIMEOUT_MSEC` (500 ms) so `_loop` releases
+        # `cap` on the owning thread above. Only if a wedged driver/mock ignores read timeouts past `join_timeout_s`,
+        # detach ownership (`_take_cap`) and release on an isolated daemon thread so the OS handle is not leaked.
+        def _release_one() -> None:
+            with contextlib.suppress(Exception):
+                cap.release()
+
+        rel_t = threading.Thread(target=_release_one, name="camera-force-release", daemon=True)
+        rel_t.start()
+        rel_t.join(timeout=0.5)
+
+
 class CameraSource:
-    """Live webcam capture with a low-latency reader thread and steady 30.0 Hz output clock."""
+    """Live webcam capture with per-device reader isolation, bounded hot-swap, and steady 30.0 Hz clock."""
 
     def __init__(
         self,
@@ -215,39 +450,111 @@ class CameraSource:
         width: int = 1280,
         height: int = 720,
         target_fps: float = 30.0,
+        open_timeout_s: float = 5.0,
     ) -> None:
         self.camera_index = int(camera_index)
-        cap = _open_camera(self.camera_index)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open camera index {self.camera_index}")
+        cap, first_bgr = _open_and_prime_camera(
+            self.camera_index,
+            width=width,
+            height=height,
+            target_fps=target_fps,
+            timeout_s=open_timeout_s,
+        )
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
-        cap.set(cv2.CAP_PROP_FPS, float(target_fps))
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        ok, first_bgr = cap.read()
-        if not ok or first_bgr is None:
-            cap.release()
-            raise RuntimeError(f"Camera {self.camera_index} opened but returned no frames")
-
-        self._cap = cap
+        self._device_gen = 0
         self._clock = _FrameClock(target_fps)
         self._lock = threading.Lock()
         # Raw BGR; converted to RGB only for frames actually emitted on the output clock.
         self._latest_bgr: np.ndarray = first_bgr
+        self._pending_switch = False
         self._stop = threading.Event()
-        self._reader_thread = threading.Thread(target=self._reader_loop, name="camera-reader", daemon=True)
-        self._reader_thread.start()
+        self._retiring_readers: list[_CameraDeviceReader] = []
+        self._timed_out_opens: dict[int, _PendingCameraOpen] = {}
+        self._reader: _CameraDeviceReader | None = self._start_reader(cap, gen=0, index=self.camera_index)
 
-    def _reader_loop(self) -> None:
-        while not self._stop.is_set():
-            ok, bgr = self._cap.read()
-            if not ok or bgr is None:
-                time.sleep(0.005)
-                continue
+    def _start_reader(self, cap: cv2.VideoCapture, *, gen: int, index: int) -> _CameraDeviceReader:
+        def _publish(bgr: np.ndarray) -> None:
             with self._lock:
-                self._latest_bgr = bgr
+                if gen == self._device_gen and not self._stop.is_set():
+                    self._latest_bgr = bgr
+
+        return _CameraDeviceReader(cap, _publish, index=index)
+
+    def _retire_reader_async(self, reader: _CameraDeviceReader) -> None:
+        def _cleanup() -> None:
+            try:
+                reader.stop(join_timeout_s=0.6)
+            finally:
+                with self._lock, contextlib.suppress(ValueError):
+                    self._retiring_readers.remove(reader)
+
+        threading.Thread(target=_cleanup, name="camera-retire", daemon=True).start()
+
+    def switch_device(
+        self,
+        camera_index: int,
+        *,
+        width: int = 1280,
+        height: int = 720,
+        target_fps: float = 30.0,
+        timeout_s: float = 2.5,
+    ) -> None:
+        """Hot-swap to another live webcam device with independent reader startup and bounded old-device retirement."""
+        new_idx = int(camera_index)
+        if new_idx == self.camera_index:
+            return
+
+        with self._lock:
+            prev_open = self._timed_out_opens.get(new_idx)
+            if prev_open is not None and not prev_open.is_alive():
+                del self._timed_out_opens[new_idx]
+                prev_open = None
+        if prev_open is not None:
+            prev_open.abort(join_timeout_s=0.1)
+            if prev_open.is_alive():
+                raise TimeoutError(f"Camera index {new_idx} is still releasing from a previous timed-out open")
+            with self._lock:
+                if self._timed_out_opens.get(new_idx) is prev_open:
+                    del self._timed_out_opens[new_idx]
+
+        pending = _PendingCameraOpen(
+            new_idx,
+            width=width,
+            height=height,
+            target_fps=target_fps,
+            timeout_s=timeout_s,
+        )
+        try:
+            new_cap, first_bgr = pending.wait_and_take()
+        except TimeoutError:
+            if pending.is_alive():
+                should_abort_again = False
+                with self._lock:
+                    if self._stop.is_set():
+                        should_abort_again = True
+                    else:
+                        self._timed_out_opens[new_idx] = pending
+                if should_abort_again:
+                    pending.abort(join_timeout_s=0.25)
+            raise
+
+        with self._lock:
+            if self._stop.is_set():
+                with contextlib.suppress(Exception):
+                    new_cap.release()
+                return
+            old_reader = self._reader
+            self._device_gen += 1
+            new_gen = self._device_gen
+            self.camera_index = new_idx
+            self._latest_bgr = first_bgr
+            self._pending_switch = True
+            self._reader = self._start_reader(new_cap, gen=new_gen, index=new_idx)
+            if old_reader is not None:
+                self._retiring_readers.append(old_reader)
+
+        if old_reader is not None:
+            self._retire_reader_async(old_reader)
 
     def read_next(self) -> SampledFrame | None:
         if self._stop.is_set():
@@ -255,13 +562,36 @@ class CameraSource:
         self._clock.wait_next()
         with self._lock:
             bgr = self._latest_bgr
-        return self._clock.emit(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            switched = self._pending_switch
+            self._pending_switch = False
+        return self._clock.emit(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), is_camera_switch=switched)
 
     def close(self) -> None:
         self._stop.set()
-        if self._reader_thread.is_alive():
-            self._reader_thread.join(timeout=1.0)
-        self._cap.release()
+        with self._lock:
+            readers = list(self._retiring_readers)
+            self._retiring_readers.clear()
+            pending_opens = list(self._timed_out_opens.values())
+            self._timed_out_opens.clear()
+            if self._reader is not None:
+                readers.append(self._reader)
+                self._reader = None
+        for pending in pending_opens:
+            pending.abort(join_timeout_s=0.2)
+        if not readers:
+            return
+        if len(readers) == 1:
+            readers[0].stop(join_timeout_s=1.0)
+            return
+        stop_threads = [
+            threading.Thread(target=r.stop, kwargs={"join_timeout_s": 1.0}, name="camera-close", daemon=True)
+            for r in readers
+        ]
+        for st in stop_threads:
+            st.start()
+        deadline = time.perf_counter() + 1.6
+        for st in stop_threads:
+            st.join(timeout=max(0.0, deadline - time.perf_counter()))
 
 
 def list_available_cameras(max_probe: int = 4) -> list[dict[str, int | str]]:

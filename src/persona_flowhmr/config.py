@@ -3,11 +3,39 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Literal, get_args
 
-from .paths import DEFAULT_DEMO_VIDEO
+from .paths import DEFAULT_DEMO_VIDEO, SETTINGS_FILE, resolve_worktree_seed_settings
+
+CAMERA_AVATAR_SCALE_MIN = 0.4
+CAMERA_AVATAR_SCALE_MAX = 2.5
+CAMERA_CALIBRATED_FOV_MIN_DEG = 10.0
+CAMERA_CALIBRATED_FOV_MAX_DEG = 140.0
+
+
+def sanitize_avatar_scale(value: object, default: float = 1.0) -> float:
+    """Parse and clamp `camera_avatar_scale` into `[0.4, 2.5]`, falling back cleanly on malformed inputs."""
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        return float(default)
+    return float(min(CAMERA_AVATAR_SCALE_MAX, max(CAMERA_AVATAR_SCALE_MIN, parsed)))
+
+
+def sanitize_camera_fov_deg(value: object, default: float = 0.0) -> float:
+    """Parse calibrated vertical FOV (`0.0` = auto/estimated, else clamped to `[10.0, 140.0]` deg)."""
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        return 0.0
+    return float(min(CAMERA_CALIBRATED_FOV_MAX_DEG, max(CAMERA_CALIBRATED_FOV_MIN_DEG, parsed)))
 
 # FlowHMR's native motion rate: sources resample to it and windows/stitching run on its frame grid.
 MODEL_FPS = 30.0
@@ -166,15 +194,21 @@ class EngineConfig:
     perception_backend: PerceptionBackend = "auto"
     replay_tokens_path: str = ""
 
+    camera_tracking_enabled: bool = True
+    camera_avatar_scale: float = 1.0
+    camera_fov_deg: float = 0.0  # 0.0 = auto intrinsics (+ optical-zoom VO scaling); >0 = calibrated vertical FOV deg
+
     vmc_enabled: bool = True
     vmc_host: str = "127.0.0.1"
     vmc_port: int = 39539
+    vmc_send_camera: bool = True
 
     plugin_api_enabled: bool = False
     plugin_api_url: str = "ws://127.0.0.1:25034"
     plugin_api_token: str = ""
     plugin_api_inject_params: bool = False
     plugin_api_auto_configure_vmc: bool = True
+    plugin_api_sync_camera: bool = True
 
     def get_preset(self) -> LatencyPreset:
         return LATENCY_PRESETS[self.preset]
@@ -214,6 +248,10 @@ class EngineConfig:
         """Load persisted configuration from JSON if present, falling back to defaults."""
         src = Path(path)
         cfg = cls()
+        if not src.is_file() and src.resolve() == SETTINGS_FILE.resolve():
+            seed = resolve_worktree_seed_settings()
+            if seed is not None and seed.is_file():
+                src = seed
         if not src.is_file():
             return cfg
         try:
@@ -225,6 +263,8 @@ class EngineConfig:
         for k, v in raw.items():
             if k in CONFIG_FIELDS and v is not None:
                 setattr(cfg, k, v)
+        cfg.camera_avatar_scale = sanitize_avatar_scale(cfg.camera_avatar_scale)
+        cfg.camera_fov_deg = sanitize_camera_fov_deg(cfg.camera_fov_deg)
         return cfg
 
 

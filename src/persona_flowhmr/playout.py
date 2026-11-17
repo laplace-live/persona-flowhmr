@@ -10,6 +10,7 @@ from operator import attrgetter
 
 import numpy as np
 
+from .camera_tracker import interpolate_camera_pose
 from .retarget import CanonicalPoseFrame, slerp_quat_xyzw
 
 _media_time = attrgetter("media_time_s")
@@ -88,6 +89,11 @@ class PosePlayoutBuffer:
             if (f0.joints_cam_3d is not None and f1.joints_cam_3d is not None)
             else f0.joints_cam_3d
         )
+        cam = (
+            interpolate_camera_pose(f0.camera, f1.camera, alpha)
+            if (f0.camera is not None and f1.camera is not None)
+            else (f0.camera if f0.camera is not None else f1.camera)
+        )
         interp_pose = CanonicalPoseFrame(
             media_time_s=target_media_time_s,
             capture_mono_s=(1.0 - alpha) * f0.capture_mono_s + alpha * f1.capture_mono_s,
@@ -95,5 +101,6 @@ class PosePlayoutBuffer:
             quats_rh_xyzw=quats,
             hips_pos_rh=hips,
             joints_cam_3d=joints,
+            camera=cam,
         )
         return PlayoutSample(pose=interp_pose, buffer_lead_ms=lead_ms, interpolated=True, underrun=False)
