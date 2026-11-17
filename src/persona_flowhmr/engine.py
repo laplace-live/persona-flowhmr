@@ -1127,7 +1127,7 @@ class StreamingMocapEngine:
                     emit_item = prev_items[-1]
                 else:
                     emit_item = first_item
-                    forward_gap_boundary = (
+                    forward_gap_boundary = self._consumed_boundary_frame != emit_item.frame_index and (
                         (self._last_emitted_shot_id is not None and emit_item.shot_id != self._last_emitted_shot_id)
                         or emit_item.is_cut
                         or emit_item.is_stream_reset

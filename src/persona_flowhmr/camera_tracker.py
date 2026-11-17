@@ -472,6 +472,8 @@ class BackgroundVisualOdometry:
         self.min_inliers = int(min_inliers)
         self.last_trans_flow_px: float = 0.0
         self.zoom_scale: float = 1.0
+        self._pending_zoom: float = 1.0
+        self._zoom_anchor_bbox: np.ndarray | None = None
         self._prev_gray: np.ndarray | None = None
         self._prev_hw: tuple[int, int] | None = None
         self._prev_bbox: np.ndarray | None = None
@@ -482,6 +484,8 @@ class BackgroundVisualOdometry:
         self._prev_gray = None
         self._prev_hw = None
         self._prev_bbox = None
+        self._pending_zoom = 1.0
+        self._zoom_anchor_bbox = None
         self._r_yup = np.eye(3, dtype=np.float32)
         self.last_trans_flow_px = 0.0
         self.zoom_scale = 1.0
@@ -501,6 +505,8 @@ class BackgroundVisualOdometry:
         prev_bbox = self._prev_bbox
         if not allow_zoom:
             self.zoom_scale = 1.0
+            self._pending_zoom = 1.0
+            self._zoom_anchor_bbox = cur_bbox.copy()
         long_side = max(1, max(h, w))
         scale = min(1.0, float(self.work_width) / float(long_side))
         sw, sh = max(32, int(round(w * scale))), max(32, int(round(h * scale)))
@@ -519,6 +525,8 @@ class BackgroundVisualOdometry:
             self._prev_gray = gray
             self._prev_hw = (sh, sw)
             self._prev_bbox = cur_bbox
+            self._pending_zoom = 1.0
+            self._zoom_anchor_bbox = cur_bbox.copy()
             self._r_yup = np.eye(3, dtype=np.float32)
             self.last_trans_flow_px = 0.0
             self.zoom_scale = 1.0
@@ -548,6 +556,8 @@ class BackgroundVisualOdometry:
         if pts0 is None or len(pts0) < self.min_inliers:
             self._prev_gray = gray
             self._prev_bbox = cur_bbox
+            self._pending_zoom = 1.0
+            self._zoom_anchor_bbox = cur_bbox.copy()
             self.last_trans_flow_px = 0.0
             return self._r_yup.copy(), 0
 
@@ -557,6 +567,8 @@ class BackgroundVisualOdometry:
         if pts1 is None or st_fwd is None:
             self._prev_gray = gray
             self._prev_bbox = cur_bbox
+            self._pending_zoom = 1.0
+            self._zoom_anchor_bbox = cur_bbox.copy()
             self.last_trans_flow_px = 0.0
             return self._r_yup.copy(), 0
 
@@ -579,6 +591,8 @@ class BackgroundVisualOdometry:
         if len(p0) < self.min_inliers:
             self._prev_gray = gray
             self._prev_bbox = cur_bbox
+            self._pending_zoom = 1.0
+            self._zoom_anchor_bbox = cur_bbox.copy()
             self.last_trans_flow_px = 0.0
             return self._r_yup.copy(), 0
 
@@ -603,6 +617,7 @@ class BackgroundVisualOdometry:
         # misfit as a one-sided pan. Centering `(a_far, b_far)` cancels translation/pan shift even on
         # one-sided backgrounds after performer masking.
         eff_zoom = 1.0
+        commit_zoom: float | None = None
         eff_k1: np.ndarray | None = None
         du0 = p0[:, 0] - cx
         dv0 = p0[:, 1] - cy
@@ -619,46 +634,60 @@ class BackgroundVisualOdometry:
             med_zoom = float(np.sum(ac * bc) / denom_z) if denom_z > 1e-6 else 1.0
             zoom_res_480 = float(np.median(np.linalg.norm(bc - med_zoom * ac, axis=-1))) * norm_480
 
-            # Separate optical lens zoom from physical camera dolly: under optical zoom, an unclipped
-            # foreground performer at closer depth `Z_person < Z_bg` magnifies by the SAME factor `med_zoom`,
-            # whereas dolly toward a textured wall expands the closer performer faster due to perspective.
-            fg_agrees = False
-            margin = 8.0
-            bw0 = float(prev_bbox[2] - prev_bbox[0])
-            bh0 = float(prev_bbox[3] - prev_bbox[1])
-            unclipped = (
-                prev_bbox[0] > margin
-                and prev_bbox[1] > margin
-                and prev_bbox[2] < (w - margin)
-                and prev_bbox[3] < (h - margin)
-                and cur_bbox[0] > margin
-                and cur_bbox[1] > margin
-                and cur_bbox[2] < (w - margin)
-                and cur_bbox[3] < (h - margin)
-                and bw0 >= 24.0
-                and bh0 >= 48.0
-            )
-            if unclipped:
-                fg_scale = 0.5 * (
-                    float(cur_bbox[2] - cur_bbox[0]) / bw0
-                    + float(cur_bbox[3] - cur_bbox[1]) / bh0
-                )
-                fg_agrees = (
-                    (fg_scale - 1.0) * (med_zoom - 1.0) > 0.0
-                    and abs(fg_scale - med_zoom) <= max(0.0045, 0.28 * abs(med_zoom - 1.0))
-                )
+            if has_spread and zoom_res_480 < 0.85 and 0.92 <= med_zoom <= 1.08:
+                # Accumulate coherent sub-threshold scale steps against `_zoom_anchor_bbox` so slow sustained
+                # zooms (e.g. 0.15%-0.20%/frame) are preserved instead of discarded when `_prev_gray` advances.
+                if (med_zoom - 1.0) * (self._pending_zoom - 1.0) < -1e-7:
+                    self._pending_zoom = 1.0
+                    self._zoom_anchor_bbox = prev_bbox.copy()
+                anchor_box = self._zoom_anchor_bbox if self._zoom_anchor_bbox is not None else prev_bbox
+                cand_zoom = self._pending_zoom * med_zoom
 
-            if (
-                has_spread
-                and fg_agrees
-                and zoom_res_480 < 0.85
-                and 0.92 <= med_zoom <= 1.08
-                and abs(med_zoom - 1.0) >= 0.0025
-            ):
-                eff_zoom = med_zoom
-                eff_k1 = cam_k.copy()
-                eff_k1[0, 0] = fx * eff_zoom
-                eff_k1[1, 1] = fy * eff_zoom
+                if abs(cand_zoom - 1.0) >= 0.008:
+                    # Separate optical lens zoom from physical camera dolly: under optical zoom, an unclipped
+                    # foreground performer at closer depth `Z_person < Z_bg` magnifies by the SAME `cand_zoom`,
+                    # whereas dolly toward a textured wall expands the closer performer faster due to perspective.
+                    fg_agrees = False
+                    margin = 8.0
+                    bw0 = float(anchor_box[2] - anchor_box[0])
+                    bh0 = float(anchor_box[3] - anchor_box[1])
+                    unclipped = (
+                        anchor_box[0] > margin
+                        and anchor_box[1] > margin
+                        and anchor_box[2] < (w - margin)
+                        and anchor_box[3] < (h - margin)
+                        and cur_bbox[0] > margin
+                        and cur_bbox[1] > margin
+                        and cur_bbox[2] < (w - margin)
+                        and cur_bbox[3] < (h - margin)
+                        and bw0 >= 24.0
+                        and bh0 >= 48.0
+                    )
+                    if unclipped:
+                        fg_scale = 0.5 * (
+                            float(cur_bbox[2] - cur_bbox[0]) / bw0
+                            + float(cur_bbox[3] - cur_bbox[1]) / bh0
+                        )
+                        fg_agrees = (
+                            (fg_scale - 1.0) * (cand_zoom - 1.0) > 0.0
+                            and abs(fg_scale - cand_zoom) <= max(0.0025, 0.28 * abs(cand_zoom - 1.0))
+                        )
+                    if fg_agrees:
+                        commit_zoom = cand_zoom
+                        eff_zoom = med_zoom
+                        eff_k1 = cam_k.copy()
+                        eff_k1[0, 0] = fx * eff_zoom
+                        eff_k1[1, 1] = fy * eff_zoom
+                    else:
+                        self._pending_zoom = 1.0
+                        self._zoom_anchor_bbox = cur_bbox.copy()
+                else:
+                    self._pending_zoom = cand_zoom
+                    if self._zoom_anchor_bbox is None:
+                        self._zoom_anchor_bbox = prev_bbox.copy()
+            else:
+                self._pending_zoom = 1.0
+                self._zoom_anchor_bbox = cur_bbox.copy()
 
         delta_r_cv, n_inliers = self._ransac_ray_rotation(p0, p1, cam_k, cam_k1=eff_k1)
         rays0 = np.stack([(p0[:, 0] - cx) / fx, (p0[:, 1] - cy) / fy, np.ones(len(p0), dtype=np.float64)], axis=-1)
@@ -668,8 +697,10 @@ class BackgroundVisualOdometry:
         fy_out = fy * eff_zoom
         u_pred = fx_out * (rays0_rot[:, 0] / z_rot) + cx
         v_pred = fy_out * (rays0_rot[:, 1] / z_rot) + cy
-        if eff_k1 is not None and n_inliers >= self.min_inliers:
-            self.zoom_scale = float(np.clip(self.zoom_scale * eff_zoom, 0.4, 3.5))
+        if commit_zoom is not None and n_inliers >= self.min_inliers:
+            self.zoom_scale = float(np.clip(self.zoom_scale * commit_zoom, 0.4, 3.5))
+            self._pending_zoom = 1.0
+            self._zoom_anchor_bbox = cur_bbox.copy()
 
         self.last_trans_flow_px = float(np.median(np.hypot(p1[:, 0] - u_pred, p1[:, 1] - v_pred))) * norm_480
 

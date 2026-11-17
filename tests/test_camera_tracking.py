@@ -1068,6 +1068,22 @@ def test_vo_optical_zoom_vs_wall_dolly_and_pre_cut_incoming_crossfade() -> None:
     yaw_accum_deg = abs(math.degrees(math.atan2(float(r_cur[2, 0]), float(r_cur[2, 2]))))
     assert yaw_accum_deg > 0.12
 
+    # 7. Sustained slow optical zoom (0.2%/frame < 0.8% commit threshold) accumulates across frames!
+    vo_slow_zoom = BackgroundVisualOdometry()
+    vo_slow_zoom.step(base, box0, cam_k, allow_zoom=True)
+    for k in range(1, 16):
+        zk = 1.002**k
+        mz = np.array(
+            [
+                [zk, 0.0, (1.0 - zk) * (w * 0.5)],
+                [0.0, zk, (1.0 - zk) * (h * 0.5)],
+            ],
+            dtype=np.float32,
+        )
+        z_img = cv2.warpAffine(base, mz, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        vo_slow_zoom.step(z_img, _scale_box(box0, zk), cam_k, allow_zoom=True)
+    assert vo_slow_zoom.zoom_scale > 1.018
+
 
 def test_stalled_camera_reader_hot_swap_and_close_release_devices(monkeypatch) -> None:
     """Verify hot-swapping away from a stalled camera starts live reads on the new device immediately,
@@ -1143,6 +1159,7 @@ def test_stalled_camera_reader_hot_swap_and_close_release_devices(monkeypatch) -
         assert elapsed < 2.0
     finally:
         unblock_0.set()
+        cam.close()
 
 
 def test_dropped_frame_gap_across_camera_cut_preserves_shot_boundary() -> None:
@@ -1231,3 +1248,24 @@ def test_dropped_frame_gap_across_camera_cut_preserves_shot_boundary() -> None:
     assert by_f[12].camera is not None
     assert by_f[12].camera.is_cut is True
     assert abs(by_f[12].camera.orbit_distance - 5.4) < 0.25
+
+    # Multi-stride forward gap (when preceding shot already rolled off `history`) emits `is_cut` ONCE at gap start!
+    eng._last_emitted_shot_id = 0
+    eng._consumed_boundary_frame = None
+    fwd_hist: deque[FrameFeatureItem] = deque()
+    for f in range(20, 36):
+        fwd_hist.append(_make_item(f, shot_id=1, dist_m=5.4, is_cut=(f == 20)))
+    fwd_committed = []
+    eng._playout_buffer.push_many = lambda frames: fwd_committed.extend(frames)  # type: ignore[method-assign]
+    eng._solve_ready_windows(
+        fwd_hist,
+        8,
+        eos=True,
+        preset=preset,
+        stitcher=stitcher,
+        camera_solver=cam_solver,
+        stream_frame0_hips=[None],
+        first_commit_event=threading.Event(),
+    )
+    cut_frames = [p.frame_index for p in fwd_committed if p.camera is not None and p.camera.is_cut]
+    assert cut_frames == [8]
