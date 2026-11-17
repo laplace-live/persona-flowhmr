@@ -275,7 +275,7 @@ _DASHBOARD_HTML = """<!doctype html>
           </div>
           <div class="field">
             <label>Camera FOV° (0=Auto)</label>
-            <input type="number" id="camera_fov_deg" data-cfg data-float step="1" min="0" max="120" value="0" />
+            <input type="number" id="camera_fov_deg" data-cfg data-float step="1" min="0" max="140" value="0" />
           </div>
         </div>
         <label class="check"><input type="checkbox" id="mirror" data-cfg /> Mirror Avatar (Webcam Selfie Mode)</label>

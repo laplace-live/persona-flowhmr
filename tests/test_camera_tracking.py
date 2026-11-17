@@ -305,6 +305,7 @@ def test_persona_plugin_client_coalesces_vrm_camera_patches() -> None:
 
     async def handler(ws):
         nonlocal inflight, max_inflight
+        tasks: set[asyncio.Task[None]] = set()
         await ws.send(
             json.dumps(
                 {
@@ -314,8 +315,9 @@ def test_persona_plugin_client_coalesces_vrm_camera_patches() -> None:
                 }
             )
         )
-        async for raw in ws:
-            msg = json.loads(raw)
+
+        async def _process(msg: dict) -> None:
+            nonlocal inflight, max_inflight
             m = msg["method"]
             params = msg.get("params") or {}
             if m == "scene.patch" and "vrmCamera" in params:
@@ -327,6 +329,15 @@ def test_persona_plugin_client_coalesces_vrm_camera_patches() -> None:
                 finally:
                     inflight -= 1
             await ws.send(json.dumps({"kind": "response", "id": msg["id"], "result": {}}))
+
+        try:
+            async for raw in ws:
+                task = asyncio.create_task(_process(json.loads(raw)))
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+        finally:
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     stop_srv = threading.Event()
     ready_srv = threading.Event()
@@ -1549,7 +1560,7 @@ def test_camera_avatar_scale_keeps_floor_travel_unscaled_and_webui_exposes_fov()
     """
     from persona_flowhmr.web_ui import _DASHBOARD_HTML
 
-    assert 'id="camera_fov_deg" data-cfg data-float' in _DASHBOARD_HTML
+    assert 'id="camera_fov_deg" data-cfg data-float step="1" min="0" max="140"' in _DASHBOARD_HTML
 
     decoder = MotionLatentDecoder(MOTION_STATS_PATH, motion_style="basic")
     cam_solver = StreamingCameraSolver(avatar_scale=2.0)
@@ -1776,12 +1787,11 @@ def test_persona_plugin_invalidation_generation_timeout_cleanup_and_disconnect_r
         assert abs(float(patched[0]["orbit"]["targetX"]) - 4.5) < 1e-4
 
         # 2. Timed-out `call()` removes its future from `client._pending` (`len == 0`).
+        import pytest
+
         state["hang_patch"] = True
-        try:
+        with pytest.raises(TimeoutError):
             client.call("scene.patch", {"vrmCamera": {"fov": 31.0}}, timeout_s=0.12)
-            raise AssertionError("Expected TimeoutError")
-        except Exception:
-            pass
         threading.Event().wait(0.05)
         assert len(client._pending) == 0
         state["hang_patch"] = False

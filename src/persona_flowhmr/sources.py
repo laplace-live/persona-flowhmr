@@ -254,12 +254,16 @@ class _PendingCameraOpen:
         cap: cv2.VideoCapture | None = None
         try:
             cap = _open_camera(self.index)
+            abandon_now = False
             with self._lock:
                 if self._abandoned.is_set():
-                    with contextlib.suppress(Exception):
-                        cap.release()
-                    return
-                self._cap = cap
+                    abandon_now = True
+                else:
+                    self._cap = cap
+            if abandon_now:
+                with contextlib.suppress(Exception):
+                    cap.release()
+                return
             if not cap.isOpened():
                 owned = self._take_cap()
                 if owned is not None:
